@@ -250,3 +250,119 @@ def test_run_with_download_failure_exits(monkeypatch, capsys):
     assert exc_info.value.code == 2
     captured = capsys.readouterr()
     assert "network down" in captured.err
+
+
+# --- language / model auto-upgrade -----------------------------------------
+
+
+def test_run_upgrades_english_only_model_for_zh(monkeypatch, capsys):
+    """`base.en` + `language=zh` must auto-upgrade to `base` so Chinese
+    actually works. The user is told about the swap in the log."""
+    from speakinput.app import App
+    from speakinput.config import Config, STTConfig
+
+    fake_ensure = MagicMock(return_value="/resolved/base.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(stt=STTConfig(model="base.en", language="zh"))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    # ensure_model was called with the *upgraded* name, not the original.
+    fake_ensure.assert_called_once_with("base")
+    captured = capsys.readouterr()
+    assert "upgrading" in captured.err
+    assert "base.en" in captured.err
+    assert "base" in captured.err
+
+
+def test_run_upgrades_english_only_model_for_auto(monkeypatch, capsys):
+    """`language=auto` on an English-only model also upgrades, because the
+    model can't recognize non-English speech at all."""
+    from speakinput.app import App
+    from speakinput.config import Config, STTConfig
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(stt=STTConfig(model="small.en", language="auto"))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    fake_ensure.assert_called_once_with("small")
+    captured = capsys.readouterr()
+    assert "upgrading" in captured.err
+
+
+def test_run_does_not_upgrade_when_english_only_model_with_en(monkeypatch, capsys):
+    """If the user explicitly chose an English-only model AND set language=en,
+    leave it alone — they wanted the fast English path."""
+    from speakinput.app import App
+    from speakinput.config import Config, STTConfig
+
+    fake_ensure = MagicMock(return_value="/resolved/base.en.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(stt=STTConfig(model="base.en", language="en"))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    fake_ensure.assert_called_once_with("base.en")
+    captured = capsys.readouterr()
+    assert "upgrading" not in captured.err
+
+
+def test_run_does_not_upgrade_multilingual_model(monkeypatch, capsys):
+    """A multilingual model + zh is the normal path. No upgrade message."""
+    from speakinput.app import App
+    from speakinput.config import Config, STTConfig
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(stt=STTConfig(model="small", language="zh"))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    fake_ensure.assert_called_once_with("small")
+    captured = capsys.readouterr()
+    assert "upgrading" not in captured.err
+
+
+# --- startup banner --------------------------------------------------------
+
+
+def test_run_prints_startup_banner(monkeypatch, capsys):
+    """The startup banner must show the active config so the user can verify
+    it without opening config.toml."""
+    from speakinput.app import App
+    from speakinput.config import Config
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config()
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert "[startup] model    : small" in captured.err
+    assert "[startup] language : auto" in captured.err
+    assert "[startup] hotkey   : alt_r" in captured.err
+    assert "[startup] sample   :" in captured.err
+    assert "[startup] inject   :" in captured.err

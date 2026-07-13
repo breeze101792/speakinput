@@ -13,7 +13,12 @@ from speakinput.config import Config
 from speakinput.feedback import Feedback, NullFeedback
 from speakinput.hotkey import HotkeyListener, resolve_key
 from speakinput.injector import Injector, TypingInjector
-from speakinput.models import ModelDownloadError, ModelNotFoundError, ensure_model
+from speakinput.models import (
+    ModelDownloadError,
+    ModelNotFoundError,
+    ensure_model,
+    resolve_for_language,
+)
 from speakinput.transcriber import Transcriber, WhisperCppTranscriber
 
 log = logging.getLogger("speakinput")
@@ -138,6 +143,15 @@ class App:
         # Bootstrap: ensure the model is on disk BEFORE we start the hotkey
         # listener, so the user never sees a 141 MB download start mid-session.
         if self.transcriber is None:
+            # Auto-upgrade: if the configured model is English-only but the
+            # language requires multilingual support, swap it for the
+            # same-tier multilingual model before downloading.
+            upgraded_model, upgrade_msg = resolve_for_language(
+                self.config.stt.model, self.config.stt.language
+            )
+            if upgrade_msg:
+                print(f"[info] {upgrade_msg}", file=sys.stderr, flush=True)
+                self.config = self.config.with_overrides(model=upgraded_model)
             try:
                 self.transcriber = self._build_default_transcriber()
             except ModelNotFoundError as exc:
@@ -146,6 +160,7 @@ class App:
             except ModelDownloadError as exc:
                 print(f"model error: {exc}", file=sys.stderr)
                 raise SystemExit(2) from exc
+        self._print_banner()
         self.feedback.start()
         self.listener = HotkeyListener(
             key=resolve_key(self.config.hotkey.key),
@@ -166,6 +181,23 @@ class App:
             self._shutdown.wait()
         finally:
             self.shutdown()
+
+    def _print_banner(self) -> None:
+        """Print a one-line-per-field startup summary so the user can verify
+        the active config without having to open config.toml. Each line is
+        independent so it's easy to grep."""
+        cfg = self.config
+        device = cfg.audio.device if cfg.audio.device is not None else "default"
+        inject_mode = "off (dry-run)" if self.dry_run else "on"
+        lines = [
+            f"model    : {cfg.stt.model}",
+            f"language : {cfg.stt.language}",
+            f"hotkey   : {cfg.hotkey.key}",
+            f"sample   : {cfg.audio.sample_rate} Hz, device={device}",
+            f"inject   : {inject_mode}, trailing_space={cfg.inject.trailing_space}",
+        ]
+        for line in lines:
+            print(f"[startup] {line}", file=sys.stderr, flush=True)
 
     def shutdown(self) -> None:
         self._shutdown.set()

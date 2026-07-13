@@ -100,3 +100,57 @@ def test_ensure_without_pywhispercpp_raises(monkeypatch):
     monkeypatch.setattr(m, "_pw_utils", None, raising=False)
     with pytest.raises(ModelDownloadError, match="pywhispercpp is not installed"):
         m.ensure_model("base.en")
+
+
+# --- resolve_for_language --------------------------------------------------
+
+
+def test_resolve_upgrades_en_model_for_zh():
+    from speakinput.models import resolve_for_language
+
+    new, msg = resolve_for_language("base.en", "zh")
+    assert new == "base"
+    assert msg is not None
+    assert "English-only" in msg
+
+
+def test_resolve_upgrades_en_model_for_auto():
+    from speakinput.models import resolve_for_language
+
+    new, msg = resolve_for_language("small.en", "auto")
+    assert new == "small"
+    assert msg is not None
+
+
+def test_resolve_does_not_upgrade_for_explicit_en():
+    from speakinput.models import resolve_for_language
+
+    new, msg = resolve_for_language("base.en", "en")
+    assert new == "base.en"
+    assert msg is None
+
+
+def test_resolve_does_not_upgrade_multilingual_model():
+    from speakinput.models import resolve_for_language
+
+    new, msg = resolve_for_language("small", "zh")
+    assert new == "small"
+    assert msg is None
+
+
+def test_resolve_passes_through_path():
+    """A custom .bin path is the user's explicit choice — never auto-upgrade."""
+    from speakinput.models import resolve_for_language
+
+    new, msg = resolve_for_language("/Users/me/custom.bin", "zh")
+    assert new == "/Users/me/custom.bin"
+    assert msg is None
+
+
+def test_resolve_upgrades_all_three_en_tiers():
+    """Each .en model must map to its size-matched multilingual counterpart."""
+    from speakinput.models import resolve_for_language
+
+    assert resolve_for_language("tiny.en", "zh")[0] == "tiny"
+    assert resolve_for_language("base.en", "zh")[0] == "base"
+    assert resolve_for_language("small.en", "zh")[0] == "small"

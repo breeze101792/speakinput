@@ -16,6 +16,22 @@ except ImportError:  # pragma: no cover - pywhispercpp is a hard dep
     _pw_utils = None  # type: ignore[assignment]
 
 
+# English-only models and the multilingual model with the same size tier.
+# Used by `resolve_for_language` to auto-upgrade an `.en` model to its
+# multilingual counterpart when the user requests a non-English language.
+_EN_TO_MULTILINGUAL = {
+    "tiny.en": "tiny",
+    "base.en": "base",
+    "small.en": "small",
+}
+
+# Languages that require a multilingual model. `auto` also requires it
+# because the model needs to be able to recognize non-English speech;
+# an English-only model with `auto` would always detect "en" and be slower
+# than just setting `language = "en"`.
+_NEEDS_MULTILINGUAL = {"zh", "auto"}
+
+
 class ModelNotFoundError(RuntimeError):
     """Raised when the configured model name is not in the curated allowlist."""
 
@@ -26,6 +42,29 @@ class ModelDownloadError(RuntimeError):
 
 def _is_path_like(name: str) -> bool:
     return "/" in name or name.endswith(".bin")
+
+
+def resolve_for_language(model: str, language: str) -> tuple[str, str | None]:
+    """Return the (possibly upgraded) model name and an info message.
+
+    If the configured model is English-only (`*.en`) and the language
+    requires multilingual support, swap it for the same-tier multilingual
+    model. Returns the new model name; the info message is non-None only
+    when a swap actually happened. The user is told about the swap so it's
+    not a silent surprise.
+
+    Absolute paths (e.g. `/path/to/custom.bin`) are returned unchanged.
+    """
+    if _is_path_like(model):
+        return model, None
+    if language in _NEEDS_MULTILINGUAL and model in _EN_TO_MULTILINGUAL:
+        upgraded = _EN_TO_MULTILINGUAL[model]
+        msg = (
+            f"model {model!r} is English-only; upgrading to {upgraded!r} "
+            f"so language={language!r} works"
+        )
+        return upgraded, msg
+    return model, None
 
 
 def ensure_model(name: str) -> Path:

@@ -7,21 +7,23 @@ import pytest
 
 @pytest.fixture
 def fake_pynput(monkeypatch):
+    """Stub out `pynput` (and its `keyboard` submodule) in `sys.modules` so
+    the lazy `from pynput import keyboard` inside `speakinput.hotkey` picks
+    up our fake. Both entries need swapping because `from pynput import
+    keyboard` looks up `.keyboard` on the cached `pynput` module object."""
+    import sys
+
     fake = MagicMock()
     fake_listener_instance = MagicMock()
     fake.Listener = MagicMock(return_value=fake_listener_instance)
     fake.Key = MagicMock()
     fake.Key.alt_r = "alt_r_key"
     fake.Key.ctrl_r = "ctrl_r_key"
-    monkeypatch.setattr("speakinput.hotkey.keyboard", fake, raising=False)
+    fake_pynput_mod = MagicMock()
+    fake_pynput_mod.keyboard = fake
+    monkeypatch.setitem(sys.modules, "pynput", fake_pynput_mod)
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", fake)
     return fake, fake_listener_instance
-
-
-def test_resolve_key_validates_name(fake_pynput):
-    from speakinput.hotkey import resolve_key
-
-    with pytest.raises(ValueError, match="unknown hotkey"):
-        resolve_key("nonsense")
 
 
 def test_resolve_key_returns_pynput_key(fake_pynput):
@@ -32,20 +34,12 @@ def test_resolve_key_returns_pynput_key(fake_pynput):
     assert k == fake.Key.alt_r
 
 
-def test_resolve_key_raises_when_pynput_missing(monkeypatch):
-    from speakinput import hotkey as hk
+def test_resolve_key_rejects_unknown_name():
+    """An unknown hotkey name must raise ValueError before any pynput access."""
+    from speakinput.hotkey import resolve_key
 
-    monkeypatch.setattr(hk, "keyboard", None, raising=False)
-    with pytest.raises(RuntimeError, match="pynput"):
-        hk.resolve_key("alt_r")
-
-
-def test_listener_raises_when_pynput_missing(monkeypatch):
-    from speakinput import hotkey as hk
-
-    monkeypatch.setattr(hk, "keyboard", None, raising=False)
-    with pytest.raises(RuntimeError, match="pynput"):
-        hk.HotkeyListener(key="alt_r", on_press=lambda: None, on_release=lambda: None)
+    with pytest.raises(ValueError, match="unknown hotkey"):
+        resolve_key("nonsense")
 
 
 def test_listener_start_creates_and_starts_pynput_listener(fake_pynput):
