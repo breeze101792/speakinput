@@ -159,3 +159,44 @@ def test_validation_rejects_english_only_model_with_chinese():
 def test_validation_allows_english_only_model_with_en_or_auto():
     Config(stt=STTConfig(model="base.en", language="en")).validate()
     Config(stt=STTConfig(model="base.en", language="auto")).validate()
+
+
+# --- CLI arg surface -------------------------------------------------------
+
+
+def test_cli_language_argument_is_parsed():
+    """`-g zh` / `--language zh` must reach the config via with_overrides."""
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["--language", "zh"])
+    assert args.language == "zh"
+
+
+def test_cli_language_short_flag():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["-g", "en"])
+    assert args.language == "en"
+
+
+def test_cli_language_defaults_to_none():
+    """When the flag is absent, the config file's value wins."""
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args([])
+    assert args.language is None
+
+
+def test_cli_rejects_unknown_language():
+    """Whisper supports ~100 languages; we expose a curated set only."""
+    from speakinput.cli import _build_parser
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["--language", "fr"])
+
+
+def test_with_overrides_changes_language():
+    cfg = Config()
+    new = cfg.with_overrides(language="zh")
+    assert new.stt.language == "zh"
+    assert cfg.stt.language == "auto"  # original untouched

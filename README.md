@@ -89,6 +89,8 @@ macOS sometimes resets these permissions after a macOS update, after major Pytho
 ```bash
 speakinput                       # run with default config
 speakinput -m base.en            # override the model for this run
+speakinput -g zh                 # force Chinese transcription
+speakinput -g en                 # force English (skips language ID)
 speakinput -l                     # show available input devices
 speakinput -D                     # record 2s, print audio stats, don't inject
 speakinput -n                     # print transcribed text to stderr instead of typing
@@ -103,6 +105,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | ----- | --------------------- | ----------------------------------------------- |
 | `-c`  | `--config PATH`       | Path to config.toml                             |
 | `-m`  | `--model NAME`        | Override the whisper model (`tiny`/`base`/`small`/`medium`/`.en` variants) |
+| `-g`  | `--language CODE`     | Override stt.language (`auto` / `en` / `zh`)               |
 | `-l`  | `--list-devices`      | List available input devices and exit           |
 | `-L`  | `--list-models`       | List curated whisper models and exit            |
 | `-D`  | `--diagnose`          | Record 2s and print audio stats                 |

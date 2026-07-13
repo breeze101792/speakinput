@@ -62,6 +62,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="List available whisper models and exit",
     )
     parser.add_argument(
+        "-g",
+        "--language",
+        choices=("auto", "en", "zh"),
+        default=None,
+        help="Override stt.language from config (auto | en | zh). 'auto' "
+        "detects per utterance; explicit values skip the language ID pass.",
+    )
+    parser.add_argument(
         "-D",
         "--diagnose",
         action="store_true",
@@ -210,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.model:
         config = config.with_overrides(model=args.model)
+    if args.language:
+        config = config.with_overrides(language=args.language)
     if args.trailing_space is not None:
         config = config.with_overrides(trailing_space=args.trailing_space)
 
