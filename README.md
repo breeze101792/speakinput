@@ -297,6 +297,20 @@ pytest
 ruff check .
 ```
 
+## Building a release binary
+
+`release.sh` builds a single-file frozen binary with PyInstaller for the **current host** (macOS arm64/x86_64, Linux x86_64). Cross-compiling isn't supported — run it on the host you want to ship for.
+
+```bash
+./release.sh             # build into dist/speakinput (~15 MB macOS arm64)
+CLEAN=1 ./release.sh     # wipe build/ + dist/ first
+./dist/speakinput --list-models
+```
+
+The build is reproducible via `speakinput.spec` (the source of truth for hidden imports and excludes). The output `dist/speakinput` is a self-contained binary — no Python install needed on the target host. Whisper models are downloaded on first run into the user's `pywhispercpp` cache, exactly like `pip install` would.
+
+**Distribute** by tarring `dist/speakinput` + `dist/config.example.toml` + `dist/README.md`. The user untars, runs `./speakinput`, and follows the same permission setup as the `pip install` flow. macOS Gatekeeper may reject the unsigned binary on first run — right-click → Open, or sign with `codesign --force --deep --sign - dist/speakinput`.
+
 ## License
 
 MIT
