@@ -40,6 +40,13 @@ class STTConfig:
     model: str = "small"
     language: str = "auto"
     beam_size: int = 1
+    # Whisper's initial_prompt is a lexical prior — tokenized once and used
+    # to bias the decoder at the start of every transcription. Useful for
+    # names, technical jargon, or acronyms the base model would misspell
+    # (e.g. "kubectl apply -f deployment.yaml" biases the decoder toward
+    # those tokens). Default empty (no prompt). Can be overridden per-run
+    # via `-P`/`--initial-prompt` on the CLI.
+    initial_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -147,6 +154,7 @@ def write_default_config(path: Path) -> None:
 model = "small"
 language = "auto"
 beam_size = 1
+# initial_prompt = ""  # optional: bias the decoder toward specific vocabulary
 
 [audio]
 sample_rate = 16000

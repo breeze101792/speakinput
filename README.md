@@ -49,6 +49,36 @@ With the default `model = "small"` and `language = "auto"`, you can switch betwe
 
 English-only models (`tiny.en`, `base.en`, `small.en`) are faster but cannot do Chinese. If you set `language = "zh"` with an English-only model, Speak Input will refuse to start with a clear error.
 
+## Initial prompt (vocabulary biasing)
+
+`stt.initial_prompt` in `config.toml` (or `-P` / `--initial-prompt` on the command line) primes whisper's decoder with a fixed text fragment at the start of every transcription. This is a **lexical prior** — it biases the model toward specific vocabulary, but it does not change whisper's behavior the way a chat-model system prompt would.
+
+Use it for:
+
+- **Names** that whisper would otherwise misspell: `"Shaowu"`, `"Karpathy"`, product/team names.
+- **Acronyms**: `"K8s, SRE, PR, kubectl"`.
+- **Technical jargon**: `"kubectl apply -f deployment.yaml"`, `"semver: 1.2.3-rc.1"`.
+- **Style hints**: `"Use British English."`, `"Use semicolons."`.
+
+Do not use it for:
+
+- Behavioral directives ("always be concise"). Whisper doesn't follow instructions; it transcribes.
+- Long passages. The prompt is tokenized at start; very long prompts hit whisper's 224-token limit and may confuse the decoder for unrelated speech.
+- Generic text. A prompt like `"hello world"` doesn't help anything and may bias the decoder toward outputting "hello" regardless of what you actually said.
+
+The default is empty (no prompt). Leave it that way unless you have specific words to bias. Example config:
+
+```toml
+[stt]
+initial_prompt = "K8s, SRE, kubectl, Dockerfile, semver"
+```
+
+Or per-run:
+
+```bash
+./start.sh -P "kubectl apply -f deployment.yaml"
+```
+
 ## macOS permissions
 
 macOS splits the permissions for what Speak Input does into **two separate gates** in System Settings. This trips up a lot of people because getting one right isn't enough — both are required, and they have to be granted to the same executable.
@@ -114,6 +144,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-t`  | `--trailing-space`    | Append a space after each transcript (default)  |
 | `-T`  | `--no-trailing-space` | Don't append a space after each transcript      |
 | `-S`  | `--silence-threshold FLOAT` | Skip transcribe when audio RMS is below this floor (0 disables; default 0.005) |
+| `-P`  | `--initial-prompt TEXT` | Whisper initial_prompt — bias the decoder toward specific vocabulary |
 | `-v`  | `--verbose`           | Enable debug logging from python logging        |
 
 By default the push-to-talk key is **Right Option (Alt)**. Hold it, speak, release. The recognized text is typed into whatever field has focus, **with a trailing space** so the next word doesn't run into the last one. Disable the trailing space with `--no-trailing-space` if you want pure dictation (e.g. when typing into a code editor).
@@ -152,6 +183,8 @@ The first time you select a model, pywhispercpp downloads it to `~/.cache/pywhis
 model = "small"            # whisper.cpp model; see model table below
 language = "auto"          # auto | en | zh
 beam_size = 1              # 1 = greedy (fastest); up to 10 for higher accuracy
+# initial_prompt = ""      # optional: bias the decoder toward specific vocabulary
+                           # (see "Initial prompt" below)
 
 [audio]
 device = null              # null = system default mic; or an integer index from --list-devices

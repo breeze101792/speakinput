@@ -237,3 +237,55 @@ def test_cli_silence_threshold_defaults_to_none():
 
     args = _build_parser().parse_args([])
     assert args.silence_threshold is None
+
+
+# --- initial_prompt --------------------------------------------------------
+
+
+def test_default_initial_prompt_is_empty():
+    """Default initial_prompt is empty (no lexical prior)."""
+    assert Config().stt.initial_prompt == ""
+
+
+def test_with_overrides_initial_prompt():
+    cfg = Config()
+    new = cfg.with_overrides(initial_prompt="kubectl apply -f deployment.yaml")
+    assert new.stt.initial_prompt == "kubectl apply -f deployment.yaml"
+    assert cfg.stt.initial_prompt == ""  # original untouched
+
+
+def test_from_dict_reads_initial_prompt():
+    cfg = Config.from_dict({"stt": {"initial_prompt": "K8s, SRE, kubectl"}})
+    assert cfg.stt.initial_prompt == "K8s, SRE, kubectl"
+
+
+def test_cli_initial_prompt_short_flag():
+    """-P/--initial-prompt must reach the config via with_overrides."""
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["-P", "kubectl"])
+    assert args.initial_prompt == "kubectl"
+
+
+def test_cli_initial_prompt_long_flag():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["--initial-prompt", "K8s, SRE"])
+    assert args.initial_prompt == "K8s, SRE"
+
+
+def test_cli_initial_prompt_defaults_to_none():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args([])
+    assert args.initial_prompt is None
+
+
+def test_cli_initial_prompt_with_spaces():
+    """Multi-word prompts must round-trip through the CLI intact."""
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        ["-P", "kubectl apply -f deployment.yaml"]
+    )
+    assert args.initial_prompt == "kubectl apply -f deployment.yaml"

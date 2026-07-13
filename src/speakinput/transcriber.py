@@ -37,6 +37,7 @@ class WhisperCppTranscriber:
         language: str = "auto",
         beam_size: int = 1,
         translate: bool = False,
+        initial_prompt: str = "",
     ) -> None:
         if _WhisperModel is None:
             raise TranscriberError(
@@ -51,6 +52,10 @@ class WhisperCppTranscriber:
         # preserved for v2 when beam_search params will be wired in.
         self._beam_size = beam_size
         self._translate = translate
+        # Whisper's initial_prompt is a lexical prior — tokenized once and
+        # used to bias the decoder at the start of every transcription. Empty
+        # string means "no prompt" (the whisper.cpp default behavior).
+        self._initial_prompt = initial_prompt or None
         # params_sampling_strategy: 0 = GREEDY, 1 = BEAM_SEARCH
         strategy = 1 if self._beam_size and self._beam_size > 1 else 0
         self._model = _WhisperModel(  # type: ignore[call-arg]
@@ -75,6 +80,7 @@ class WhisperCppTranscriber:
             audio,
             language=self._language,
             translate=self._translate,
+            initial_prompt=self._initial_prompt,
         )
         # pywhispercpp can return the same segment multiple times when
         # whisper's temperature fallback chain re-samples the same low-

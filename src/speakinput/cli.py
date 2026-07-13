@@ -112,6 +112,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip transcribe when audio RMS is below this floor (0 disables, default: 0.005)",
     )
     parser.add_argument(
+        "-P",
+        "--initial-prompt",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help='Whisper initial_prompt — bias the decoder toward specific '
+        'vocabulary (e.g. names, jargon, acronyms). Empty for no prompt.',
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -177,6 +186,7 @@ def _diagnose(config: Config) -> int:
         model=model_path,
         language=config.stt.language,
         beam_size=config.stt.beam_size,
+        initial_prompt=config.stt.initial_prompt,
     )
     # Force a warmup pass so the user can see if the model actually works.
     transcriber.transcribe(np.zeros(1600, dtype=np.float32), 16000)
@@ -232,6 +242,8 @@ def main(argv: list[str] | None = None) -> int:
         config = config.with_overrides(trailing_space=args.trailing_space)
     if args.silence_threshold is not None:
         config = config.with_overrides(silence_threshold=args.silence_threshold)
+    if args.initial_prompt is not None:
+        config = config.with_overrides(initial_prompt=args.initial_prompt)
 
     if args.diagnose:
         return _diagnose(config)

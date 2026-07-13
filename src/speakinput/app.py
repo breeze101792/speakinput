@@ -72,6 +72,7 @@ class App:
             model=model_path,
             language=self.config.stt.language,
             beam_size=self.config.stt.beam_size,
+            initial_prompt=self.config.stt.initial_prompt,
         )
 
     def on_hotkey_press(self) -> None:
@@ -204,12 +205,14 @@ class App:
         inject_mode = "off (dry-run)" if self.dry_run else "on"
         threshold = cfg.audio.silence_threshold
         threshold_str = "off" if threshold == 0 else f"{threshold:g}"
+        prompt_str = "off" if not cfg.stt.initial_prompt else repr(cfg.stt.initial_prompt)
         lines = [
             f"model    : {cfg.stt.model}",
             f"language : {cfg.stt.language}",
             f"hotkey   : {cfg.hotkey.key}",
             f"sample   : {cfg.audio.sample_rate} Hz, device={device}",
             f"silence  : rms<{threshold_str} -> skip",
+            f"prompt   : {prompt_str}",
             f"inject   : {inject_mode}, trailing_space={cfg.inject.trailing_space}",
         ]
         for line in lines:

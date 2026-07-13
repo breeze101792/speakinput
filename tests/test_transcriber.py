@@ -165,6 +165,51 @@ def test_explicit_language_is_passed_through(fake_pywhispercpp):
     assert model_instance.transcribe.call_args.kwargs["language"] == "zh"
 
 
+# --- initial_prompt --------------------------------------------------------
+
+
+def test_transcribe_passes_initial_prompt(fake_pywhispercpp):
+    """A non-empty initial_prompt must reach pywhispercpp so the decoder
+    gets the lexical prior."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    model_instance.transcribe.return_value = [MagicMock(text="kubectl")]
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber(initial_prompt="kubectl apply -f deployment.yaml")
+    t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert (
+        model_instance.transcribe.call_args.kwargs["initial_prompt"]
+        == "kubectl apply -f deployment.yaml"
+    )
+
+
+def test_transcribe_empty_initial_prompt_becomes_none(fake_pywhispercpp):
+    """The whisper.cpp C library prefers None over "" for the absent-prompt
+    case. We normalize here so the user's `initial_prompt = ""` in
+    config.toml behaves like "no prompt at all"."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber(initial_prompt="")
+    t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert model_instance.transcribe.call_args.kwargs["initial_prompt"] is None
+
+
+def test_constructor_default_has_no_prompt(fake_pywhispercpp):
+    """Default constructor must not bias the decoder (initial_prompt=None)."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    fake_pywhispercpp.return_value = MagicMock()
+
+    t = WhisperCppTranscriber()
+    t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert fake_pywhispercpp.return_value.transcribe.call_args.kwargs["initial_prompt"] is None
+
+
 # --- duplicate-segment defense --------------------------------------------
 
 

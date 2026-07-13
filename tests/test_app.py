@@ -466,4 +466,29 @@ def test_run_prints_startup_banner(monkeypatch, capsys):
     assert "[startup] language : auto" in captured.err
     assert "[startup] hotkey   : alt_r" in captured.err
     assert "[startup] sample   :" in captured.err
+    assert "[startup] silence  :" in captured.err
+    assert "[startup] prompt   : off" in captured.err  # empty default
     assert "[startup] inject   :" in captured.err
+
+
+def test_run_passes_initial_prompt_to_transcriber(monkeypatch):
+    """`stt.initial_prompt` from config must reach the WhisperCppTranscriber
+    constructor so the decoder gets the lexical prior on every call."""
+    from speakinput.app import App
+    from speakinput.config import Config, STTConfig
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(stt=STTConfig(initial_prompt="kubectl apply -f deployment.yaml"))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    fake_model_cls.assert_called_once()
+    assert (
+        fake_model_cls.call_args.kwargs["initial_prompt"]
+        == "kubectl apply -f deployment.yaml"
+    )
