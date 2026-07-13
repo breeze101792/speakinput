@@ -14,6 +14,11 @@ from speakinput.config import (
     default_config_path,
     load_config,
 )
+from speakinput.models import (
+    ModelDownloadError,
+    ModelNotFoundError,
+    ensure_model,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -40,6 +45,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--list-devices",
         action="store_true",
         help="List available audio input devices and exit",
+    )
+    parser.add_argument(
+        "-L",
+        "--list-models",
+        action="store_true",
+        help="List available whisper models and exit",
     )
     parser.add_argument(
         "-D",
@@ -102,6 +113,16 @@ def _list_devices() -> int:
     return 0
 
 
+def _list_models() -> int:
+    """List models curated for v1. Full pywhispercpp list is also accepted via
+    a path to a .bin file, but the curated set is what we recommend."""
+    curated = ("tiny.en", "base.en", "small.en")
+    print("curated models (default whitelist):")
+    for name in curated:
+        print(f"  {name}")
+    return 0
+
+
 def _diagnose(config: Config) -> int:
     import time
 
@@ -110,13 +131,24 @@ def _diagnose(config: Config) -> int:
     from speakinput.audio import AudioRecorder
     from speakinput.transcriber import WhisperCppTranscriber
 
-    print("loading model...", file=sys.stderr)
+    # Bootstrap the model the same way the live app does, so a misconfigured
+    # `stt.model` surfaces here rather than at first transcribe().
+    try:
+        model_path = ensure_model(config.stt.model)
+    except ModelNotFoundError as exc:
+        print(f"model error: {exc}", file=sys.stderr)
+        return 2
+    except ModelDownloadError as exc:
+        print(f"model error: {exc}", file=sys.stderr)
+        return 2
+
+    print("loading model into memory...", file=sys.stderr)
     transcriber = WhisperCppTranscriber(
-        model=config.stt.model,
+        model=model_path,
         language=config.stt.language,
         beam_size=config.stt.beam_size,
     )
-    # Force the model load by passing a tiny silent buffer.
+    # Force a warmup pass so the user can see if the model actually works.
     transcriber.transcribe(np.zeros(1600, dtype=np.float32), 16000)
     print("model loaded", file=sys.stderr)
 
@@ -147,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_devices:
         return _list_devices()
+    if args.list_models:
+        return _list_models()
 
     try:
         config = load_config(args.config)

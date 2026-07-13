@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 
 def _build_app(debug: bool = False, dry_run: bool = False):
@@ -168,3 +169,84 @@ def test_inject_error_does_not_crash(capsys):
     app.on_hotkey_press()
     # Should NOT raise — the release path catches injection errors.
     app.on_hotkey_release()
+
+
+# --- model bootstrap tests -------------------------------------------------
+
+
+def test_run_bootstraps_model_when_no_transcriber_injected(monkeypatch):
+    """If no transcriber was passed in, run() must call ensure_model and
+    construct the default WhisperCppTranscriber with the resolved path."""
+    from speakinput.app import App
+    from speakinput.config import Config
+
+    fake_ensure = MagicMock(return_value="/resolved/model.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config()
+    # Recorder, injector, feedback are not used in run() until after bootstrap.
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    assert app.transcriber is None  # confirm precondition
+
+    # Stop the run loop immediately after the listener starts.
+    app._shutdown.set()
+    app.run()
+
+    fake_ensure.assert_called_once_with("base.en")
+    fake_model_cls.assert_called_once()
+    # The path from ensure_model should be the one passed to the constructor.
+    assert fake_model_cls.call_args.kwargs["model"] == "/resolved/model.bin"
+
+
+def test_run_skips_bootstrap_when_transcriber_injected():
+    """If a transcriber was passed in (e.g. in tests), run() must not call
+    ensure_model — the test owns the transcriber."""
+    app, _, transcriber, _, _ = _build_app()
+    assert app.transcriber is transcriber  # precondition
+
+    # No monkeypatching of ensure_model — if it were called, the test would
+    # fail because pywhispercpp isn't installed in the test env. We assert
+    # by simply running the early portion of run() and checking nothing
+    # was constructed.
+    app._shutdown.set()
+    app.run()  # should not raise
+    assert app.transcriber is transcriber
+
+
+def test_run_with_unknown_model_exits(monkeypatch, capsys):
+    """A misconfigured model name should exit 2 before the listener starts."""
+    from speakinput.app import App
+    from speakinput.config import Config
+    from speakinput.models import ModelNotFoundError
+
+    fake_ensure = MagicMock(side_effect=ModelNotFoundError("unknown model"))
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+
+    config = Config()
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+
+    with pytest.raises(SystemExit) as exc_info:
+        app.run()
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "unknown model" in captured.err
+
+
+def test_run_with_download_failure_exits(monkeypatch, capsys):
+    from speakinput.app import App
+    from speakinput.config import Config
+    from speakinput.models import ModelDownloadError
+
+    fake_ensure = MagicMock(side_effect=ModelDownloadError("network down"))
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+
+    config = Config()
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+
+    with pytest.raises(SystemExit) as exc_info:
+        app.run()
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "network down" in captured.err

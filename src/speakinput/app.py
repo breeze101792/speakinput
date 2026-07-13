@@ -13,6 +13,7 @@ from speakinput.config import Config
 from speakinput.feedback import Feedback, NullFeedback
 from speakinput.hotkey import HotkeyListener, resolve_key
 from speakinput.injector import Injector, TypingInjector
+from speakinput.models import ModelDownloadError, ModelNotFoundError, ensure_model
 from speakinput.transcriber import Transcriber, WhisperCppTranscriber
 
 log = logging.getLogger("speakinput")
@@ -40,11 +41,10 @@ class App:
             sample_rate=config.audio.sample_rate,
             device=config.audio.device,
         )
-        self.transcriber = transcriber or WhisperCppTranscriber(
-            model=config.stt.model,
-            language=config.stt.language,
-            beam_size=config.stt.beam_size,
-        )
+        # Defer the default transcriber to run() so we can resolve and
+        # download the model first. Tests that inject a transcriber don't
+        # pay this cost.
+        self.transcriber = transcriber
         self.injector = injector or TypingInjector(
             restore_clipboard_ms=config.inject.restore_clipboard_ms,
             trailing_space=config.inject.trailing_space,
@@ -56,6 +56,18 @@ class App:
         self._busy = threading.Lock()
         self._press_started_at: float | None = None
         self.listener: HotkeyListener | None = None
+
+    def _build_default_transcriber(self) -> Transcriber:
+        """Resolve the model path (downloading if needed) and construct the
+        default WhisperCppTranscriber. Raises ModelNotFoundError /
+        ModelDownloadError if the model can't be made available.
+        """
+        model_path = ensure_model(self.config.stt.model)
+        return WhisperCppTranscriber(
+            model=model_path,
+            language=self.config.stt.language,
+            beam_size=self.config.stt.beam_size,
+        )
 
     def on_hotkey_press(self) -> None:
         # Guard against re-entry: if a previous press is still being processed,
@@ -123,6 +135,17 @@ class App:
         self.feedback.set_state("idle")
 
     def run(self) -> None:
+        # Bootstrap: ensure the model is on disk BEFORE we start the hotkey
+        # listener, so the user never sees a 141 MB download start mid-session.
+        if self.transcriber is None:
+            try:
+                self.transcriber = self._build_default_transcriber()
+            except ModelNotFoundError as exc:
+                print(f"model error: {exc}", file=sys.stderr)
+                raise SystemExit(2) from exc
+            except ModelDownloadError as exc:
+                print(f"model error: {exc}", file=sys.stderr)
+                raise SystemExit(2) from exc
         self.feedback.start()
         self.listener = HotkeyListener(
             key=resolve_key(self.config.hotkey.key),

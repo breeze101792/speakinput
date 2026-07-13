@@ -1,5 +1,6 @@
 """Tests for the transcriber. Mocks pywhispercpp so tests are CPU/disk-free."""
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -29,33 +30,37 @@ def test_raises_when_pywhispercpp_missing(monkeypatch):
         WhisperCppTranscriber()
 
 
+def test_constructor_loads_model_eagerly(fake_pywhispercpp):
+    """The model is loaded in __init__, not deferred to first transcribe()."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    fake_pywhispercpp.return_value = model_instance
+
+    WhisperCppTranscriber(model="/path/to/model.bin", language="en", beam_size=1)
+    fake_pywhispercpp.assert_called_once()
+    # The path we pass should be the one given to the Model constructor.
+    assert fake_pywhispercpp.call_args.args[0] == "/path/to/model.bin"
+
+
+def test_constructor_accepts_path_object(fake_pywhispercpp):
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    WhisperCppTranscriber(model=Path("/some/model.bin"))
+    assert fake_pywhispercpp.call_args.args[0] == "/some/model.bin"
+
+
 def test_transcribe_empty_audio_returns_empty(fake_pywhispercpp):
     from speakinput.transcriber import WhisperCppTranscriber
 
-    model_cls = fake_pywhispercpp
+    model_instance = MagicMock()
+    fake_pywhispercpp.return_value = model_instance
+
     t = WhisperCppTranscriber()
     out = t.transcribe(np.zeros(0, dtype=np.float32), 16000)
     assert out == ""
-    model_cls.assert_not_called()  # model not loaded for empty input
-
-
-def test_transcribe_loads_model_lazily_on_first_call(fake_pywhispercpp):
-    from speakinput.transcriber import WhisperCppTranscriber
-
-    model_cls = fake_pywhispercpp
-    model_instance = MagicMock()
-    seg = MagicMock(text="hello world ")
-    model_instance.transcribe.return_value = [seg]
-    model_cls.return_value = model_instance
-
-    t = WhisperCppTranscriber(model="base.en", language="en", beam_size=1)
-    # No model loaded yet.
-    model_cls.assert_not_called()
-    out = t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
-    assert out == "hello world"
-    # Model loaded exactly once across the call.
-    model_cls.assert_called_once()
-    model_instance.transcribe.assert_called_once()
+    # Model was loaded (eagerly) but not invoked for empty audio.
+    model_instance.transcribe.assert_not_called()
 
 
 def test_transcribe_concatenates_multiple_segments(fake_pywhispercpp):
@@ -112,9 +117,7 @@ def test_transcribe_passes_config_through(fake_pywhispercpp):
 def test_transcribe_with_greedy_strategy_for_beam_size_one(fake_pywhispercpp):
     from speakinput.transcriber import WhisperCppTranscriber
 
-    model_instance = MagicMock()
-    model_instance.transcribe.return_value = [MagicMock(text="x")]
-    fake_pywhispercpp.return_value = model_instance
+    fake_pywhispercpp.return_value = MagicMock()
 
     t = WhisperCppTranscriber(beam_size=1)
     t.transcribe(np.zeros(1600, dtype=np.float32), 16000)

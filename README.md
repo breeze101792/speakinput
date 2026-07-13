@@ -22,7 +22,18 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-On first run Speak Input writes a default config to `~/Library/Application Support/speakinput/config.toml`.
+On first run Speak Input writes a default config to `~/Library/Application Support/speakinput/config.toml`, then checks whether the configured model file is present. If not, it downloads it from Hugging Face **at startup**, before the push-to-talk listener starts — you will not be surprised by a multi-hundred-MB download in the middle of a recording session. Subsequent runs reuse the cached model and start in seconds.
+
+## Model management
+
+The model is downloaded into pywhispercpp's cache directory, typically `~/Library/Application Support/pywhispercpp/models/`. By default Speak Input uses the `base.en` model (~141 MB). To see the curated model list, run `speakinput -L`.
+
+```bash
+speakinput -L                     # show the curated list
+speakinput -m small.en            # pick a different model; downloaded on first use
+```
+
+If the download fails (no internet, firewall, disk full), Speak Input exits with code 2 and a clear error message — the listener never starts. Fix the underlying problem and re-run.
 
 ## macOS permissions
 
@@ -79,6 +90,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-c`  | `--config PATH`       | Path to config.toml                             |
 | `-m`  | `--model NAME`        | Override the whisper model (`tiny.en`/`base.en`/`small.en`) |
 | `-l`  | `--list-devices`      | List available input devices and exit           |
+| `-L`  | `--list-models`       | List curated whisper models and exit            |
 | `-D`  | `--diagnose`          | Record 2s and print audio stats                 |
 | `-n`  | `--no-inject`         | Print transcript to stderr instead of typing it |
 | `-d`  | `--debug`             | Log every key event and transcript to stderr    |
