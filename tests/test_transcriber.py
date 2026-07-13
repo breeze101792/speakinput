@@ -134,3 +134,91 @@ def test_transcribe_with_translate_flag(fake_pywhispercpp):
     t = WhisperCppTranscriber(translate=True)
     t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
     assert model_instance.transcribe.call_args.kwargs["translate"] is True
+
+
+# --- language handling -----------------------------------------------------
+
+
+def test_auto_language_is_passed_as_none(fake_pywhispercpp):
+    """`language="auto"` must reach pywhispercpp as `None` so the model runs
+    per-utterance language identification."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    model_instance.transcribe.return_value = [MagicMock(text="你好")]
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber(model="small", language="auto")
+    t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert model_instance.transcribe.call_args.kwargs["language"] is None
+
+
+def test_explicit_language_is_passed_through(fake_pywhispercpp):
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    model_instance.transcribe.return_value = [MagicMock(text="你好")]
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber(model="small", language="zh")
+    t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert model_instance.transcribe.call_args.kwargs["language"] == "zh"
+
+
+# --- duplicate-segment defense --------------------------------------------
+
+
+def test_transcribe_collapses_consecutive_duplicate_segments(fake_pywhispercpp):
+    """pywhispercpp can return the same segment multiple times when whisper's
+    temperature fallback chain re-samples a low-confidence region. We must
+    collapse consecutive duplicates so the user doesn't see the same phrase
+    typed three times."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    model_instance.transcribe.return_value = [
+        MagicMock(text="Hello, how are you? "),
+        MagicMock(text="Hello, how are you? "),
+        MagicMock(text="Hello, how are you?"),
+    ]
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber()
+    out = t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert out == "Hello, how are you?"
+
+
+def test_transcribe_keeps_non_consecutive_duplicates(fake_pywhispercpp):
+    """Only collapse when two identical segments are *adjacent* — legitimate
+    repeated phrases (e.g. "yes yes" or the same word twice in a sentence)
+    are still distinct segments with content between them."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    model_instance.transcribe.return_value = [
+        MagicMock(text="yes "),
+        MagicMock(text="no "),
+        MagicMock(text="yes"),
+    ]
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber()
+    out = t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert out == "yes no yes"
+
+
+def test_transcribe_drops_blank_audio_marker(fake_pywhispercpp):
+    """The model's no-speech marker should never reach the user."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    model_instance.transcribe.return_value = [
+        MagicMock(text="[BLANK_AUDIO]"),
+        MagicMock(text=" "),
+        MagicMock(text=""),
+    ]
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber()
+    out = t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert out == ""

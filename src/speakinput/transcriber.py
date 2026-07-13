@@ -33,8 +33,8 @@ class WhisperCppTranscriber:
 
     def __init__(
         self,
-        model: str | Path = "base.en",
-        language: str = "en",
+        model: str | Path = "small",
+        language: str = "auto",
         beam_size: int = 1,
         translate: bool = False,
     ) -> None:
@@ -43,7 +43,9 @@ class WhisperCppTranscriber:
                 "pywhispercpp is not installed. Install with `pip install pywhispercpp`."
             )
         self._model_path = str(model)
-        self._language = language
+        # pywhispercpp uses `language=None` to enable per-utterance language
+        # identification. The config "auto" maps to that here.
+        self._language = None if language in (None, "", "auto") else language
         # pywhispercpp uses sampling strategy (0=greedy, 1=beam_search) set at
         # construction time. For v1 we always use greedy; the config field is
         # preserved for v2 when beam_search params will be wired in.
@@ -66,10 +68,27 @@ class WhisperCppTranscriber:
         # native rate (16 kHz for whisper). `sample_rate` is accepted for
         # interface parity with future Transcriber implementations.
         del sample_rate
+        # When `_language is None` (auto), pywhispercpp runs the language
+        # identifier on the first 30s of audio and prints the detected
+        # language to stderr. We pass through whichever the caller set.
         segments = self._model.transcribe(  # type: ignore[attr-defined]
             audio,
             language=self._language,
             translate=self._translate,
         )
-        text = "".join(getattr(seg, "text", "") for seg in segments).strip()
-        return text
+        # pywhispercpp can return the same segment multiple times when
+        # whisper's temperature fallback chain re-samples the same low-
+        # confidence region. Real speech segments are unique; collapsing
+        # consecutive identical segments removes the duplicates without
+        # affecting correct output. Whisper also emits a `[BLANK_AUDIO]`
+        # marker for non-speech regions; drop it.
+        _NO_SPEECH_MARKERS = ("[BLANK_AUDIO]",)
+        seen: list[str] = []
+        for seg in segments:
+            text = getattr(seg, "text", "").strip()
+            if not text or text in _NO_SPEECH_MARKERS:
+                continue
+            if seen and seen[-1] == text:
+                continue
+            seen.append(text)
+        return " ".join(seen).strip()

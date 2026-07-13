@@ -194,7 +194,7 @@ def test_run_bootstraps_model_when_no_transcriber_injected(monkeypatch):
     app._shutdown.set()
     app.run()
 
-    fake_ensure.assert_called_once_with("base.en")
+    fake_ensure.assert_called_once_with("small")
     fake_model_cls.assert_called_once()
     # The path from ensure_model should be the one passed to the constructor.
     assert fake_model_cls.call_args.kwargs["model"] == "/resolved/model.bin"

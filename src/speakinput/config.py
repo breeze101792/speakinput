@@ -11,14 +11,34 @@ from platformdirs import user_config_dir
 
 APP_NAME = "speakinput"
 
-VALID_MODELS = ("tiny.en", "base.en", "small.en")
+# Curated models exposed by default. The `.en` variants are English-only and
+# faster; the multilingual variants (`tiny`, `base`, `small`, `medium`) are
+# slower per call but support Chinese and auto-detection. Any absolute path
+# to a .bin file is also accepted at the CLI/ensure_model layer.
+VALID_MODELS = (
+    "tiny.en",
+    "base.en",
+    "small.en",
+    "tiny",
+    "base",
+    "small",
+    "medium",
+)
+# Languages that are always supported. `auto` translates to pywhispercpp's
+# `language=None`, which triggers per-utterance language identification.
+VALID_LANGUAGES = ("auto", "en", "zh")
 VALID_HOTKEYS = ("alt_r", "ctrl_r", "cmd_r", "shift_r", "caps_lock", "f12")
+
+
+# Model names that are English-only. Pairing one with a non-English language
+# would be a misconfiguration; we surface it at validate() time.
+_ENGLISH_ONLY_MODELS = frozenset({"tiny.en", "base.en", "small.en"})
 
 
 @dataclass(frozen=True)
 class STTConfig:
-    model: str = "base.en"
-    language: str = "en"
+    model: str = "small"
+    language: str = "auto"
     beam_size: int = 1
 
 
@@ -68,6 +88,18 @@ class Config:
     def validate(self) -> None:
         if self.stt.model not in VALID_MODELS:
             raise ValueError(f"stt.model must be one of {VALID_MODELS}, got {self.stt.model!r}")
+        if self.stt.language not in VALID_LANGUAGES:
+            raise ValueError(
+                f"stt.language must be one of {VALID_LANGUAGES}, got {self.stt.language!r}"
+            )
+        if (
+            self.stt.model in _ENGLISH_ONLY_MODELS
+            and self.stt.language not in ("auto", "en")
+        ):
+            raise ValueError(
+                f"model {self.stt.model!r} is English-only; "
+                f"set stt.language to 'en' or 'auto', or pick a multilingual model."
+            )
         if self.hotkey.key not in VALID_HOTKEYS:
             raise ValueError(f"hotkey.key must be one of {VALID_HOTKEYS}, got {self.hotkey.key!r}")
         if self.audio.sample_rate <= 0:
@@ -104,8 +136,8 @@ def write_default_config(path: Path) -> None:
     # `Config.from_dict` defaults it to None when missing.
     path.write_text(
         """[stt]
-model = "base.en"
-language = "en"
+model = "small"
+language = "auto"
 beam_size = 1
 
 [audio]

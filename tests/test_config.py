@@ -90,11 +90,12 @@ def test_from_dict_explicit_none_device_is_none():
 
 def test_with_overrides_does_not_mutate_original():
     cfg = Config()
-    new = cfg.with_overrides(model="small.en", key="f12")
-    assert new.stt.model == "small.en"
+    new = cfg.with_overrides(model="base.en", key="f12")
+    assert new.stt.model == "base.en"
     assert new.hotkey.key == "f12"
     # Original is frozen dataclass: untouched.
-    assert cfg.stt.model == "base.en"
+    assert cfg.stt.model == "small"
+    assert cfg.stt.language == "auto"
     assert cfg.hotkey.key == "alt_r"
 
 
@@ -103,7 +104,8 @@ def test_load_config_writes_default_when_missing(tmp_path: Path):
     assert not path.exists()
     cfg = load_config(path)
     assert path.exists()
-    assert cfg.stt.model == "base.en"
+    assert cfg.stt.model == "small"
+    assert cfg.stt.language == "auto"
     assert cfg.hotkey.key == "alt_r"
 
 
@@ -111,7 +113,8 @@ def test_load_config_reads_existing(tmp_path: Path):
     path = tmp_path / "config.toml"
     write_default_config(path)
     cfg = load_config(path)
-    assert cfg.stt.model == "base.en"
+    assert cfg.stt.model == "small"
+    assert cfg.stt.language == "auto"
 
 
 def test_write_default_config_does_not_overwrite(tmp_path: Path):
@@ -119,3 +122,40 @@ def test_write_default_config_does_not_overwrite(tmp_path: Path):
     path.write_text('[stt]\nmodel = "tiny.en"\n', encoding="utf-8")
     write_default_config(path)
     assert 'model = "tiny.en"' in path.read_text(encoding="utf-8")
+
+
+# --- multilingual / Chinese support ---------------------------------------
+
+
+def test_default_model_is_multilingual():
+    """The shipped default should be `small` (multilingual) so first-run
+    Chinese works out of the box without any config editing."""
+    assert Config().stt.model == "small"
+    assert Config().stt.language == "auto"
+
+
+def test_validation_accepts_multilingual_models():
+    for m in ("tiny", "base", "small", "medium"):
+        Config(stt=STTConfig(model=m, language="zh")).validate()
+
+
+def test_validation_accepts_auto_language():
+    Config(stt=STTConfig(model="base", language="auto")).validate()
+    Config(stt=STTConfig(model="small.en", language="auto")).validate()
+
+
+def test_validation_rejects_unknown_language():
+    with pytest.raises(ValueError, match="stt.language"):
+        Config(stt=STTConfig(model="base", language="fr")).validate()
+
+
+def test_validation_rejects_english_only_model_with_chinese():
+    """tiny.en / base.en / small.en can't do Chinese. Fail fast with a clear
+    error rather than feeding it to whisper and getting nonsense back."""
+    with pytest.raises(ValueError, match="English-only"):
+        Config(stt=STTConfig(model="base.en", language="zh")).validate()
+
+
+def test_validation_allows_english_only_model_with_en_or_auto():
+    Config(stt=STTConfig(model="base.en", language="en")).validate()
+    Config(stt=STTConfig(model="base.en", language="auto")).validate()

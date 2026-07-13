@@ -11,8 +11,17 @@ def fake_pw_utils(monkeypatch):
     from speakinput import models as m
 
     fake = MagicMock()
-    fake.AVAILABLE_MODELS = ["tiny.en", "base.en", "small.en", "large-v3"]
-    fake.download_model = MagicMock(return_value="/cache/base.en.bin")
+    fake.AVAILABLE_MODELS = [
+        "tiny.en",
+        "base.en",
+        "small.en",
+        "tiny",
+        "base",
+        "small",
+        "medium",
+        "large-v3",
+    ]
+    fake.download_model = MagicMock(return_value="/cache/small.bin")
     monkeypatch.setattr(m, "_pw_utils", fake, raising=False)
     return fake
 
@@ -23,9 +32,9 @@ def fake_pw_utils(monkeypatch):
 def test_ensure_known_model_calls_downloader(fake_pw_utils, capsys):
     from speakinput.models import ensure_model
 
-    path = ensure_model("base.en")
-    assert str(path) == "/cache/base.en.bin"
-    fake_pw_utils.download_model.assert_called_once_with("base.en")
+    path = ensure_model("small")
+    assert str(path) == "/cache/small.bin"
+    fake_pw_utils.download_model.assert_called_once_with("small")
     captured = capsys.readouterr()
     assert "checking model" in captured.err
     assert "model ready" in captured.err
@@ -43,7 +52,7 @@ def test_ensure_downloader_failure_raises(fake_pw_utils):
 
     fake_pw_utils.download_model.side_effect = RuntimeError("network down")
     with pytest.raises(ModelDownloadError, match="failed to download"):
-        ensure_model("base.en")
+        ensure_model("small")
 
 
 def test_ensure_downloader_returns_empty_raises(fake_pw_utils):
@@ -51,7 +60,7 @@ def test_ensure_downloader_returns_empty_raises(fake_pw_utils):
 
     fake_pw_utils.download_model.return_value = None
     with pytest.raises(ModelDownloadError, match="no path"):
-        ensure_model("base.en")
+        ensure_model("small")
 
 
 # --- path input (no download) -----------------------------------------------

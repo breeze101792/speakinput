@@ -19,6 +19,7 @@ from speakinput.models import (
     ModelNotFoundError,
     ensure_model,
 )
+from speakinput.singleinstance import acquire as acquire_instance_lock
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -36,9 +37,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-m",
         "--model",
-        choices=("tiny.en", "base.en", "small.en"),
+        choices=(
+            "tiny.en",
+            "base.en",
+            "small.en",
+            "tiny",
+            "base",
+            "small",
+            "medium",
+        ),
         default=None,
-        help="Override the whisper model from config",
+        help="Override the whisper model from config (default: small)",
     )
     parser.add_argument(
         "-l",
@@ -116,10 +125,15 @@ def _list_devices() -> int:
 def _list_models() -> int:
     """List models curated for v1. Full pywhispercpp list is also accepted via
     a path to a .bin file, but the curated set is what we recommend."""
-    curated = ("tiny.en", "base.en", "small.en")
+    from speakinput.config import VALID_MODELS
+
     print("curated models (default whitelist):")
-    for name in curated:
-        print(f"  {name}")
+    for name in VALID_MODELS:
+        suffix = "  # English-only" if name.endswith(".en") else "  # multilingual"
+        print(f"  {name}{suffix}")
+    print()
+    print("English-only models are faster. Multilingual models support")
+    print("Chinese and other languages via stt.language in config.toml.")
     return 0
 
 
@@ -181,6 +195,12 @@ def main(argv: list[str] | None = None) -> int:
         return _list_devices()
     if args.list_models:
         return _list_models()
+
+    # Acquire the single-instance lock before any heavy work. If another
+    # speakinput is already running, this exits 3 immediately. The fd is
+    # intentionally held for the rest of the process lifetime so the OS
+    # releases the lock when we exit (or crash).
+    acquire_instance_lock()
 
     try:
         config = load_config(args.config)

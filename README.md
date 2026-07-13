@@ -26,14 +26,28 @@ On first run Speak Input writes a default config to `~/Library/Application Suppo
 
 ## Model management
 
-The model is downloaded into pywhispercpp's cache directory, typically `~/Library/Application Support/pywhispercpp/models/`. By default Speak Input uses the `base.en` model (~141 MB). To see the curated model list, run `speakinput -L`.
+The model is downloaded into pywhispercpp's cache directory, typically `~/Library/Application Support/pywhispercpp/models/`. By default Speak Input uses the `small` model (~466 MB, multilingual) so it works for English *and* Chinese out of the box. To see the curated model list, run `speakinput -L`.
 
 ```bash
 speakinput -L                     # show the curated list
-speakinput -m small.en            # pick a different model; downloaded on first use
+speakinput -m base.en             # pick a different model; downloaded on first use
 ```
 
 If the download fails (no internet, firewall, disk full), Speak Input exits with code 2 and a clear error message — the listener never starts. Fix the underlying problem and re-run.
+
+## Languages
+
+`stt.language` in `config.toml` controls what language the model transcribes:
+
+| Value   | What it does                                                | Pairs with                          |
+| ------- | ----------------------------------------------------------- | ----------------------------------- |
+| `auto`  | Detect the spoken language per utterance (default)          | multilingual models (`tiny`/`base`/`small`/`medium`) |
+| `en`    | Force English (faster, more accurate than auto for English) | any model                           |
+| `zh`    | Force Chinese (Mandarin)                                    | multilingual models only           |
+
+With the default `model = "small"` and `language = "auto"`, you can switch between English and Chinese mid-session without restarting. The trade-off: `auto` runs the language identifier on the first 30s of every recording, which adds a small latency hit and is slightly less accurate than explicitly stating the language. If you only ever dictate in one language, set `language` explicitly and you'll get better results.
+
+English-only models (`tiny.en`, `base.en`, `small.en`) are faster but cannot do Chinese. If you set `language = "zh"` with an English-only model, Speak Input will refuse to start with a clear error.
 
 ## macOS permissions
 
@@ -74,7 +88,7 @@ macOS sometimes resets these permissions after a macOS update, after major Pytho
 
 ```bash
 speakinput                       # run with default config
-speakinput -m small.en           # override the model for this run
+speakinput -m base.en            # override the model for this run
 speakinput -l                     # show available input devices
 speakinput -D                     # record 2s, print audio stats, don't inject
 speakinput -n                     # print transcribed text to stderr instead of typing
@@ -88,7 +102,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | Short | Long                  | What it does                                    |
 | ----- | --------------------- | ----------------------------------------------- |
 | `-c`  | `--config PATH`       | Path to config.toml                             |
-| `-m`  | `--model NAME`        | Override the whisper model (`tiny.en`/`base.en`/`small.en`) |
+| `-m`  | `--model NAME`        | Override the whisper model (`tiny`/`base`/`small`/`medium`/`.en` variants) |
 | `-l`  | `--list-devices`      | List available input devices and exit           |
 | `-L`  | `--list-models`       | List curated whisper models and exit            |
 | `-D`  | `--diagnose`          | Record 2s and print audio stats                 |
@@ -111,14 +125,19 @@ To change the model:
 
 ```toml
 [stt]
-model = "base.en"    # tiny.en | base.en | small.en
+model = "small"        # tiny.en | base.en | small.en | tiny | base | small | medium
+language = "auto"      # auto | en | zh
 ```
 
-| Model    | Size  | Speed (M1) | Accuracy |
-| -------- | ----- | ---------- | -------- |
-| tiny.en  | 75 MB | ~real-time | OK for short phrases |
-| base.en  | 142 MB| ~real-time | Good default |
-| small.en | 466 MB| ~2x slower | Best for noisy mics |
+| Model    | Size  | Speed (M1) | Languages                |
+| -------- | ----- | ---------- | ------------------------ |
+| tiny.en  | 75 MB | ~real-time | English (fastest)        |
+| base.en  | 142 MB| ~real-time | English                  |
+| small.en | 466 MB| ~2x slower | English (best `.en`)     |
+| tiny     | 75 MB | ~real-time | multilingual             |
+| base     | 142 MB| ~real-time | multilingual             |
+| small    | 466 MB| ~2x slower | multilingual (default)   |
+| medium   | 1.5 GB| ~5x slower | multilingual (best)      |
 
 The first time you select a model, pywhispercpp downloads it to `~/.cache/pywhispercpp/`.
 
@@ -126,8 +145,8 @@ The first time you select a model, pywhispercpp downloads it to `~/.cache/pywhis
 
 ```toml
 [stt]
-model = "base.en"          # whisper.cpp model
-language = "en"            # language code
+model = "small"            # whisper.cpp model; see model table below
+language = "auto"          # auto | en | zh
 beam_size = 1              # 1 = greedy (fastest); up to 10 for higher accuracy
 
 [audio]
@@ -157,7 +176,7 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 
 - A `StreamingTranscriber` that consumes `AudioRecorder.chunk_generator()` for partial results while the key is still held (the "overlapped streaming" goal from the original design).
 - A `CommandInjector` that interprets the transcription and dispatches to shell or an agent.
-- A multilingual model path for Chinese (the config field exists; the UI is intentionally not wired up yet).
+- A streaming partial-results UI as you hold the key.
 
 ## Troubleshooting
 
@@ -169,7 +188,9 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 
 **`pywhispercpp` fails to load the model.** Make sure the model name matches exactly (case-sensitive, e.g. `base.en` not `Base.en`). Run `speakinput --diagnose` to surface the error directly.
 
-**Transcription is empty / nonsense.** Try `small.en` for noisy environments. Make sure `--list-devices` is showing the right mic; set `[audio].device` to its index.
+**Transcription is empty / nonsense.** Try `small` (or `medium`) for noisy environments. Make sure `--list-devices` is showing the right mic; set `[audio].device` to its index.
+
+**The same phrase appears multiple times in the focused field.** Two processes are listening to the hotkey. The app refuses to start a second instance — the new process exits with code 3 and a clear error message pointing at the lockfile. Check `ps aux | grep speakinput` and kill any leftover processes. A common cause is starting the app, getting distracted, then starting it again from another terminal — every instance registers a hotkey listener and your single key release fans out to all of them.
 
 ## Development
 
