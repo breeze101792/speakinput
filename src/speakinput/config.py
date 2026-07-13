@@ -46,6 +46,12 @@ class STTConfig:
 class AudioConfig:
     device: int | None = None
     sample_rate: int = 16000
+    # Audio whose RMS is below this floor is treated as silence and never
+    # sent to the model. Stops whisper from hallucinating on near-empty
+    # recordings (e.g. user pressed the hotkey by accident). 0 disables
+    # the gate. Default 0.005 — quiet enough to swallow room noise,
+    # loud enough to admit any actual speech.
+    silence_threshold: float = 0.005
 
 
 @dataclass(frozen=True)
@@ -104,6 +110,8 @@ class Config:
             raise ValueError(f"hotkey.key must be one of {VALID_HOTKEYS}, got {self.hotkey.key!r}")
         if self.audio.sample_rate <= 0:
             raise ValueError("audio.sample_rate must be positive")
+        if self.audio.silence_threshold < 0:
+            raise ValueError("audio.silence_threshold must be >= 0 (0 disables)")
         if not 1 <= self.stt.beam_size <= 10:
             raise ValueError("stt.beam_size must be in [1, 10]")
 
@@ -142,6 +150,7 @@ beam_size = 1
 
 [audio]
 sample_rate = 16000
+silence_threshold = 0.005
 
 [hotkey]
 key = "alt_r"

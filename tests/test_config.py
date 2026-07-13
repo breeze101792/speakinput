@@ -200,3 +200,40 @@ def test_with_overrides_changes_language():
     new = cfg.with_overrides(language="zh")
     assert new.stt.language == "zh"
     assert cfg.stt.language == "auto"  # original untouched
+
+
+# --- silence threshold -----------------------------------------------------
+
+
+def test_default_silence_threshold():
+    """Default silence_threshold is 0.005 — above room noise, below speech."""
+    assert Config().audio.silence_threshold == 0.005
+
+
+def test_with_overrides_silence_threshold():
+    cfg = Config()
+    new = cfg.with_overrides(silence_threshold=0.02)
+    assert new.audio.silence_threshold == 0.02
+    assert cfg.audio.silence_threshold == 0.005
+
+
+def test_cli_silence_threshold_short_flag():
+    """-S/--silence-threshold must reach the config via with_overrides."""
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["-S", "0.02"])
+    assert args.silence_threshold == 0.02
+
+
+def test_cli_silence_threshold_long_flag():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["--silence-threshold", "0"])
+    assert args.silence_threshold == 0
+
+
+def test_cli_silence_threshold_defaults_to_none():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args([])
+    assert args.silence_threshold is None

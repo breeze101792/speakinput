@@ -104,6 +104,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "-S",
+        "--silence-threshold",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Skip transcribe when audio RMS is below this floor (0 disables, default: 0.005)",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -222,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
         config = config.with_overrides(language=args.language)
     if args.trailing_space is not None:
         config = config.with_overrides(trailing_space=args.trailing_space)
+    if args.silence_threshold is not None:
+        config = config.with_overrides(silence_threshold=args.silence_threshold)
 
     if args.diagnose:
         return _diagnose(config)

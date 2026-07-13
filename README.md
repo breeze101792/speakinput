@@ -113,6 +113,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-d`  | `--debug`             | Log every key event and transcript to stderr    |
 | `-t`  | `--trailing-space`    | Append a space after each transcript (default)  |
 | `-T`  | `--no-trailing-space` | Don't append a space after each transcript      |
+| `-S`  | `--silence-threshold FLOAT` | Skip transcribe when audio RMS is below this floor (0 disables; default 0.005) |
 | `-v`  | `--verbose`           | Enable debug logging from python logging        |
 
 By default the push-to-talk key is **Right Option (Alt)**. Hold it, speak, release. The recognized text is typed into whatever field has focus, **with a trailing space** so the next word doesn't run into the last one. Disable the trailing space with `--no-trailing-space` if you want pure dictation (e.g. when typing into a code editor).
@@ -155,6 +156,8 @@ beam_size = 1              # 1 = greedy (fastest); up to 10 for higher accuracy
 [audio]
 device = null              # null = system default mic; or an integer index from --list-devices
 sample_rate = 16000        # whisper expects 16 kHz; do not change
+silence_threshold = 0.005  # skip transcribe when audio RMS is below this floor
+                           # (0 disables the gate; lower = more sensitive)
 
 [hotkey]
 key = "alt_r"              # see valid keys above
@@ -171,6 +174,7 @@ trailing_space = true      # append a single space after each transcript
 ```
 hotkey press   →  AudioRecorder starts capturing
 hotkey release →  AudioRecorder stops
+              →  silence gate: if RMS < threshold, skip (no hallucination)
               →  WhisperCppTranscriber transcribes the buffer
               →  TypingInjector types the result (or pastes via clipboard for non-ASCII)
 ```
@@ -194,6 +198,8 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 **Transcription is empty / nonsense.** Try `small` (or `medium`) for noisy environments. Make sure `--list-devices` is showing the right mic; set `[audio].device` to its index.
 
 **The same phrase appears multiple times in the focused field.** Two processes are listening to the hotkey. The app refuses to start a second instance — the new process exits with code 3 and a clear error message pointing at the lockfile. Check `ps aux | grep speakinput` and kill any leftover processes. A common cause is starting the app, getting distracted, then starting it again from another terminal — every instance registers a hotkey listener and your single key release fans out to all of them.
+
+**A random short phrase appears when I didn't say anything / accidentally tapped the hotkey.** Whisper hallucinates on near-empty audio — the silence gate should catch this. If you still see phantom text, your environment may be noisy enough that the RMS exceeds the default `0.005` floor. Lower it: `speakinput -S 0.01` or set `[audio].silence_threshold = 0.01` in config.toml. Set to `0` to disable the gate entirely (whisper will see every recording, including silence).
 
 ## Development
 

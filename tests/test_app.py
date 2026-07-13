@@ -9,9 +9,11 @@ import pytest
 def _build_app(debug: bool = False, dry_run: bool = False):
     """Build an App with all I/O collaborators mocked out."""
     from speakinput.app import App
-    from speakinput.config import Config
+    from speakinput.config import AudioConfig, Config
 
-    config = Config()
+    # silence_threshold=0 so tests don't get blocked by the silence gate
+    # even when they pass zero-RMS audio to the mock recorder.
+    config = Config(audio=AudioConfig(silence_threshold=0))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)  # 1s of "silence"
@@ -78,6 +80,105 @@ def test_release_empty_transcript_does_not_inject(capsys):
     app.on_hotkey_press()
     app.on_hotkey_release()
     injector.inject.assert_not_called()
+
+
+def test_release_silence_skips_transcribe(capsys):
+    """If audio RMS is below the configured silence_threshold, we must NOT
+    call the transcriber. Whisper hallucinates on near-empty audio; better
+    to skip the call entirely and log a debug line so the user can see
+    why nothing was typed."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig, Config
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    # 1s of pure silence — RMS is 0.0, well below the threshold.
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    transcriber = MagicMock()
+    injector = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcriber=transcriber,
+        injector=injector,
+        feedback=MagicMock(),
+        debug=True,
+    )
+    app.on_hotkey_press()
+    app.on_hotkey_release()
+
+    transcriber.transcribe.assert_not_called()
+    injector.inject.assert_not_called()
+    captured = capsys.readouterr()
+    assert "silence gate" in captured.err
+    assert "skipping transcribe" in captured.err
+
+
+def test_release_silence_threshold_zero_disables_gate(capsys):
+    """silence_threshold=0 must NOT short-circuit — even zero-RMS audio
+    goes to the transcriber. This is the escape hatch for users who want
+    whisper to see literally everything."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig, Config
+
+    config = Config(audio=AudioConfig(silence_threshold=0))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    transcriber = MagicMock()
+    transcriber.transcribe.return_value = ""
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcriber=transcriber,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+        debug=True,
+    )
+    app.on_hotkey_press()
+    app.on_hotkey_release()
+
+    transcriber.transcribe.assert_called_once()
+
+
+def test_release_loud_audio_passes_gate(capsys):
+    """Audio above the threshold must reach the transcriber."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig, Config
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    # RMS ~ 0.5 (loud tone), well above the threshold.
+    recorder.stop.return_value = np.full(16000, 0.5, dtype=np.float32)
+    transcriber = MagicMock()
+    transcriber.transcribe.return_value = "hello"
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcriber=transcriber,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+        debug=True,
+    )
+    app.on_hotkey_press()
+    app.on_hotkey_release()
+
+    transcriber.transcribe.assert_called_once()
+
+
+# --- silence gate config validation ----------------------------------------
+
+
+def test_validation_rejects_negative_silence_threshold():
+    from speakinput.config import AudioConfig, Config
+
+    with pytest.raises(ValueError, match="silence_threshold"):
+        Config(audio=AudioConfig(silence_threshold=-0.1)).validate()
 
 
 def test_dry_run_prints_text_to_stderr_instead_of_typing(capsys):

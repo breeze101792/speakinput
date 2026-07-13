@@ -117,6 +117,19 @@ class App:
             self.debug,
             f"audio: {audio.size} samples, {duration:.2f}s, rms={rms:.4f}",
         )
+        # Silence gate: short-circuit near-empty recordings so whisper
+        # doesn't hallucinate on them. The default 0.005 is well above
+        # the noise floor of a quiet room but well below any actual
+        # speech. Set to 0 in config.toml to disable.
+        threshold = self.config.audio.silence_threshold
+        if threshold > 0 and rms < threshold:
+            _dbg(
+                self.debug,
+                f"silence gate: rms={rms:.4f} < {threshold:.4f}, skipping transcribe",
+            )
+            self._busy.release()
+            self.feedback.set_state("idle")
+            return
         try:
             text = self.transcriber.transcribe(audio, self.config.audio.sample_rate)
         except Exception:
@@ -189,11 +202,14 @@ class App:
         cfg = self.config
         device = cfg.audio.device if cfg.audio.device is not None else "default"
         inject_mode = "off (dry-run)" if self.dry_run else "on"
+        threshold = cfg.audio.silence_threshold
+        threshold_str = "off" if threshold == 0 else f"{threshold:g}"
         lines = [
             f"model    : {cfg.stt.model}",
             f"language : {cfg.stt.language}",
             f"hotkey   : {cfg.hotkey.key}",
             f"sample   : {cfg.audio.sample_rate} Hz, device={device}",
+            f"silence  : rms<{threshold_str} -> skip",
             f"inject   : {inject_mode}, trailing_space={cfg.inject.trailing_space}",
         ]
         for line in lines:
