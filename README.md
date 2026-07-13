@@ -55,26 +55,73 @@ English-only models (`tiny.en`, `base.en`, `small.en`) are faster but cannot do 
 
 `stt.initial_prompt` in `config.toml` (or `-P` / `--initial-prompt` on the command line) primes whisper's decoder with a fixed text fragment at the start of every transcription. This is a **lexical prior** — it biases the model toward specific vocabulary, but it does not change whisper's behavior the way a chat-model system prompt would.
 
-The shipped default is an embedded-software-engineer bias — C/C++/Rust, MCU names (STM32, ESP32, ARM Cortex), RTOS terms (FreeRTOS, Zephyr, scheduler, mutex, semaphore), peripherals (GPIO, UART, SPI, I2C, DMA, ADC, PWM), debug tools (JTAG, SWD, OpenOCD, GDB), types (`uint32_t`, `size_t`, `bool`), and common idioms (`printf`, `malloc`, `0x`). This dramatically improves recognition for typical embedded dictation out of the box: "configure the DMA controller for UART TX" comes out without mangling the acronyms.
+### Shipped default: embedded software engineer
 
-Use it for:
+Out of the box, the program uses this bias — covering C/C++/Rust, MCU names, RTOS terms, peripherals, debug tools, types, and common idioms:
+
+```text
+C, C++, Rust, embedded, firmware, microcontroller, MCU, STM32, ESP32,
+ARM Cortex, RTOS, FreeRTOS, Zephyr, bootloader, ISR, interrupt,
+DMA, GPIO, UART, SPI, I2C, ADC, PWM, register, peripheral,
+JTAG, SWD, OpenOCD, GDB, linker, flash, SRAM, heap, stack,
+HAL, driver, kernel, scheduler, mutex, semaphore, queue,
+volatile, const, static, inline, typedef, struct, enum,
+void, NULL, nullptr, printf, sprintf, malloc, free, memcpy, memset,
+0x, uint8_t, uint16_t, uint32_t, size_t, bool
+```
+
+Why this is the default: in day-to-day embedded dictation, the same words keep coming up — MCU names, peripheral acronyms, RTOS primitives, type names. Whisper's raw small model mangles them ("STM thirty-two", "D M A controller", "you art one"). Pre-seeding the decoder with the right tokens fixes almost all of these. If you say *"configure the DMA controller for UART TX on the STM32"*, the output is now exactly that — no post-edit needed.
+
+If your work isn't embedded, see [Switching to a different domain](#switching-to-a-different-domain) below.
+
+### What it can bias for you
 
 - **Names** that whisper would otherwise misspell: `"Shaowu"`, `"Karpathy"`, product/team names.
 - **Acronyms**: `"K8s, SRE, PR, kubectl"`.
 - **Technical jargon**: `"kubectl apply -f deployment.yaml"`, `"semver: 1.2.3-rc.1"`.
 - **Style hints**: `"Use British English."`, `"Use semicolons."`.
 
-Do not use it for:
+### What it can't do
 
-- Behavioral directives ("always be concise"). Whisper doesn't follow instructions; it transcribes.
-- Long passages. The prompt is tokenized at start; very long prompts hit whisper's 224-token limit and may confuse the decoder for unrelated speech.
-- Generic text. A prompt like `"hello world"` doesn't help anything and may bias the decoder toward outputting "hello" regardless of what you actually said.
+- **Behavioral directives** ("always be concise"). Whisper doesn't follow instructions; it transcribes.
+- **Long passages.** The prompt is tokenized at start; very long prompts hit whisper's 224-token limit and may confuse the decoder for unrelated speech. The default is ~120 tokens, leaving headroom.
+- **Generic text.** A prompt like `"hello world"` doesn't help anything and may bias the decoder toward outputting "hello" regardless of what you actually said.
 
-To **disable** the default bias, set `initial_prompt = ""` in `config.toml`, or override per-run with an empty value (you cannot easily pass an empty string via `-P`; prefer the config file for disabling). To use a different bias, replace the value in `config.toml` or pass it via `-P` on the command line:
+### Switching to a different domain
+
+Set `initial_prompt` in `config.toml` to a comma-separated list of the words you actually say. Some examples:
+
+```toml
+# Web / DevOps
+initial_prompt = "Kubernetes, K8s, kubectl, Docker, Dockerfile, Helm, Terraform, AWS, S3, EC2, Lambda, CI/CD, GitHub Actions, Grafana, Prometheus, nginx, Postgres, Redis, gRPC, REST, JSON, YAML, semver"
+
+# Data science / ML
+initial_prompt = "PyTorch, TensorFlow, NumPy, pandas, scikit-learn, Jupyter, GPU, CUDA, TPU, transformer, attention, embedding, fine-tune, LoRA, RAG, vector database, Weights and Biases"
+
+# Embedded (the default — shown for reference)
+initial_prompt = "C, C++, Rust, embedded, firmware, STM32, ESP32, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, OpenOCD, GDB"
+```
+
+Or override per-run with `-P`:
 
 ```bash
-./start.sh -P "K8s, SRE, kubectl, Dockerfile, semver"
+./start.sh -P "kubectl apply -f deployment.yaml, Helm, Terraform, K8s"
 ```
+
+### Disabling the bias entirely
+
+Set `initial_prompt = ""` in `config.toml` (empty string). Useful if you dictate in mixed/unpredictable domains and don't want any prior pulling the decoder one way or another.
+
+```toml
+[stt]
+initial_prompt = ""
+```
+
+Note: passing `-P ""` on the command line is awkward (the shell swallows the empty argument). Prefer the config file for disabling.
+
+### Verifying the bias is active
+
+Run `./start.sh -d` and look for the startup banner line `[startup] prompt   : on` — that confirms a non-empty `initial_prompt` is reaching the transcriber. With `initial_prompt = ""` it reads `prompt   : off`.
 
 ## macOS permissions
 
@@ -141,7 +188,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-t`  | `--trailing-space`    | Append a space after each transcript (default)  |
 | `-T`  | `--no-trailing-space` | Don't append a space after each transcript      |
 | `-S`  | `--silence-threshold FLOAT` | Skip transcribe when audio RMS is below this floor (0 disables; default 0.005) |
-| `-P`  | `--initial-prompt TEXT` | Whisper initial_prompt — bias the decoder toward specific vocabulary |
+| `-P`  | `--initial-prompt TEXT` | Override `stt.initial_prompt` for this run (default: embedded-software-engineer bias; see [Initial prompt](#initial-prompt-vocabulary-biasing)) |
 | `-v`  | `--verbose`           | Enable debug logging from python logging        |
 
 By default the push-to-talk key is **Right Option (Alt)**. Hold it, speak, release. The recognized text is typed into whatever field has focus, **with a trailing space** so the next word doesn't run into the last one. Disable the trailing space with `--no-trailing-space` if you want pure dictation (e.g. when typing into a code editor).
@@ -182,8 +229,8 @@ The shipped `config.example.toml` is the source of truth — every field shown t
 model = "small"            # whisper.cpp model; see model table below
 language = "auto"          # auto | en | zh
 beam_size = 1              # 1 = greedy (fastest); up to 10 for higher accuracy
-# initial_prompt = ""      # optional: bias the decoder toward specific vocabulary
-                           # (see "Initial prompt" below)
+# initial_prompt = ""      # default is an embedded-software-engineer bias;
+                           # set to "" to disable. See "Initial prompt" below.
 
 [audio]
 device = null              # null = system default mic; or an integer index from --list-devices
@@ -239,6 +286,8 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 **The same phrase appears multiple times in the focused field.** Two processes are listening to the hotkey. The app refuses to start a second instance — the new process exits with code 3 and a clear error message pointing at the lockfile. Check `ps aux | grep speakinput` and kill any leftover processes. A common cause is starting the app, getting distracted, then starting it again from another terminal — every instance registers a hotkey listener and your single key release fans out to all of them.
 
 **A random short phrase appears when I didn't say anything / accidentally tapped the hotkey.** Whisper hallucinates on near-empty audio — the silence gate should catch this. If you still see phantom text, your environment may be noisy enough that the RMS exceeds the default `0.005` floor. Lower it: `speakinput -S 0.01` or set `[audio].silence_threshold = 0.01` in config.toml. Set to `0` to disable the gate entirely (whisper will see every recording, including silence).
+
+**Output contains "STM32", "DMA", "FreeRTOS" etc. that I didn't say.** The shipped `initial_prompt` biases whisper toward embedded-software vocabulary — see [Initial prompt](#initial-prompt-vocabulary-biasing). It's a one-shot token prior: whisper overweights those words because they appear in the seed. If your dictation isn't embedded (or you want mixed/general speech), either set `stt.initial_prompt = ""` in `config.toml` to disable the bias, or pass a domain-appropriate comma-separated list of the words you actually use. The phantom outputs are strongest right after the prompt tokens ("STM32"), weakest mid-sentence.
 
 ## Development
 
