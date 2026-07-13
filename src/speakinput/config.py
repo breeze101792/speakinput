@@ -1,4 +1,11 @@
-"""Configuration loading and first-run default write."""
+"""Configuration loading.
+
+The program ships with `config.example.toml` in the project root as
+documentation. The user copies that to their user config dir on first
+run (or `start.sh` does it for them) and edits as needed. If the file
+is missing, the program uses hard-coded defaults — every value in
+`config.example.toml` is the same as the dataclass default.
+"""
 
 from __future__ import annotations
 
@@ -44,9 +51,20 @@ class STTConfig:
     # to bias the decoder at the start of every transcription. Useful for
     # names, technical jargon, or acronyms the base model would misspell
     # (e.g. "kubectl apply -f deployment.yaml" biases the decoder toward
-    # those tokens). Default empty (no prompt). Can be overridden per-run
-    # via `-P`/`--initial-prompt` on the CLI.
-    initial_prompt: str = ""
+    # those tokens). The default biases toward embedded software engineer
+    # vocabulary: C/C++, RTOS terms, MCU peripherals, debug tools, and
+    # common acronyms. Can be overridden per-run via `-P`/`--initial-prompt`
+    # on the CLI, or set to "" in config.toml to disable the bias.
+    initial_prompt: str = (
+        "C, C++, Rust, embedded, firmware, microcontroller, MCU, STM32, ESP32, "
+        "ARM Cortex, RTOS, FreeRTOS, Zephyr, bootloader, ISR, interrupt, "
+        "DMA, GPIO, UART, SPI, I2C, ADC, PWM, register, peripheral, "
+        "JTAG, SWD, OpenOCD, GDB, linker, flash, SRAM, heap, stack, "
+        "HAL, driver, kernel, scheduler, mutex, semaphore, queue, "
+        "volatile, const, static, inline, typedef, struct, enum, "
+        "void, NULL, nullptr, printf, sprintf, malloc, free, memcpy, memset, "
+        "0x, uint8_t, uint16_t, uint32_t, size_t, bool"
+    )
 
 
 @dataclass(frozen=True)
@@ -143,46 +161,19 @@ def default_config_path() -> Path:
     return Path(user_config_dir(APP_NAME, appauthor=False)) / "config.toml"
 
 
-def write_default_config(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        return
-    # Note: TOML has no null literal. Audio device is intentionally omitted;
-    # `Config.from_dict` defaults it to None when missing.
-    path.write_text(
-        """[stt]
-model = "small"
-language = "auto"
-beam_size = 1
-# initial_prompt = ""  # optional: bias the decoder toward specific vocabulary
-
-[audio]
-sample_rate = 16000
-silence_threshold = 0.005
-
-[hotkey]
-key = "alt_r"
-
-[inject]
-restore_clipboard_ms = 50
-trailing_space = true
-""",
-        encoding="utf-8",
-    )
-
-
-def load_config(path: Path | None = None, *, write_default: bool = True) -> Config:
+def load_config(path: Path | None = None) -> Config:
     """Load config from `path`, falling back to the user config dir.
 
-    If `write_default` is True and no file exists at the resolved path, a
-    default config.toml is written so the user has a discoverable starting point.
+    If the resolved file is missing, returns a `Config()` populated with
+    the hard-coded defaults — every value matches what's in
+    `config.example.toml`. The program does not auto-write a config file;
+    the user runs `./start.sh` (which copies the example on first run)
+    or `cp config.example.toml ~/.config/speakinput/config.toml`.
     """
     resolved = path or default_config_path()
     if not resolved.exists():
-        if write_default:
-            write_default_config(resolved)
-        else:
-            raise FileNotFoundError(f"config not found: {resolved}")
+        return Config()
     cfg = Config.from_toml(resolved)
     cfg.validate()
     return cfg
+

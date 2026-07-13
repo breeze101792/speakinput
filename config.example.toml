@@ -1,0 +1,37 @@
+# Speak Input — example configuration.
+#
+# Copy this to the user config dir on first run:
+#   cp config.example.toml ~/Library/Application\ Support/speakinput/config.toml
+# or use the helper from the project root:
+#   ./start.sh          # does the copy for you if config.toml is missing
+#
+# Every field shown here is the default the program uses when no config
+# file is present. To customize, uncomment or change the lines you care
+# about — anything left out falls back to the value below.
+
+[stt]
+model = "small"             # tiny.en | base.en | small.en
+                            # tiny | base | small | medium  (multilingual)
+language = "auto"           # auto | en | zh
+beam_size = 1               # 1 = greedy (fastest); 2..10 = beam search
+# initial_prompt = "C, C++, Rust, embedded, firmware, STM32, ESP32, RTOS, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, OpenOCD, GDB, ..."
+                            # bias the decoder toward specific vocabulary;
+                            # see README "Initial prompt" section. The default
+                            # is an embedded-software-engineer bias; set to ""
+                            # to disable.
+
+[audio]
+sample_rate = 16000         # whisper expects 16 kHz; do not change
+silence_threshold = 0.005   # skip transcribe when audio RMS is below this
+                            # (0 disables the gate; lower = more sensitive)
+# device = null             # uncomment to pin a specific input device;
+                            # use `speakinput --list-devices` to see indices
+
+[hotkey]
+key = "alt_r"               # alt_r | ctrl_r | cmd_r | shift_r | caps_lock | f12
+
+[inject]
+restore_clipboard_ms = 50   # how long to wait before restoring the prior
+                            # clipboard contents (Unicode paste path only)
+trailing_space = true       # append a single space after each transcript
+                            # (set false for code editors)

@@ -22,7 +22,9 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-On first run Speak Input writes a default config to `~/Library/Application Support/speakinput/config.toml`, then checks whether the configured model file is present. If not, it downloads it from Hugging Face **at startup**, before the push-to-talk listener starts — you will not be surprised by a multi-hundred-MB download in the middle of a recording session. Subsequent runs reuse the cached model and start in seconds.
+On first run `./start.sh` copies `config.example.toml` to `~/Library/Application Support/speakinput/config.toml` so you have a discoverable starting point. The program also runs fine with no config file at all — every value in `config.example.toml` is the same as the hard-coded default. Edit the copied file to customize, or leave it alone and use CLI flags (`-m`, `-g`, `-P`, `-S`, etc.) to override per-run. The config file is git-ignored; only `config.example.toml` is committed.
+
+Speak Input then checks whether the configured model file is present. If not, it downloads it from Hugging Face **at startup**, before the push-to-talk listener starts — you will not be surprised by a multi-hundred-MB download in the middle of a recording session. Subsequent runs reuse the cached model and start in seconds.
 
 ## Model management
 
@@ -53,6 +55,8 @@ English-only models (`tiny.en`, `base.en`, `small.en`) are faster but cannot do 
 
 `stt.initial_prompt` in `config.toml` (or `-P` / `--initial-prompt` on the command line) primes whisper's decoder with a fixed text fragment at the start of every transcription. This is a **lexical prior** — it biases the model toward specific vocabulary, but it does not change whisper's behavior the way a chat-model system prompt would.
 
+The shipped default is an embedded-software-engineer bias — C/C++/Rust, MCU names (STM32, ESP32, ARM Cortex), RTOS terms (FreeRTOS, Zephyr, scheduler, mutex, semaphore), peripherals (GPIO, UART, SPI, I2C, DMA, ADC, PWM), debug tools (JTAG, SWD, OpenOCD, GDB), types (`uint32_t`, `size_t`, `bool`), and common idioms (`printf`, `malloc`, `0x`). This dramatically improves recognition for typical embedded dictation out of the box: "configure the DMA controller for UART TX" comes out without mangling the acronyms.
+
 Use it for:
 
 - **Names** that whisper would otherwise misspell: `"Shaowu"`, `"Karpathy"`, product/team names.
@@ -66,17 +70,10 @@ Do not use it for:
 - Long passages. The prompt is tokenized at start; very long prompts hit whisper's 224-token limit and may confuse the decoder for unrelated speech.
 - Generic text. A prompt like `"hello world"` doesn't help anything and may bias the decoder toward outputting "hello" regardless of what you actually said.
 
-The default is empty (no prompt). Leave it that way unless you have specific words to bias. Example config:
-
-```toml
-[stt]
-initial_prompt = "K8s, SRE, kubectl, Dockerfile, semver"
-```
-
-Or per-run:
+To **disable** the default bias, set `initial_prompt = ""` in `config.toml`, or override per-run with an empty value (you cannot easily pass an empty string via `-P`; prefer the config file for disabling). To use a different bias, replace the value in `config.toml` or pass it via `-P` on the command line:
 
 ```bash
-./start.sh -P "kubectl apply -f deployment.yaml"
+./start.sh -P "K8s, SRE, kubectl, Dockerfile, semver"
 ```
 
 ## macOS permissions
@@ -178,6 +175,8 @@ The first time you select a model, pywhispercpp downloads it to `~/.cache/pywhis
 
 ## Configuration reference
 
+The shipped `config.example.toml` is the source of truth — every field shown there is also the program's default. Copy it to the user config dir (`./start.sh` does this on first run) and uncomment/edit the lines you care about; anything left out falls back to the default.
+
 ```toml
 [stt]
 model = "small"            # whisper.cpp model; see model table below
@@ -200,6 +199,13 @@ restore_clipboard_ms = 50  # how long to wait before restoring the prior clipboa
                            # (only relevant when injecting Unicode text)
 trailing_space = true      # append a single space after each transcript
                            # (set false for code editors where you don't want auto-spacing)
+```
+
+To customize manually:
+
+```bash
+cp config.example.toml ~/Library/Application\ Support/speakinput/config.toml
+$EDITOR ~/Library/Application\ Support/speakinput/config.toml
 ```
 
 ## How it works

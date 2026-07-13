@@ -9,7 +9,6 @@ from speakinput.config import (
     InjectConfig,
     STTConfig,
     load_config,
-    write_default_config,
 )
 
 
@@ -99,29 +98,29 @@ def test_with_overrides_does_not_mutate_original():
     assert cfg.hotkey.key == "alt_r"
 
 
-def test_load_config_writes_default_when_missing(tmp_path: Path):
+def test_load_config_returns_defaults_when_missing(tmp_path: Path):
+    """No file at the path? Return a Config() populated with the dataclass
+    defaults. The program must not auto-write anything; the user copies
+    config.example.toml themselves (or via start.sh)."""
     path = tmp_path / "config.toml"
     assert not path.exists()
     cfg = load_config(path)
-    assert path.exists()
     assert cfg.stt.model == "small"
     assert cfg.stt.language == "auto"
     assert cfg.hotkey.key == "alt_r"
+    # The path must still be absent — load_config never touches the filesystem.
+    assert not path.exists()
 
 
 def test_load_config_reads_existing(tmp_path: Path):
     path = tmp_path / "config.toml"
-    write_default_config(path)
+    path.write_text(
+        '[stt]\nmodel = "tiny.en"\nlanguage = "en"\n',
+        encoding="utf-8",
+    )
     cfg = load_config(path)
-    assert cfg.stt.model == "small"
-    assert cfg.stt.language == "auto"
-
-
-def test_write_default_config_does_not_overwrite(tmp_path: Path):
-    path = tmp_path / "config.toml"
-    path.write_text('[stt]\nmodel = "tiny.en"\n', encoding="utf-8")
-    write_default_config(path)
-    assert 'model = "tiny.en"' in path.read_text(encoding="utf-8")
+    assert cfg.stt.model == "tiny.en"
+    assert cfg.stt.language == "en"
 
 
 # --- multilingual / Chinese support ---------------------------------------
@@ -242,16 +241,31 @@ def test_cli_silence_threshold_defaults_to_none():
 # --- initial_prompt --------------------------------------------------------
 
 
-def test_default_initial_prompt_is_empty():
-    """Default initial_prompt is empty (no lexical prior)."""
-    assert Config().stt.initial_prompt == ""
+def test_default_initial_prompt_biases_toward_embedded_vocabulary():
+    """The shipped default biases whisper toward embedded software engineer
+    vocabulary: C/C++, RTOS, MCU peripherals, debug tools, common acronyms.
+    Disable by setting initial_prompt = "" in config.toml."""
+    prompt = Config().stt.initial_prompt
+    assert prompt  # non-empty
+    # Spot-check a few representative tokens.
+    for token in ("STM32", "FreeRTOS", "GPIO", "uint32_t", "ISR", "OpenOCD", "DMA"):
+        assert token in prompt
 
 
 def test_with_overrides_initial_prompt():
     cfg = Config()
     new = cfg.with_overrides(initial_prompt="kubectl apply -f deployment.yaml")
     assert new.stt.initial_prompt == "kubectl apply -f deployment.yaml"
-    assert cfg.stt.initial_prompt == ""  # original untouched
+    # Original default is the embedded-vocab bias; the override is what wins.
+    assert cfg.stt.initial_prompt != new.stt.initial_prompt
+
+
+def test_with_overrides_initial_prompt_clear_to_empty():
+    """Setting initial_prompt="" via override disables the bias entirely,
+    even when the config default is the embedded-vocab prompt."""
+    cfg = Config()
+    new = cfg.with_overrides(initial_prompt="")
+    assert new.stt.initial_prompt == ""
 
 
 def test_from_dict_reads_initial_prompt():

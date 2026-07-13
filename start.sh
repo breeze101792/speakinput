@@ -63,5 +63,21 @@ if [[ $need_install -eq 1 ]]; then
     .venv/bin/pip install --quiet -e ".[menu]"
 fi
 
-# 4. Forward to the CLI.
+# 4. Copy config.example.toml into the user config dir on first run, so the
+#    user can `vim` it to customize. The program also runs fine with no
+#    config file at all (defaults are baked in), so this is purely for
+#    discoverability — skip silently if the dir can't be created (CI, etc.).
+#    Use IFS= and process substitution so the path with a space
+#    ("Application Support") survives word-splitting. `read` returns 1 on
+#    EOF (no trailing newline) — that's not an error, swallow it.
+IFS= read -r user_cfg_dir < <("$PY" -c 'from platformdirs import user_config_dir; print(user_config_dir("speakinput", appauthor=False), end="")') || true
+if [[ ! -f "$user_cfg_dir/config.toml" && -f config.example.toml ]]; then
+    if mkdir -p "$user_cfg_dir" 2>/dev/null; then
+        cp config.example.toml "$user_cfg_dir/config.toml"
+        log "created $user_cfg_dir/config.toml from config.example.toml"
+        log "edit it to customize; the program uses defaults if it's missing"
+    fi
+fi
+
+# 5. Forward to the CLI.
 exec .venv/bin/speakinput "$@"

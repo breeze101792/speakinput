@@ -22,3 +22,7 @@ env/
 # OS / IDE
 *.swp
 *~
+
+# User config (the program ships config.example.toml; the user copies
+# it to config.toml or to ~/Library/Application Support/speakinput/config.toml).
+config.toml

@@ -467,7 +467,7 @@ def test_run_prints_startup_banner(monkeypatch, capsys):
     assert "[startup] hotkey   : alt_r" in captured.err
     assert "[startup] sample   :" in captured.err
     assert "[startup] silence  :" in captured.err
-    assert "[startup] prompt   : off" in captured.err  # empty default
+    assert "[startup] prompt   : on" in captured.err  # default is the embedded-vocab bias
     assert "[startup] inject   :" in captured.err
 
 
