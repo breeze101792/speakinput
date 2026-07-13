@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Callable, Protocol
 
-# Note: pynput is intentionally NOT imported at module load time. See the
-# same note in injector.py — importing pynput starts a Carbon/HIToolbox
-# background thread that can abort the process on misconfigured macOS
-# systems (notably the test runner without Input Monitoring permission).
+try:
+    from pynput import keyboard
+except ImportError:  # pragma: no cover - pynput is a hard dep at runtime
+    keyboard = None  # type: ignore[assignment]
 
 from speakinput.config import VALID_HOTKEYS
 
@@ -24,8 +24,6 @@ _KEY_NAMES = {
 def resolve_key(name: str):
     if name not in VALID_HOTKEYS:
         raise ValueError(f"unknown hotkey {name!r}; expected one of {VALID_HOTKEYS}")
-    from pynput import keyboard  # lazy import — see module docstring
-
     if keyboard is None:
         raise RuntimeError("pynput is not installed; cannot resolve hotkey")
     return _KEY_NAMES[name](keyboard.Key)
@@ -53,6 +51,8 @@ class HotkeyListener:
         on_release: Callable[[], None],
         suppress: bool = False,
     ) -> None:
+        if keyboard is None:
+            raise RuntimeError("pynput is not installed")
         self._key = key
         self._on_press = on_press
         self._on_release = on_release
@@ -85,8 +85,6 @@ class HotkeyListener:
     def start(self) -> None:
         if self._listener is not None:
             return
-        from pynput import keyboard  # lazy import — see module docstring
-
         if keyboard is None:
             raise RuntimeError("pynput is not installed")
         self._listener = keyboard.Listener(  # type: ignore[attr-defined]

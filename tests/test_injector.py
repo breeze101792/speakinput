@@ -1,6 +1,5 @@
 """Tests for the injector. Mocks pynput and pyperclip so the suite runs headless."""
 
-import sys
 import threading
 import time
 from unittest.mock import MagicMock
@@ -10,11 +9,10 @@ import pytest
 
 @pytest.fixture
 def fake_modules(monkeypatch):
-    """Patch `pynput.keyboard` in `sys.modules` and `pyperclip` so the
-    injector picks up a stub Controller. The injector lazy-imports pynput
-    via `importlib.import_module("pynput.keyboard")` so swapping the
-    module entry is enough — there are no module-level references in
-    `speakinput.injector` to chase down."""
+    """Patch the module-level `Controller`/`Key` and `pyperclip` references
+    inside the injector module. Replacing only `sys.modules` is not enough
+    because the import was already captured at module load time.
+    """
     from speakinput import injector as inj_mod
 
     fake_keyboard = MagicMock()
@@ -27,7 +25,8 @@ def fake_modules(monkeypatch):
     fake_pyperclip.paste = MagicMock(return_value="prior-clipboard")
     fake_pyperclip.copy = MagicMock()
 
-    monkeypatch.setitem(sys.modules, "pynput.keyboard", fake_keyboard)
+    monkeypatch.setattr(inj_mod, "Controller", fake_keyboard.Controller, raising=False)
+    monkeypatch.setattr(inj_mod, "Key", fake_keyboard.Key, raising=False)
     monkeypatch.setattr(inj_mod, "pyperclip", fake_pyperclip, raising=False)
     return fake_keyboard, fake_pyperclip
 
