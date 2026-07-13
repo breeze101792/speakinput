@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speakinput"
+version = "0.1.0"
+description = "Push-to-talk voice input that types transcribed speech into the focused field."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "speakinput" }]
+dependencies = [
+    "pywhispercpp>=1.2",
+    "sounddevice>=0.4.6",
+    "numpy>=1.26",
+    "pynput>=1.7.7",
+    "pyperclip>=1.8",
+    "platformdirs>=4",
+]
+
+[project.optional-dependencies]
+menu = ["rumps>=0.4"]
+dev = [
+    "pytest>=8",
+    "pytest-mock>=3.12",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+speakinput = "speakinput.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/shaowu/speakinput"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
