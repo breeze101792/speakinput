@@ -22,42 +22,58 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Push-to-talk voice transcription typed into the focused field.",
     )
     parser.add_argument(
+        "-c",
         "--config",
         type=Path,
         default=None,
         help=f"Path to config.toml (default: {default_config_path()})",
     )
     parser.add_argument(
+        "-m",
         "--model",
         choices=("tiny.en", "base.en", "small.en"),
         default=None,
         help="Override the whisper model from config",
     )
     parser.add_argument(
+        "-l",
         "--list-devices",
         action="store_true",
         help="List available audio input devices and exit",
     )
     parser.add_argument(
+        "-D",
         "--diagnose",
         action="store_true",
         help="Record for 2s and print the audio RMS without injecting text",
     )
     parser.add_argument(
+        "-n",
         "--no-inject",
         action="store_true",
         help="In dry-run mode, print transcribed text to stderr instead of typing it",
     )
     parser.add_argument(
+        "-d",
         "--debug",
         action="store_true",
         help="Log every key event and transcript to stderr (useful for permission issues)",
     )
     parser.add_argument(
+        "-t",
         "--trailing-space",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Append a single space after each transcript (default: on; override with --no-trailing-space)",
+        help="Append a single space after each transcript (default: on; override with -T / --no-trailing-space)",
+    )
+    # Register the short form of the negation. BooleanOptionalAction only
+    # attaches a short flag to the positive form; we mirror it here.
+    parser.add_argument(
+        "-T",
+        action="store_false",
+        dest="trailing_space",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "-v",

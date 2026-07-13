@@ -63,13 +63,28 @@ macOS sometimes resets these permissions after a macOS update, after major Pytho
 
 ```bash
 speakinput                       # run with default config
-speakinput --model small.en      # override the model for this run
-speakinput --list-devices        # show available input devices
-speakinput --diagnose            # record 2s, print audio stats, don't inject
-speakinput --no-inject           # print transcribed text to stderr instead of typing
-speakinput --no-trailing-space   # don't append a space after each transcript
-speakinput --config ./my.toml    # use a custom config file
+speakinput -m small.en           # override the model for this run
+speakinput -l                     # show available input devices
+speakinput -D                     # record 2s, print audio stats, don't inject
+speakinput -n                     # print transcribed text to stderr instead of typing
+speakinput -T                     # don't append a space after each transcript
+speakinput -c ./my.toml           # use a custom config file
+speakinput -d                     # debug mode: log every key event and transcript
 ```
+
+### All flags
+
+| Short | Long                  | What it does                                    |
+| ----- | --------------------- | ----------------------------------------------- |
+| `-c`  | `--config PATH`       | Path to config.toml                             |
+| `-m`  | `--model NAME`        | Override the whisper model (`tiny.en`/`base.en`/`small.en`) |
+| `-l`  | `--list-devices`      | List available input devices and exit           |
+| `-D`  | `--diagnose`          | Record 2s and print audio stats                 |
+| `-n`  | `--no-inject`         | Print transcript to stderr instead of typing it |
+| `-d`  | `--debug`             | Log every key event and transcript to stderr    |
+| `-t`  | `--trailing-space`    | Append a space after each transcript (default)  |
+| `-T`  | `--no-trailing-space` | Don't append a space after each transcript      |
+| `-v`  | `--verbose`           | Enable debug logging from python logging        |
 
 By default the push-to-talk key is **Right Option (Alt)**. Hold it, speak, release. The recognized text is typed into whatever field has focus, **with a trailing space** so the next word doesn't run into the last one. Disable the trailing space with `--no-trailing-space` if you want pure dictation (e.g. when typing into a code editor).
 
