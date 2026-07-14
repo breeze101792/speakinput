@@ -14,7 +14,7 @@ model = "small"             # tiny.en | base.en | small.en
                             # tiny | base | small | medium  (multilingual)
 language = "auto"           # auto | en | zh
 beam_size = 1               # 1 = greedy (fastest); 2..10 = beam search
-# initial_prompt = "C, C++, Rust, embedded, firmware, STM32, ESP32, RTOS, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, OpenOCD, GDB, ..."
+# initial_prompt = "C, C++, Rust, RTOS, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, scheduler, mutex, GDB, OpenOCD, JTAG, ..."
                             # bias the decoder toward specific vocabulary;
                             # see README "Initial prompt" section. The default
                             # is an embedded-software-engineer bias; set to ""

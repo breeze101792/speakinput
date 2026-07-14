@@ -57,20 +57,34 @@ English-only models (`tiny.en`, `base.en`, `small.en`) are faster but cannot do 
 
 ### Shipped default: embedded software engineer
 
-Out of the box, the program uses this bias — covering C/C++/Rust, MCU names, RTOS terms, peripherals, debug tools, types, and common idioms:
+Out of the box, the program uses this bias — covering languages, RTOSes, MCU concepts, peripherals, protocols, build tools, debug, and C/C++ idioms:
 
 ```text
-C, C++, Rust, embedded, firmware, microcontroller, MCU, STM32, ESP32,
-ARM Cortex, RTOS, FreeRTOS, Zephyr, bootloader, ISR, interrupt,
-DMA, GPIO, UART, SPI, I2C, ADC, PWM, register, peripheral,
-JTAG, SWD, OpenOCD, GDB, linker, flash, SRAM, heap, stack,
-HAL, driver, kernel, scheduler, mutex, semaphore, queue,
-volatile, const, static, inline, typedef, struct, enum,
-void, NULL, nullptr, printf, sprintf, malloc, free, memcpy, memset,
-0x, uint8_t, uint16_t, uint32_t, size_t, bool
+C, C++, Rust, assembly, embedded, firmware, kernel, driver,
+RTOS, FreeRTOS, Zephyr, syscall, callback,
+microcontroller, ARM Cortex, RISC-V, register, peripheral,
+clock, PLL, prescaler, watchdog,
+ROM, RAM, flash, EEPROM, heap, stack, allocator,
+interrupt, ISR, IRQ, exception, fault, hardfault,
+scheduler, mutex, semaphore, spinlock, atomic, preemptive,
+GPIO, UART, SPI, I2C, I2S, CAN, USB, Ethernet,
+ADC, DAC, PWM, timer, DMA, FIFO,
+ack, nack, CRC, checksum, parity, packet, frame, payload,
+endian, alignment, bitfield,
+block, sector, page, erase, program, mount,
+gcc, clang, cmake, ninja, linker, cross-compile,
+elf, hex, optimization,
+GDB, OpenOCD, JTAG, SWD, trace, profiler,
+core dump, stack trace, backtrace,
+volatile, const, static, inline, extern, weak, packed,
+typedef, struct, union, enum, macro, pragma,
+void, NULL, nullptr, true, false,
+printf, sprintf, malloc, free, memcpy, memset, strlen
 ```
 
-Why this is the default: in day-to-day embedded dictation, the same words keep coming up — MCU names, peripheral acronyms, RTOS primitives, type names. Whisper's raw small model mangles them ("STM thirty-two", "D M A controller", "you art one"). Pre-seeding the decoder with the right tokens fixes almost all of these. If you say *"configure the DMA controller for UART TX on the STM32"*, the output is now exactly that — no post-edit needed.
+Why this is the default: in day-to-day embedded dictation, the same words keep coming up — peripheral acronyms, RTOS primitives, build/toolchain terms, fault types. Whisper's raw small model mangles them ("D M A controller", "you art one", "hard fault"). Pre-seeding the decoder with the right tokens fixes almost all of these. If you say *"configure the DMA controller for UART TX"*, the output is now exactly that — no post-edit needed.
+
+The list deliberately avoids product names (STM32, ESP32, …) and `_t` type suffixes (`uint32_t`, etc.) so it stays useful across vendors. See the [full config default](src/speakinput/config.py) if you want to add or remove entries.
 
 If your work isn't embedded, see [Switching to a different domain](#switching-to-a-different-domain) below.
 
@@ -98,8 +112,9 @@ initial_prompt = "Kubernetes, K8s, kubectl, Docker, Dockerfile, Helm, Terraform,
 # Data science / ML
 initial_prompt = "PyTorch, TensorFlow, NumPy, pandas, scikit-learn, Jupyter, GPU, CUDA, TPU, transformer, attention, embedding, fine-tune, LoRA, RAG, vector database, Weights and Biases"
 
-# Embedded (the default — shown for reference)
-initial_prompt = "C, C++, Rust, embedded, firmware, STM32, ESP32, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, OpenOCD, GDB"
+# Embedded (the default — shown for reference; product names left out
+# so the bias stays useful across vendors)
+initial_prompt = "C, C++, Rust, RTOS, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, scheduler, mutex, GDB, OpenOCD, JTAG"
 ```
 
 Or override per-run with `-P`:
@@ -287,7 +302,7 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 
 **A random short phrase appears when I didn't say anything / accidentally tapped the hotkey.** Whisper hallucinates on near-empty audio — the silence gate should catch this. If you still see phantom text, your environment may be noisy enough that the RMS exceeds the default `0.005` floor. Lower it: `speakinput -S 0.01` or set `[audio].silence_threshold = 0.01` in config.toml. Set to `0` to disable the gate entirely (whisper will see every recording, including silence).
 
-**Output contains "STM32", "DMA", "FreeRTOS" etc. that I didn't say.** The shipped `initial_prompt` biases whisper toward embedded-software vocabulary — see [Initial prompt](#initial-prompt-vocabulary-biasing). It's a one-shot token prior: whisper overweights those words because they appear in the seed. If your dictation isn't embedded (or you want mixed/general speech), either set `stt.initial_prompt = ""` in `config.toml` to disable the bias, or pass a domain-appropriate comma-separated list of the words you actually use. The phantom outputs are strongest right after the prompt tokens ("STM32"), weakest mid-sentence.
+**Output contains "DMA", "FreeRTOS", "OpenOCD" etc. that I didn't say.** The shipped `initial_prompt` biases whisper toward embedded-software vocabulary — see [Initial prompt](#initial-prompt-vocabulary-biasing). It's a one-shot token prior: whisper overweights those words because they appear in the seed. If your dictation isn't embedded (or you want mixed/general speech), either set `stt.initial_prompt = ""` in `config.toml` to disable the bias, or pass a domain-appropriate comma-separated list of the words you actually use. The phantom outputs are strongest right after the prompt tokens, weakest mid-sentence.
 
 ## Development
 

@@ -248,7 +248,7 @@ def test_default_initial_prompt_biases_toward_embedded_vocabulary():
     prompt = Config().stt.initial_prompt
     assert prompt  # non-empty
     # Spot-check a few representative tokens.
-    for token in ("STM32", "FreeRTOS", "GPIO", "uint32_t", "ISR", "OpenOCD", "DMA"):
+    for token in ("FreeRTOS", "GPIO", "ISR", "OpenOCD", "DMA", "RTOS", "PWM", "mutex"):
         assert token in prompt
 
 

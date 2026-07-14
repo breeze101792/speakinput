@@ -56,14 +56,36 @@ class STTConfig:
     # common acronyms. Can be overridden per-run via `-P`/`--initial-prompt`
     # on the CLI, or set to "" in config.toml to disable the bias.
     initial_prompt: str = (
-        "C, C++, Rust, embedded, firmware, microcontroller, MCU, STM32, ESP32, "
-        "ARM Cortex, RTOS, FreeRTOS, Zephyr, bootloader, ISR, interrupt, "
-        "DMA, GPIO, UART, SPI, I2C, ADC, PWM, register, peripheral, "
-        "JTAG, SWD, OpenOCD, GDB, linker, flash, SRAM, heap, stack, "
-        "HAL, driver, kernel, scheduler, mutex, semaphore, queue, "
-        "volatile, const, static, inline, typedef, struct, enum, "
-        "void, NULL, nullptr, printf, sprintf, malloc, free, memcpy, memset, "
-        "0x, uint8_t, uint16_t, uint32_t, size_t, bool"
+        # Languages + RTOSes
+        "C, C++, Rust, assembly, embedded, firmware, kernel, driver, "
+        "RTOS, FreeRTOS, Zephyr, syscall, callback, "
+        # MCU / SoC (no product names)
+        "microcontroller, ARM Cortex, RISC-V, register, peripheral, "
+        "clock, PLL, prescaler, watchdog, "
+        # Memory
+        "ROM, RAM, flash, EEPROM, heap, stack, allocator, "
+        # Interrupts / concurrency
+        "interrupt, ISR, IRQ, exception, fault, hardfault, "
+        "scheduler, mutex, semaphore, spinlock, atomic, preemptive, "
+        # Communication peripherals (no product names)
+        "GPIO, UART, SPI, I2C, I2S, CAN, USB, Ethernet, "
+        "ADC, DAC, PWM, timer, DMA, FIFO, "
+        # Protocols / data concepts
+        "ack, nack, CRC, checksum, parity, packet, frame, payload, "
+        "endian, alignment, bitfield, "
+        # Storage
+        "block, sector, page, erase, program, mount, "
+        # Build / toolchain
+        "gcc, clang, cmake, ninja, linker, cross-compile, "
+        "elf, hex, optimization, "
+        # Debug / analysis
+        "GDB, OpenOCD, JTAG, SWD, trace, profiler, "
+        "core dump, stack trace, backtrace, "
+        # Language idioms
+        "volatile, const, static, inline, extern, weak, packed, "
+        "typedef, struct, union, enum, macro, pragma, "
+        "void, NULL, nullptr, true, false, "
+        "printf, sprintf, malloc, free, memcpy, memset, strlen"
     )
 
 
