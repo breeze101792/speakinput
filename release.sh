@@ -20,6 +20,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || hostname)
+VENV_DIR=".venv_${HOSTNAME_SHORT}"
+
 log() { printf '\033[1;34m[release.sh]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[release.sh]\033[0m %s\n' "$*" >&2; }
 
@@ -52,8 +55,8 @@ EOF
 find_python() {
     # Prefer the venv if it exists, since the user may have bootstrapped
     # with a different interpreter.
-    if [[ -x .venv/bin/python ]]; then
-        echo ".venv/bin/python"
+    if [[ -x "$VENV_DIR/bin/python" ]]; then
+        echo "$VENV_DIR/bin/python"
         return
     fi
     local candidate ver higher
@@ -73,38 +76,38 @@ find_python() {
 
 ensure_venv() {
     local py=$1
-    if [[ ! -d .venv ]]; then
-        log "creating virtualenv in .venv using $py"
-        "$py" -m venv .venv
+    if [[ ! -d "$VENV_DIR" ]]; then
+        log "creating virtualenv in $VENV_DIR using $py"
+        "$py" -m venv "$VENV_DIR"
     fi
     # shellcheck disable=SC1091
-    source .venv/bin/activate
+    source "$VENV_DIR/bin/activate"
 }
 
 ensure_app_deps() {
     # Skip the editable install if the package and its runtime deps
     # are already importable. Saves minutes on repeat builds.
     if [[ -d src/speakinput.egg-info ]]; then
-        if .venv/bin/python -c 'import pywhispercpp, sounddevice, pynput, pyperclip, platformdirs, numpy; import speakinput' 2>/dev/null; then
+        if "$VENV_DIR/bin/python" -c 'import pywhispercpp, sounddevice, pynput, pyperclip, platformdirs, numpy; import speakinput' 2>/dev/null; then
             return
         fi
     fi
-    log "installing speakinput + deps into .venv"
-    .venv/bin/python -m pip install --quiet --upgrade pip
-    .venv/bin/pip install --quiet -e ".[menu]"
+    log "installing speakinput + deps into $VENV_DIR"
+    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip
+    "$VENV_DIR/bin/pip" install --quiet -e ".[menu]"
 }
 
 ensure_pyinstaller() {
-    if ! .venv/bin/python -c 'import PyInstaller' 2>/dev/null; then
+    if ! "$VENV_DIR/bin/python" -c 'import PyInstaller' 2>/dev/null; then
         log "installing pyinstaller"
-        .venv/bin/pip install --quiet "pyinstaller>=6.0"
+        "$VENV_DIR/bin/pip" install --quiet "pyinstaller>=6.0"
     fi
 }
 
 run_build() {
     local spec=$1
     log "building speakinput (this takes a couple of minutes the first time)"
-    .venv/bin/pyinstaller \
+    "$VENV_DIR/bin/pyinstaller" \
         --noconfirm \
         --clean \
         --workpath build \

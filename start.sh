@@ -2,8 +2,9 @@
 # Bootstrap and launch speakinput.
 #
 # - Ensures a Python 3.11+ interpreter is available.
-# - Creates .venv on first run, upgrades pip, installs the package in
-#   editable mode (with the [menu] extra for the optional menu-bar indicator).
+# - Creates .venv_<hostname> on first run, upgrades pip, installs the
+#   package in editable mode (with the [menu] extra for the optional
+#   menu-bar indicator).
 # - Runs `speakinput` from the venv.
 #
 # Idempotent: re-running is fast (skips pip install if already up to date).
@@ -13,14 +14,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || hostname)
+VENV_DIR=".venv_${HOSTNAME_SHORT}"
+
 log() { printf '\033[1;34m[start.sh]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[start.sh]\033[0m %s\n' "$*" >&2; }
 err() { printf '\033[1;31m[start.sh]\033[0m %s\n' "$*" >&2; }
 
 # 1. Find a usable Python (>= 3.11). Prefer the venv if it exists, since the
 #    user may have bootstrapped with a different interpreter.
-if [[ -x .venv/bin/python ]]; then
-    PY=.venv/bin/python
+if [[ -x "$VENV_DIR/bin/python" ]]; then
+    PY="$VENV_DIR/bin/python"
 else
     PY=""
     # Probe candidates newest-first; the version check is "is it >= 3.11",
@@ -45,28 +49,28 @@ else
 fi
 
 # 2. Create the venv on first run.
-if [[ ! -d .venv ]]; then
-    log "creating virtualenv in .venv using $PY"
-    "$PY" -m venv .venv
+if [[ ! -d "$VENV_DIR" ]]; then
+    log "creating virtualenv in $VENV_DIR using $PY"
+    "$PY" -m venv "$VENV_DIR"
 fi
 
 # shellcheck disable=SC1091
-source .venv/bin/activate
+source "$VENV_DIR/bin/activate"
 
 # 3. Ensure the package is installed (editable). Skip if the egg-info exists
 #    AND every listed dep imports cleanly — a missing dep will fail the import
 #    probe and trigger a reinstall on the next run.
 need_install=1
 if [[ -d src/speakinput.egg-info ]]; then
-    if .venv/bin/python -c 'import pywhispercpp, sounddevice, pynput, pyperclip, platformdirs, numpy' 2>/dev/null; then
+    if "$VENV_DIR/bin/python" -c 'import pywhispercpp, sounddevice, pynput, pyperclip, platformdirs, numpy' 2>/dev/null; then
         need_install=0
     fi
 fi
 
 if [[ $need_install -eq 1 ]]; then
     log "installing speakinput (this may take a minute on first run)"
-    .venv/bin/python -m pip install --quiet --upgrade pip
-    .venv/bin/pip install --quiet -e ".[menu]"
+    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip
+    "$VENV_DIR/bin/pip" install --quiet -e ".[menu]"
 fi
 
 # 4. Copy config.example.toml into the user config dir on first run, so the
@@ -76,9 +80,9 @@ fi
 #    Use IFS= and process substitution so the path with a space
 #    ("Application Support") survives word-splitting. `read` returns 1 on
 #    EOF (no trailing newline) — that's not an error, swallow it.
-#    Use .venv/bin/python explicitly (not $PY) so the venv's `platformdirs`
+#    Use $VENV_DIR/bin/python explicitly (not $PY) so the venv's `platformdirs`
 #    is on the path; the system python won't have it installed.
-IFS= read -r user_cfg_dir < <(.venv/bin/python -c 'from platformdirs import user_config_dir; print(user_config_dir("speakinput", appauthor=False), end="")') || true
+IFS= read -r user_cfg_dir < <("$VENV_DIR/bin/python" -c 'from platformdirs import user_config_dir; print(user_config_dir("speakinput", appauthor=False), end="")') || true
 if [[ -n "$user_cfg_dir" && ! -f "$user_cfg_dir/config.toml" && -f config.example.toml ]]; then
     if mkdir -p "$user_cfg_dir" 2>/dev/null; then
         cp config.example.toml "$user_cfg_dir/config.toml"
@@ -88,4 +92,4 @@ if [[ -n "$user_cfg_dir" && ! -f "$user_cfg_dir/config.toml" && -f config.exampl
 fi
 
 # 5. Forward to the CLI.
-exec .venv/bin/speakinput "$@"
+exec "$VENV_DIR/bin/speakinput" "$@"
