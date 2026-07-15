@@ -1,25 +1,47 @@
-"""Tests for the App orchestrator. Mocks audio + transcriber + injector."""
+"""Tests for the App orchestrator. Mocks audio + transcribers + injector."""
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+from speakinput.config import AudioConfig, Config, Profile
 
-def _build_app(debug: bool = False, dry_run: bool = False):
-    """Build an App with all I/O collaborators mocked out."""
+
+@pytest.fixture(autouse=True)
+def _stub_hotkey_listener(monkeypatch):
+    """Replace HotkeyListener with a no-op mock for the whole module.
+
+    pynput's keyboard.Listener.init crashes on this test environment
+    (macOS HIToolbox) — see earlier commits — so every test that would
+    start a real listener uses this stub. The class mock returns a
+    fresh listener instance per construction so per-profile assertions
+    work as expected.
+    """
+    fake_listener_cls = MagicMock()
+    fake_listener_cls.side_effect = lambda *a, **kw: MagicMock()
+    monkeypatch.setattr("speakinput.app.HotkeyListener", fake_listener_cls)
+    return fake_listener_cls
+
+
+def _build_app(debug: bool = False, dry_run: bool = False, config: Config | None = None,
+               transcribers: dict | None = None):
+    """Build an App with all I/O collaborators mocked out.
+
+    `transcribers` defaults to a single mock keyed by the primary profile's
+    hotkey; override it to simulate a multi-profile setup."""
     from speakinput.app import App
-    from speakinput.config import AudioConfig, Config
 
-    # silence_threshold=0 so tests don't get blocked by the silence gate
-    # even when they pass zero-RMS audio to the mock recorder.
-    config = Config(audio=AudioConfig(silence_threshold=0))
+    config = config or Config(audio=AudioConfig(silence_threshold=0))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)  # 1s of "silence"
 
-    transcriber = MagicMock()
-    transcriber.transcribe.return_value = "hello world"
+    if transcribers is None:
+        t = MagicMock()
+        t.transcribe.return_value = "hello world"
+        transcribers = {config.primary.key: t}
 
     injector = MagicMock()
     feedback = MagicMock()
@@ -27,58 +49,57 @@ def _build_app(debug: bool = False, dry_run: bool = False):
     app = App(
         config=config,
         recorder=recorder,
-        transcriber=transcriber,
+        transcribers=transcribers,
         injector=injector,
         feedback=feedback,
         dry_run=dry_run,
         debug=debug,
     )
-    return app, recorder, transcriber, injector, feedback
+    return app, recorder, transcribers, injector, feedback
+
+
+# --- press/release: single-profile path ----------------------------------
 
 
 def test_press_calls_recorder_start_and_marks_listening(capsys):
     app, recorder, _, _, feedback = _build_app()
-    app.on_hotkey_press()
+    app.on_hotkey_press(app.config.primary)
     recorder.start.assert_called_once()
     feedback.set_state.assert_called_with("listening")
-    # No debug output by default.
     captured = capsys.readouterr()
     assert "[debug]" not in captured.err
 
 
 def test_press_ignored_when_already_busy(capsys):
     app, recorder, _, _, _ = _build_app()
-    app.on_hotkey_press()  # first press acquires the lock
+    app.on_hotkey_press(app.config.primary)  # first press acquires the lock
     recorder.start.reset_mock()
-    app.on_hotkey_press()  # second press should be ignored
+    app.on_hotkey_press(app.config.primary)  # second press should be ignored
     recorder.start.assert_not_called()
 
 
 def test_release_press_failed_means_nothing_to_do(capsys):
-    """If on_hotkey_press failed (recorder never started), on_hotkey_release is a no-op."""
-    app, recorder, transcriber, injector, _ = _build_app()
-    # Make is_recording return False (as if start() had failed).
+    app, recorder, transcribers, injector, _ = _build_app()
     recorder.is_recording.return_value = False
-    app.on_hotkey_release()
-    transcriber.transcribe.assert_not_called()
+    app.on_hotkey_release(app.config.primary)
+    transcribers[app.config.primary.key].transcribe.assert_not_called()
     injector.inject.assert_not_called()
 
 
 def test_release_happy_path_calls_transcribe_and_inject(capsys):
-    app, recorder, transcriber, injector, feedback = _build_app()
-    app.on_hotkey_press()
-    app.on_hotkey_release()
-    transcriber.transcribe.assert_called_once()
+    app, recorder, transcribers, injector, feedback = _build_app()
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    transcribers[app.config.primary.key].transcribe.assert_called_once()
     injector.inject.assert_called_once_with("hello world")
-    # State should end back at idle.
     feedback.set_state.assert_any_call("idle")
 
 
 def test_release_empty_transcript_does_not_inject(capsys):
-    app, recorder, transcriber, injector, _ = _build_app()
-    transcriber.transcribe.return_value = ""
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app, _, transcribers, injector, _ = _build_app()
+    transcribers[app.config.primary.key].transcribe.return_value = ""
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     injector.inject.assert_not_called()
 
 
@@ -88,26 +109,25 @@ def test_release_silence_skips_transcribe(capsys):
     to skip the call entirely and log a debug line so the user can see
     why nothing was typed."""
     from speakinput.app import App
-    from speakinput.config import AudioConfig, Config
 
     config = Config(audio=AudioConfig(silence_threshold=0.005))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
-    # 1s of pure silence — RMS is 0.0, well below the threshold.
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     injector = MagicMock()
+    transcribers = {config.primary.key: transcriber}
 
     app = App(
         config=config,
         recorder=recorder,
-        transcriber=transcriber,
+        transcribers=transcribers,
         injector=injector,
         feedback=MagicMock(),
         debug=True,
     )
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
 
     transcriber.transcribe.assert_not_called()
     injector.inject.assert_not_called()
@@ -117,11 +137,7 @@ def test_release_silence_skips_transcribe(capsys):
 
 
 def test_release_silence_threshold_zero_disables_gate(capsys):
-    """silence_threshold=0 must NOT short-circuit — even zero-RMS audio
-    goes to the transcriber. This is the escape hatch for users who want
-    whisper to see literally everything."""
     from speakinput.app import App
-    from speakinput.config import AudioConfig, Config
 
     config = Config(audio=AudioConfig(silence_threshold=0))
     recorder = MagicMock()
@@ -129,137 +145,124 @@ def test_release_silence_threshold_zero_disables_gate(capsys):
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     transcriber.transcribe.return_value = ""
+    transcribers = {config.primary.key: transcriber}
 
     app = App(
         config=config,
         recorder=recorder,
-        transcriber=transcriber,
+        transcribers=transcribers,
         injector=MagicMock(),
         feedback=MagicMock(),
         debug=True,
     )
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
 
     transcriber.transcribe.assert_called_once()
 
 
 def test_release_loud_audio_passes_gate(capsys):
-    """Audio above the threshold must reach the transcriber."""
     from speakinput.app import App
-    from speakinput.config import AudioConfig, Config
 
     config = Config(audio=AudioConfig(silence_threshold=0.005))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
-    # RMS ~ 0.5 (loud tone), well above the threshold.
     recorder.stop.return_value = np.full(16000, 0.5, dtype=np.float32)
     transcriber = MagicMock()
     transcriber.transcribe.return_value = "hello"
+    transcribers = {config.primary.key: transcriber}
 
     app = App(
         config=config,
         recorder=recorder,
-        transcriber=transcriber,
+        transcribers=transcribers,
         injector=MagicMock(),
         feedback=MagicMock(),
         debug=True,
     )
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
 
     transcriber.transcribe.assert_called_once()
 
 
-# --- silence gate config validation ----------------------------------------
-
-
-def test_validation_rejects_negative_silence_threshold():
-    from speakinput.config import AudioConfig, Config
-
-    with pytest.raises(ValueError, match="silence_threshold"):
-        Config(audio=AudioConfig(silence_threshold=-0.1)).validate()
-
-
 def test_dry_run_prints_text_to_stderr_instead_of_typing(capsys):
-    app, _, transcriber, injector, _ = _build_app(dry_run=True)
-    transcriber.transcribe.return_value = "dry run output"
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app, _, transcribers, injector, _ = _build_app(dry_run=True)
+    transcribers[app.config.primary.key].transcribe.return_value = "dry run output"
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     captured = capsys.readouterr()
     assert "dry run output" in captured.err
     injector.inject.assert_not_called()
 
 
-# --- debug-mode tests -------------------------------------------------------
+# --- debug mode ------------------------------------------------------------
 
 
 def test_debug_mode_logs_press_start_and_end(capsys):
     app, _, _, _, _ = _build_app(debug=True)
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     captured = capsys.readouterr()
-    assert "[debug] key press start (alt_r)" in captured.err
+    assert f"[debug] key press start ({app.config.primary.key})" in captured.err
     assert "[debug] key press end" in captured.err
-    assert "held" in captured.err  # includes the held-for duration
+    assert "held" in captured.err
 
 
 def test_debug_mode_logs_audio_stats(capsys):
     app, recorder, _, _, _ = _build_app(debug=True)
-    # 16000 samples at 16kHz = 1.0s, all-zero so rms=0.
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     captured = capsys.readouterr()
     assert "[debug] audio: 16000 samples" in captured.err
     assert "rms=" in captured.err
 
 
 def test_debug_mode_prints_transcript(capsys):
-    app, _, transcriber, _, _ = _build_app(debug=True)
-    transcriber.transcribe.return_value = "the quick brown fox"
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app, _, transcribers, _, _ = _build_app(debug=True)
+    transcribers[app.config.primary.key].transcribe.return_value = "the quick brown fox"
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     captured = capsys.readouterr()
     assert "[debug] transcript: 'the quick brown fox'" in captured.err
 
 
 def test_debug_mode_prints_empty_transcript(capsys):
-    """Empty transcript still gets printed so the user can distinguish silence from stuck."""
-    app, _, transcriber, _, _ = _build_app(debug=True)
-    transcriber.transcribe.return_value = ""
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app, _, transcribers, _, _ = _build_app(debug=True)
+    transcribers[app.config.primary.key].transcribe.return_value = ""
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     captured = capsys.readouterr()
     assert "[debug] transcript: ''" in captured.err
 
 
 def test_debug_mode_ignored_press_logs_message(capsys):
-    app, recorder, _, _, _ = _build_app(debug=True)
-    app.on_hotkey_press()  # acquires lock
-    app.on_hotkey_press()  # ignored
+    app, _, _, _, _ = _build_app(debug=True)
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_press(app.config.primary)
     captured = capsys.readouterr()
     assert "press ignored: already busy" in captured.err
 
 
 def test_no_debug_output_when_disabled(capsys):
-    app, _, transcriber, _, _ = _build_app(debug=False)
-    transcriber.transcribe.return_value = "should not appear"
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app, _, transcribers, _, _ = _build_app(debug=False)
+    transcribers[app.config.primary.key].transcribe.return_value = "should not appear"
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     captured = capsys.readouterr()
     assert "[debug]" not in captured.err
     assert "should not appear" not in captured.err
 
 
 def test_transcribe_error_releases_lock_and_returns_to_idle(capsys):
-    app, _, transcriber, injector, feedback = _build_app(debug=True)
-    transcriber.transcribe.side_effect = RuntimeError("model exploded")
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app, _, transcribers, injector, feedback = _build_app(debug=True)
+    transcribers[app.config.primary.key].transcribe.side_effect = RuntimeError("model exploded")
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     # Lock should be released — a fresh press should now succeed.
-    app.on_hotkey_press()
-    app.on_hotkey_release()
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
     assert injector.inject.call_count == 0
     feedback.set_state.assert_any_call("idle")
 
@@ -267,65 +270,92 @@ def test_transcribe_error_releases_lock_and_returns_to_idle(capsys):
 def test_inject_error_does_not_crash(capsys):
     app, _, _, injector, _ = _build_app(debug=True)
     injector.inject.side_effect = RuntimeError("pbcopy failed")
-    app.on_hotkey_press()
+    app.on_hotkey_press(app.config.primary)
     # Should NOT raise — the release path catches injection errors.
-    app.on_hotkey_release()
+    app.on_hotkey_release(app.config.primary)
 
 
-# --- model bootstrap tests -------------------------------------------------
+# --- model bootstrap tests ------------------------------------------------
 
 
-def test_run_bootstraps_model_when_no_transcriber_injected(monkeypatch):
-    """If no transcriber was passed in, run() must call ensure_model and
-    construct the default WhisperCppTranscriber with the resolved path."""
+def test_run_bootstraps_model_when_no_transcribers_injected(monkeypatch):
+    """If no transcribers were passed in, run() must call _build_transcribers,
+    which in turn calls ensure_model. Two profiles means two model loads
+    (or one shared load if the model paths collide)."""
     from speakinput.app import App
-    from speakinput.config import Config
+    from speakinput.config import Profile
 
-    fake_ensure = MagicMock(return_value="/resolved/model.bin")
+    fake_ensure = MagicMock(side_effect=lambda name: f"/resolved/{name}.bin")
     fake_model_cls = MagicMock()
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
 
-    config = Config()
-    # Recorder, injector, feedback are not used in run() until after bootstrap.
+    config = Config(
+        primary=Profile(key="alt_r", model="small", language="auto"),
+        secondary=Profile(key="cmd_r", model="small", language="zh"),
+    )
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
-    assert app.transcriber is None  # confirm precondition
+    assert app.transcribers == {}  # precondition
 
-    # Stop the run loop immediately after the listener starts.
     app._shutdown.set()
     app.run()
 
-    fake_ensure.assert_called_once_with("small")
-    fake_model_cls.assert_called_once()
-    # The path from ensure_model should be the one passed to the constructor.
-    assert fake_model_cls.call_args.kwargs["model"] == "/resolved/model.bin"
+    # Two profiles, both `small` -> one model file downloaded, one
+    # WhisperCppTranscriber constructed (deduped by name+path).
+    assert fake_ensure.call_count == 1
+    assert fake_ensure.call_args.args == ("small",)
+    assert fake_model_cls.call_count == 1
+    # Two listeners started.
+    assert set(app.listeners.keys()) == {"alt_r", "cmd_r"}
 
 
-def test_run_skips_bootstrap_when_transcriber_injected():
-    """If a transcriber was passed in (e.g. in tests), run() must not call
-    ensure_model — the test owns the transcriber."""
-    app, _, transcriber, _, _ = _build_app()
-    assert app.transcriber is transcriber  # precondition
+def test_run_bootstraps_two_distinct_models(monkeypatch):
+    """Two profiles with different model files => two ensure_model calls
+    and two WhisperCppTranscriber constructions."""
+    from speakinput.app import App
+    from speakinput.config import Profile
 
-    # No monkeypatching of ensure_model — if it were called, the test would
-    # fail because pywhispercpp isn't installed in the test env. We assert
-    # by simply running the early portion of run() and checking nothing
-    # was constructed.
+    fake_ensure = MagicMock(side_effect=lambda name: f"/resolved/{name}.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(
+        primary=Profile(key="alt_r", model="base.en", language="en"),
+        secondary=Profile(key="cmd_r", model="small", language="zh"),
+    )
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    # base.en + en is allowed (English-only stays). base + zh is
+    # multilingual, no upgrade. Two distinct model files, two
+    # transcribers, two listeners.
+    assert fake_ensure.call_count == 2
+    assert fake_model_cls.call_count == 2
+    assert set(app.listeners.keys()) == {"alt_r", "cmd_r"}
+
+
+def test_run_skips_bootstrap_when_transcribers_injected():
+    """If transcribers were passed in, run() must not call ensure_model —
+    the test owns the transcribers."""
+    app, _, transcribers, _, _ = _build_app()
+    assert app.transcribers is transcribers  # precondition
+
     app._shutdown.set()
     app.run()  # should not raise
-    assert app.transcriber is transcriber
+    assert app.transcribers is transcribers
 
 
 def test_run_with_unknown_model_exits(monkeypatch, capsys):
-    """A misconfigured model name should exit 2 before the listener starts."""
     from speakinput.app import App
-    from speakinput.config import Config
+    from speakinput.config import Profile
     from speakinput.models import ModelNotFoundError
 
     fake_ensure = MagicMock(side_effect=ModelNotFoundError("unknown model"))
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
 
-    config = Config()
+    config = Config(primary=Profile(model="bogus"))
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
 
     with pytest.raises(SystemExit) as exc_info:
@@ -337,7 +367,6 @@ def test_run_with_unknown_model_exits(monkeypatch, capsys):
 
 def test_run_with_download_failure_exits(monkeypatch, capsys):
     from speakinput.app import App
-    from speakinput.config import Config
     from speakinput.models import ModelDownloadError
 
     fake_ensure = MagicMock(side_effect=ModelDownloadError("network down"))
@@ -353,26 +382,25 @@ def test_run_with_download_failure_exits(monkeypatch, capsys):
     assert "network down" in captured.err
 
 
-# --- language / model auto-upgrade -----------------------------------------
+# --- language / model auto-upgrade ----------------------------------------
 
 
 def test_run_upgrades_english_only_model_for_zh(monkeypatch, capsys):
     """`base.en` + `language=zh` must auto-upgrade to `base` so Chinese
     actually works. The user is told about the swap in the log."""
     from speakinput.app import App
-    from speakinput.config import Config, STTConfig
+    from speakinput.config import Profile
 
     fake_ensure = MagicMock(return_value="/resolved/base.bin")
     fake_model_cls = MagicMock()
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
 
-    config = Config(stt=STTConfig(model="base.en", language="zh"))
+    config = Config(primary=Profile(key="alt_r", model="base.en", language="zh"))
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
     app._shutdown.set()
     app.run()
 
-    # ensure_model was called with the *upgraded* name, not the original.
     fake_ensure.assert_called_once_with("base")
     captured = capsys.readouterr()
     assert "upgrading" in captured.err
@@ -381,17 +409,15 @@ def test_run_upgrades_english_only_model_for_zh(monkeypatch, capsys):
 
 
 def test_run_upgrades_english_only_model_for_auto(monkeypatch, capsys):
-    """`language=auto` on an English-only model also upgrades, because the
-    model can't recognize non-English speech at all."""
     from speakinput.app import App
-    from speakinput.config import Config, STTConfig
+    from speakinput.config import Profile
 
     fake_ensure = MagicMock(return_value="/resolved/small.bin")
     fake_model_cls = MagicMock()
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
 
-    config = Config(stt=STTConfig(model="small.en", language="auto"))
+    config = Config(primary=Profile(key="alt_r", model="small.en", language="auto"))
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
     app._shutdown.set()
     app.run()
@@ -402,17 +428,15 @@ def test_run_upgrades_english_only_model_for_auto(monkeypatch, capsys):
 
 
 def test_run_does_not_upgrade_when_english_only_model_with_en(monkeypatch, capsys):
-    """If the user explicitly chose an English-only model AND set language=en,
-    leave it alone — they wanted the fast English path."""
     from speakinput.app import App
-    from speakinput.config import Config, STTConfig
+    from speakinput.config import Profile
 
     fake_ensure = MagicMock(return_value="/resolved/base.en.bin")
     fake_model_cls = MagicMock()
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
 
-    config = Config(stt=STTConfig(model="base.en", language="en"))
+    config = Config(primary=Profile(key="alt_r", model="base.en", language="en"))
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
     app._shutdown.set()
     app.run()
@@ -423,16 +447,15 @@ def test_run_does_not_upgrade_when_english_only_model_with_en(monkeypatch, capsy
 
 
 def test_run_does_not_upgrade_multilingual_model(monkeypatch, capsys):
-    """A multilingual model + zh is the normal path. No upgrade message."""
     from speakinput.app import App
-    from speakinput.config import Config, STTConfig
+    from speakinput.config import Profile
 
     fake_ensure = MagicMock(return_value="/resolved/small.bin")
     fake_model_cls = MagicMock()
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
 
-    config = Config(stt=STTConfig(model="small", language="zh"))
+    config = Config(primary=Profile(key="alt_r", model="small", language="zh"))
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
     app._shutdown.set()
     app.run()
@@ -442,43 +465,184 @@ def test_run_does_not_upgrade_multilingual_model(monkeypatch, capsys):
     assert "upgrading" not in captured.err
 
 
-# --- startup banner --------------------------------------------------------
+# --- multi-profile dispatch -------------------------------------------------
 
 
-def test_run_prints_startup_banner(monkeypatch, capsys):
-    """The startup banner must show the active config so the user can verify
-    it without opening config.toml."""
+def test_secondary_profile_press_uses_secondary_transcriber(capsys):
+    """A press on the secondary key must dispatch to the secondary
+    profile's transcriber, not the primary's. This is the whole point
+    of the two-profile design — different language, different model
+    settings."""
     from speakinput.app import App
-    from speakinput.config import Config
+
+    config = Config(
+        audio=AudioConfig(silence_threshold=0),
+        primary=Profile(key="alt_r", model="small", language="en"),
+        secondary=Profile(key="cmd_r", model="small", language="zh"),
+    )
+    primary_t = MagicMock()
+    primary_t.transcribe.return_value = "english text"
+    secondary_t = MagicMock()
+    secondary_t.transcribe.return_value = "中文文字"
+    transcribers = {"alt_r": primary_t, "cmd_r": secondary_t}
+
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+
+    # Press secondary, release secondary — the secondary transcriber
+    # runs, the primary does not.
+    app.on_hotkey_press(config.secondary)
+    app.on_hotkey_release(config.secondary)
+    primary_t.transcribe.assert_not_called()
+    secondary_t.transcribe.assert_called_once()
+    app.injector.inject.assert_called_once_with("中文文字")
+
+
+def test_primary_profile_press_uses_primary_transcriber(capsys):
+    """Symmetric to the above — primary key press dispatches to primary."""
+    from speakinput.app import App
+
+    config = Config(
+        audio=AudioConfig(silence_threshold=0),
+        primary=Profile(key="alt_r", model="small", language="en"),
+        secondary=Profile(key="cmd_r", model="small", language="zh"),
+    )
+    primary_t = MagicMock()
+    primary_t.transcribe.return_value = "english text"
+    secondary_t = MagicMock()
+    transcribers = {"alt_r": primary_t, "cmd_r": secondary_t}
+
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+    primary_t.transcribe.assert_called_once()
+    secondary_t.transcribe.assert_not_called()
+    app.injector.inject.assert_called_once_with("english text")
+
+
+def test_two_listeners_started_for_two_profiles(monkeypatch):
+    """run() must start a HotkeyListener for every profile."""
+    from speakinput.app import App
+    from speakinput.config import Profile
 
     fake_ensure = MagicMock(return_value="/resolved/small.bin")
     fake_model_cls = MagicMock()
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
 
-    config = Config()
+    config = Config(
+        primary=Profile(key="alt_r"),
+        secondary=Profile(key="cmd_r"),
+    )
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+    assert set(app.listeners.keys()) == {"alt_r", "cmd_r"}
+
+
+def test_shutdown_stops_all_listeners(monkeypatch):
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(
+        primary=Profile(key="alt_r"),
+        secondary=Profile(key="cmd_r"),
+    )
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+    # Listeners remain in the dict after shutdown (so tests can
+    # verify wiring) and each one had stop() called.
+    assert set(app.listeners.keys()) == {"alt_r", "cmd_r"}
+    for listener in app.listeners.values():
+        listener.stop.assert_called_once()
+
+
+def test_shared_model_loads_once(monkeypatch):
+    """Two profiles using the same model file should load the model
+    once and share the WhisperCppTranscriber instance. Same path ==
+    same RAM footprint as one profile."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/shared/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(
+        primary=Profile(key="alt_r", model="small"),
+        secondary=Profile(key="cmd_r", model="small"),
+    )
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    # One file download, one WhisperCppTranscriber, but two key -> transcriber
+    # entries pointing to the same instance.
+    assert fake_ensure.call_count == 1
+    assert fake_model_cls.call_count == 1
+    assert app.transcribers["alt_r"] is app.transcribers["cmd_r"]
+
+
+# --- startup banner --------------------------------------------------------
+
+
+def test_run_prints_startup_banner(monkeypatch, capsys):
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(
+        primary=Profile(key="alt_r"),
+        secondary=Profile(key="cmd_r", language="zh"),
+    )
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
     app._shutdown.set()
     app.run()
 
     captured = capsys.readouterr()
     assert "[startup] config   : (defaults — no config.toml found)" in captured.err
-    assert "[startup] model    : small" in captured.err
-    assert "[startup] language : auto" in captured.err
-    assert "[startup] hotkey   : alt_r" in captured.err
+    assert "[startup] profile 1 : key=alt_r model=small language=auto prompt=set" in captured.err
+    assert "[startup] profile 2 : key=cmd_r model=small language=zh prompt=set" in captured.err
+    # Both profiles share the same model file -> dedupe message shown.
+    assert "[startup] models   : loaded 1 into memory (shared: 1 transcriber, 2 profiles)" in captured.err
     assert "[startup] sample   :" in captured.err
     assert "[startup] silence  :" in captured.err
-    assert "[startup] prompt   :" in captured.err  # default is the embedded-vocab bias; full prompt follows
     assert "[startup] inject   :" in captured.err
 
 
 def test_run_banner_shows_config_source_when_file_loaded(monkeypatch, capsys, tmp_path):
-    """When the config was loaded from a file, the banner must show the
-    source path so the user can verify the right file is being read."""
-    from pathlib import Path
-
     from speakinput.app import App
-    from speakinput.config import Config
 
     fake_ensure = MagicMock(return_value="/resolved/small.bin")
     fake_model_cls = MagicMock()
@@ -502,18 +666,57 @@ def test_run_banner_shows_config_source_when_file_loaded(monkeypatch, capsys, tm
     assert "(defaults" not in captured.err
 
 
-def test_run_passes_initial_prompt_to_transcriber(monkeypatch):
-    """`stt.initial_prompt` from config must reach the WhisperCppTranscriber
-    constructor so the decoder gets the lexical prior on every call."""
+def test_run_banner_single_profile_no_dedupe_message(monkeypatch, capsys):
+    """With no secondary profile the dedupe line should NOT mention
+    sharing — there's only one profile, sharing is impossible."""
     from speakinput.app import App
-    from speakinput.config import Config, STTConfig
 
     fake_ensure = MagicMock(return_value="/resolved/small.bin")
     fake_model_cls = MagicMock()
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
 
-    config = Config(stt=STTConfig(initial_prompt="kubectl apply -f deployment.yaml"))
+    config = Config()  # no secondary
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert "[startup] profile 1" in captured.err
+    assert "profile 2" not in captured.err
+    assert "shared" not in captured.err
+
+
+def test_run_banner_prompt_off_when_initial_prompt_empty(monkeypatch, capsys):
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(primary=Profile(key="alt_r", initial_prompt=""))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert "prompt=off" in captured.err
+
+
+def test_run_passes_initial_prompt_to_transcriber(monkeypatch):
+    """`profile.primary.initial_prompt` from config must reach the
+    WhisperCppTranscriber constructor for that profile."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(primary=Profile(key="alt_r", initial_prompt="kubectl apply -f deployment.yaml"))
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
     app._shutdown.set()
     app.run()

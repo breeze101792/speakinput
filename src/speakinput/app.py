@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from speakinput.audio import AudioRecorder
-from speakinput.config import Config
+from speakinput.config import Config, Profile
 from speakinput.feedback import Feedback, NullFeedback
 from speakinput.hotkey import HotkeyListener, resolve_key
 from speakinput.injector import Injector, TypingInjector
@@ -31,12 +31,68 @@ def _dbg(enabled: bool, msg: str) -> None:
         print(f"[debug] {msg}", file=sys.stderr, flush=True)
 
 
+def _build_transcribers(
+    profiles: list[Profile],
+    transcriber_overrides: dict[str, Transcriber] | None = None,
+) -> dict[str, Transcriber]:
+    """Construct one Transcriber per profile, sharing instances by model path.
+
+    Two profiles that resolve to the same model file share a single
+    `WhisperCppTranscriber` — pywhispercpp loads the model eagerly in
+    its constructor, so a shared instance means one copy in RAM
+    (~466 MB for `small`). The `transcribe()` call's `language` and
+    `initial_prompt` are per-call, not per-instance, so sharing is safe.
+
+    `ensure_model` is also deduped: when two profiles pick the same
+    model name we only print the "checking model..." / "model ready"
+    lines once.
+
+    `transcriber_overrides` lets tests inject mock transcribers keyed by
+    the profile's hotkey (e.g. `{"alt_r": mock1, "cmd_r": mock2}`).
+    """
+    overrides = transcriber_overrides or {}
+    by_name: dict[str, Path] = {}
+    by_path: dict[str, Transcriber] = {}
+    by_key: dict[str, Transcriber] = {}
+    for profile in profiles:
+        if profile.key in overrides:
+            by_key[profile.key] = overrides[profile.key]
+            continue
+        # Auto-upgrade: an English-only model with a non-English language
+        # (or `auto`) gets swapped for the same-tier multilingual model
+        # before we try to download it. The user is told via the message.
+        model_name, upgrade_msg = resolve_for_language(profile.model, profile.language)
+        if upgrade_msg and model_name not in by_name:
+            print(f"[info] {upgrade_msg}", file=sys.stderr, flush=True)
+        # Reuse the resolved path if a previous profile already chose
+        # the same model name. Avoids redundant "checking model..." lines
+        # and a redundant on-disk lookup.
+        if model_name in by_name:
+            model_path = by_name[model_name]
+        else:
+            model_path = ensure_model(model_name)
+            by_name[model_name] = model_path
+        cached = by_path.get(str(model_path))
+        if cached is not None:
+            by_key[profile.key] = cached
+        else:
+            t = WhisperCppTranscriber(
+                model=model_path,
+                language=profile.language,
+                beam_size=profile.beam_size,
+                initial_prompt=profile.initial_prompt,
+            )
+            by_path[str(model_path)] = t
+            by_key[profile.key] = t
+    return by_key
+
+
 class App:
     def __init__(
         self,
         config: Config,
         recorder: AudioRecorder | None = None,
-        transcriber: Transcriber | None = None,
+        transcribers: dict[str, Transcriber] | None = None,
         injector: Injector | None = None,
         feedback: Feedback | None = None,
         dry_run: bool = False,
@@ -53,10 +109,15 @@ class App:
             sample_rate=config.audio.sample_rate,
             device=config.audio.device,
         )
-        # Defer the default transcriber to run() so we can resolve and
-        # download the model first. Tests that inject a transcriber don't
-        # pay this cost.
-        self.transcriber = transcriber
+        # Profiles in (key, model, language, prompt) order, primary first.
+        # Used to build the per-key transcribers and hotkey listeners.
+        self._profiles: list[Profile] = [config.primary]
+        if config.secondary is not None:
+            self._profiles.append(config.secondary)
+        # Defer default-transcriber construction to run() so we can
+        # resolve and download models first. Tests inject transcribers
+        # via the `transcribers` kwarg and skip the bootstrap step.
+        self.transcribers: dict[str, Transcriber] = transcribers or {}
         self.injector = injector or TypingInjector(
             restore_clipboard_ms=config.inject.restore_clipboard_ms,
             trailing_space=config.inject.trailing_space,
@@ -67,55 +128,58 @@ class App:
         self._shutdown = threading.Event()
         self._busy = threading.Lock()
         self._press_started_at: float | None = None
-        self.listener: HotkeyListener | None = None
+        # The profile that's currently being recorded. Set on press,
+        # consumed on release, cleared at the end. None outside of a
+        # press/release pair.
+        self._active_profile: Profile | None = None
+        self.listeners: dict[str, HotkeyListener] = {}
 
-    def _build_default_transcriber(self) -> Transcriber:
-        """Resolve the model path (downloading if needed) and construct the
-        default WhisperCppTranscriber. Raises ModelNotFoundError /
-        ModelDownloadError if the model can't be made available.
-        """
-        model_path = ensure_model(self.config.stt.model)
-        return WhisperCppTranscriber(
-            model=model_path,
-            language=self.config.stt.language,
-            beam_size=self.config.stt.beam_size,
-            initial_prompt=self.config.stt.initial_prompt,
-        )
+    @property
+    def active_profile(self) -> Profile | None:
+        return self._active_profile
 
-    def on_hotkey_press(self) -> None:
+    def on_hotkey_press(self, profile: Profile) -> None:
         # Guard against re-entry: if a previous press is still being processed,
         # ignore this press. pynput's latch would also catch this, but a
         # second physical press during processing would still fire.
         if self._busy.locked():
-            _dbg(self.debug, "press ignored: already busy")
+            _dbg(self.debug, f"press ignored: already busy (key={profile.key})")
             return
         self._busy.acquire()
+        self._active_profile = profile
         self._press_started_at = time.monotonic()
-        _dbg(self.debug, f"key press start ({self.config.hotkey.key})")
+        _dbg(self.debug, f"key press start ({profile.key})")
         try:
             self.recorder.start()
         except Exception:
             log.exception("failed to start recorder")
             self._busy.release()
             self._press_started_at = None
+            self._active_profile = None
             return
         self.feedback.set_state("listening")
 
-    def on_hotkey_release(self) -> None:
+    def on_hotkey_release(self, profile: Profile) -> None:
         if not self.recorder.is_recording():
             # Press callback failed; nothing to do.
             return
+        if self._active_profile is not profile:
+            # Press and release keys don't match (shouldn't happen with
+            # one key held at a time, but guard anyway). Release the
+            # active profile instead of the release-side argument.
+            profile = self._active_profile
         held_for = (
             time.monotonic() - self._press_started_at if self._press_started_at is not None else 0.0
         )
         self._press_started_at = None
-        _dbg(self.debug, f"key press end (held {held_for:.2f}s)")
+        _dbg(self.debug, f"key press end (held {held_for:.2f}s, key={profile.key})")
         self.feedback.set_state("processing")
         try:
             audio = self.recorder.stop()
         except Exception:
             log.exception("failed to stop recorder")
             self._busy.release()
+            self._active_profile = None
             return
         duration = audio.size / max(self.config.audio.sample_rate, 1)
         import numpy as np  # local import keeps the hot path lean
@@ -136,13 +200,23 @@ class App:
                 f"silence gate: rms={rms:.4f} < {threshold:.4f}, skipping transcribe",
             )
             self._busy.release()
+            self._active_profile = None
             self.feedback.set_state("idle")
             return
         try:
-            text = self.transcriber.transcribe(audio, self.config.audio.sample_rate)
+            transcriber = self.transcribers[profile.key]
+        except KeyError:
+            log.exception("no transcriber wired for key %r", profile.key)
+            self._busy.release()
+            self._active_profile = None
+            self.feedback.set_state("idle")
+            return
+        try:
+            text = transcriber.transcribe(audio, self.config.audio.sample_rate)
         except Exception:
             log.exception("transcription failed")
             self._busy.release()
+            self._active_profile = None
             self.feedback.set_state("idle")
             return
         # Always print the transcript in debug mode, even when empty, so the
@@ -158,23 +232,26 @@ class App:
                 except Exception:
                     log.exception("injection failed")
         self._busy.release()
+        self._active_profile = None
         self.feedback.set_state("idle")
 
+    def _make_press_cb(self, profile: Profile):
+        def cb() -> None:
+            self.on_hotkey_press(profile)
+        return cb
+
+    def _make_release_cb(self, profile: Profile):
+        def cb() -> None:
+            self.on_hotkey_release(profile)
+        return cb
+
     def run(self) -> None:
-        # Bootstrap: ensure the model is on disk BEFORE we start the hotkey
+        # Bootstrap: ensure models are on disk BEFORE we start the hotkey
         # listener, so the user never sees a 141 MB download start mid-session.
-        if self.transcriber is None:
-            # Auto-upgrade: if the configured model is English-only but the
-            # language requires multilingual support, swap it for the
-            # same-tier multilingual model before downloading.
-            upgraded_model, upgrade_msg = resolve_for_language(
-                self.config.stt.model, self.config.stt.language
-            )
-            if upgrade_msg:
-                print(f"[info] {upgrade_msg}", file=sys.stderr, flush=True)
-                self.config = self.config.with_overrides(model=upgraded_model)
+        # If the test (or another caller) injected transcribers, skip.
+        if not self.transcribers:
             try:
-                self.transcriber = self._build_default_transcriber()
+                self.transcribers = _build_transcribers(self._profiles)
             except ModelNotFoundError as exc:
                 print(f"model error: {exc}", file=sys.stderr)
                 raise SystemExit(2) from exc
@@ -183,16 +260,16 @@ class App:
                 raise SystemExit(2) from exc
         self._print_banner()
         self.feedback.start()
-        self.listener = HotkeyListener(
-            key=resolve_key(self.config.hotkey.key),
-            on_press=self.on_hotkey_press,
-            on_release=self.on_hotkey_release,
-        )
-        self.listener.start()
-        log.info(
-            "speakinput listening: hold %s to record, release to inject",
-            self.config.hotkey.key,
-        )
+        for profile in self._profiles:
+            listener = HotkeyListener(
+                key=resolve_key(profile.key),
+                on_press=self._make_press_cb(profile),
+                on_release=self._make_release_cb(profile),
+            )
+            self.listeners[profile.key] = listener
+            listener.start()
+        keys = ", ".join(p.key for p in self._profiles)
+        log.info("speakinput listening: hold %s to record, release to inject", keys)
         if self.debug:
             _dbg(True, "debug mode ON — every key event and transcript will be logged to stderr")
         # Install signal handlers so Ctrl-C cleans up the recorder.
@@ -212,19 +289,34 @@ class App:
         inject_mode = "off (dry-run)" if self.dry_run else "on"
         threshold = cfg.audio.silence_threshold
         threshold_str = "off" if threshold == 0 else f"{threshold:g}"
-        prompt_str = "off" if not cfg.stt.initial_prompt else repr(cfg.stt.initial_prompt)
         if self.config_source is not None:
             source_str = str(self.config_source)
         else:
             source_str = "(defaults — no config.toml found)"
+        # Profile lines: one per profile, listing the STT settings; a
+        # closing summary line tells the user how many distinct model
+        # files we actually loaded (so they can see when their dedup
+        # worked).
+        profile_lines = []
+        for i, p in enumerate(self._profiles, start=1):
+            prompt = "off" if not p.initial_prompt else "set"
+            profile_lines.append(
+                f"profile {i} : key={p.key} model={p.model} "
+                f"language={p.language} prompt={prompt}"
+            )
+        distinct = len({id(t) for t in self.transcribers.values()})
+        total = len(self.transcribers)
+        dedupe_str = (
+            f" (shared: 1 transcriber, {total} profiles)"
+            if total > 1 and distinct == 1
+            else ""
+        )
         lines = [
             f"config   : {source_str}",
-            f"model    : {cfg.stt.model}",
-            f"language : {cfg.stt.language}",
-            f"hotkey   : {cfg.hotkey.key}",
+            *profile_lines,
+            f"models   : loaded {distinct} into memory{dedupe_str}",
             f"sample   : {cfg.audio.sample_rate} Hz, device={device}",
             f"silence  : rms<{threshold_str} -> skip",
-            f"prompt   : {prompt_str}",
             f"inject   : {inject_mode}, trailing_space={cfg.inject.trailing_space}",
         ]
         for line in lines:
@@ -232,9 +324,14 @@ class App:
 
     def shutdown(self) -> None:
         self._shutdown.set()
-        if self.listener is not None:
-            self.listener.stop()
-            self.listener = None
+        for key, listener in self.listeners.items():
+            try:
+                listener.stop()
+            except Exception:
+                log.exception("listener stop failed (key=%s)", key)
+        # Keep the listeners dict around so post-shutdown tests can
+        # verify which keys were wired. pynput's Listener objects are
+        # safe to leave stopped but referenced.
         try:
             self.feedback.stop()
         except Exception:

@@ -28,7 +28,7 @@ Speak Input then checks whether the configured model file is present. If not, it
 
 ## Model management
 
-The model is downloaded into pywhispercpp's cache directory, typically `~/Library/Application Support/pywhispercpp/models/`. By default Speak Input uses the `small` model (~466 MB, multilingual) so it works for English *and* Chinese out of the box. To see the curated model list, run `speakinput -L`.
+Model files are downloaded into pywhispercpp's cache directory, typically `~/Library/Application Support/pywhispercpp/models/`. By default Speak Input uses the `small` model (~466 MB, multilingual) so it works for English *and* Chinese out of the box. With two profiles, that single `small` file is loaded once and shared between the two `WhisperCppTranscriber` instances — so a typical two-language setup costs ~466 MB resident, not 932 MB. To see the curated model list, run `speakinput -L`.
 
 ```bash
 speakinput -L                     # show the curated list
@@ -37,23 +37,46 @@ speakinput -m base.en             # pick a different model; downloaded on first 
 
 If the download fails (no internet, firewall, disk full), Speak Input exits with code 2 and a clear error message — the listener never starts. Fix the underlying problem and re-run.
 
+## Two profiles, one key per language
+
+Speak Input runs **one or two profiles**. A profile binds one hotkey to one STT setup (model + language + prompt). The typical setup is two profiles, so a single key speaks one language and the model never has to guess:
+
+| Profile   | Default key                    | Default language | Default model |
+| --------- | ------------------------------ | ---------------- | ------------- |
+| primary   | `alt_r` (macOS) / `ctrl_r` (Linux/Windows) | `auto`  | `small`       |
+| secondary | `cmd_r` (macOS) / `cmd_r` (Linux/Windows, pynput maps to Super) | `zh`    | `small`       |
+
+Hold the primary key, speak English, release → English text. Hold the secondary key, speak Chinese, release → Chinese text. Whisper never runs the language-ID pass because the language is already pinned per key.
+
+To use only one language, delete the entire `[profile.secondary]` block in `config.toml` — the right-alt key keeps working, the right-cmd key is not wired, and only the primary model is loaded into RAM.
+
+The two profiles can share the same model file. The default uses `small` (multilingual) for both, and Speak Input loads it into RAM **once** — the `WhisperCppTranscriber` instance is shared between profiles. To speed up the English path, set `primary.model = "small.en"` (note: the secondary profile's language must then be `en` or `auto` to keep the model valid). With one shared `small` model the program uses ~466 MB resident; with `small.en` for English + `small` for Chinese it's ~932 MB.
+
 ## Languages
 
-`stt.language` in `config.toml` controls what language the model transcribes:
+The language is set **per profile**:
+
+```toml
+[profile.primary]
+language = "auto"   # or "en"
+
+[profile.secondary]
+language = "zh"
+```
 
 | Value   | What it does                                                | Pairs with                          |
 | ------- | ----------------------------------------------------------- | ----------------------------------- |
-| `auto`  | Detect the spoken language per utterance (default)          | multilingual models (`tiny`/`base`/`small`/`medium`) |
+| `auto`  | Detect the spoken language per utterance (primary default)  | multilingual models (`tiny`/`base`/`small`/`medium`) |
 | `en`    | Force English (faster, more accurate than auto for English) | any model                           |
-| `zh`    | Force Chinese (Mandarin)                                    | multilingual models only           |
+| `zh`    | Force Chinese (Mandarin, secondary default)                 | multilingual models only           |
 
-With the default `model = "small"` and `language = "auto"`, you can switch between English and Chinese mid-session without restarting. The trade-off: `auto` runs the language identifier on the first 30s of every recording, which adds a small latency hit and is slightly less accurate than explicitly stating the language. If you only ever dictate in one language, set `language` explicitly and you'll get better results.
+The trade-off with `auto`: it runs the language identifier on the first 30s of every recording, which adds a small latency hit and is slightly less accurate than explicitly stating the language. With a two-profile setup, you almost never need `auto` — the secondary profile pins `zh` and the primary pins `en` (or `auto` if you want to mix English with occasional other languages). Explicit `language` per profile is the whole point of having two keys.
 
-English-only models (`tiny.en`, `base.en`, `small.en`) are faster but cannot do Chinese. If you set `language = "zh"` with an English-only model, Speak Input will refuse to start with a clear error.
+English-only models (`tiny.en`, `base.en`, `small.en`) are faster but cannot do Chinese. If you set `language = "zh"` on a profile whose model is English-only, Speak Input will refuse to start with a clear error. The same goes the other way: `base.en` paired with `language = "en"` is fine, but `base.en` paired with `language = "auto"` is also allowed and just runs the language ID with an English-only encoder.
 
 ## Initial prompt (vocabulary biasing)
 
-`stt.initial_prompt` in `config.toml` (or `-P` / `--initial-prompt` on the command line) primes whisper's decoder with a fixed text fragment at the start of every transcription. This is a **lexical prior** — it biases the model toward specific vocabulary, but it does not change whisper's behavior the way a chat-model system prompt would.
+`initial_prompt` is set **per profile** in `config.toml` (or `-P` / `--initial-prompt` on the command line, which overrides the primary profile's prompt). It primes whisper's decoder with a fixed text fragment at the start of every transcription. This is a **lexical prior** — it biases the model toward specific vocabulary, but it does not change whisper's behavior the way a chat-model system prompt would.
 
 ### Shipped default: embedded software engineer
 
@@ -128,7 +151,7 @@ Or override per-run with `-P`:
 Set `initial_prompt = ""` in `config.toml` (empty string). Useful if you dictate in mixed/unpredictable domains and don't want any prior pulling the decoder one way or another.
 
 ```toml
-[stt]
+[profile.primary]
 initial_prompt = ""
 ```
 
@@ -136,7 +159,7 @@ Note: passing `-P ""` on the command line is awkward (the shell swallows the emp
 
 ### Verifying the bias is active
 
-Run `./start.sh -d` and look for the startup banner line `[startup] prompt   : on` — that confirms a non-empty `initial_prompt` is reaching the transcriber. With `initial_prompt = ""` it reads `prompt   : off`.
+Run `./start.sh -d` and look for the startup banner line `profile 1 : ... prompt=set` — that confirms a non-empty `initial_prompt` is reaching the primary profile's transcriber. With `initial_prompt = ""` it reads `prompt=off`. Same for `profile 2` if you have a secondary profile.
 
 ## macOS permissions
 
@@ -193,8 +216,8 @@ speakinput -d                     # debug mode: log every key event and transcri
 | Short | Long                  | What it does                                    |
 | ----- | --------------------- | ----------------------------------------------- |
 | `-c`  | `--config PATH`       | Path to config.toml                             |
-| `-m`  | `--model NAME`        | Override the whisper model (`tiny`/`base`/`small`/`medium`/`.en` variants) |
-| `-g`  | `--language CODE`     | Override stt.language (`auto` / `en` / `zh`)               |
+| `-m`  | `--model NAME`        | Override the **primary** profile's whisper model (`tiny`/`base`/`small`/`medium`/`.en` variants) |
+| `-g`  | `--language CODE`     | Override the **primary** profile's language (`auto` / `en` / `zh`) |
 | `-l`  | `--list-devices`      | List available input devices and exit           |
 | `-L`  | `--list-models`       | List curated whisper models and exit            |
 | `-D`  | `--diagnose`          | Record 2s and print audio stats                 |
@@ -203,24 +226,33 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-t`  | `--trailing-space`    | Append a space after each transcript (default)  |
 | `-T`  | `--no-trailing-space` | Don't append a space after each transcript      |
 | `-S`  | `--silence-threshold FLOAT` | Skip transcribe when audio RMS is below this floor (0 disables; default 0.005) |
-| `-P`  | `--initial-prompt TEXT` | Override `stt.initial_prompt` for this run (default: embedded-software-engineer bias; see [Initial prompt](#initial-prompt-vocabulary-biasing)) |
+| `-P`  | `--initial-prompt TEXT` | Override the **primary** profile's `initial_prompt` for this run (default: embedded-software-engineer bias; see [Initial prompt](#initial-prompt-vocabulary-biasing)) |
 | `-v`  | `--verbose`           | Enable debug logging from python logging        |
+
+CLI flags apply to the **primary** profile only. The secondary profile is configured in `config.toml` — there's no `--secondary-*` flag by design, since the secondary's whole point is a stable per-machine config.
 
 By default the push-to-talk key is **Right Option (Alt)** on macOS and **Right Ctrl** on Linux/Windows. The choice is platform-aware — Alt is heavily used for menu mnemonics on PC desktops, so the default flips to Right Ctrl there. Hold the key, speak, release. The recognized text is typed into whatever field has focus, **with a trailing space** so the next word doesn't run into the last one. Disable the trailing space with `--no-trailing-space` if you want pure dictation (e.g. when typing into a code editor).
 
-To change the hotkey, edit the config:
+To change the hotkey(s), edit the config:
 
 ```toml
-[hotkey]
+[profile.primary]
 key = "alt_r"        # alt_r | ctrl_r | cmd_r | shift_r | caps_lock | f12
+
+[profile.secondary]
+key = "cmd_r"        # only read if [profile.secondary] is present
 ```
 
-To change the model:
+To change the model and language, edit the per-profile sections:
 
 ```toml
-[stt]
+[profile.primary]
 model = "small"        # tiny.en | base.en | small.en | tiny | base | small | medium
 language = "auto"      # auto | en | zh
+
+[profile.secondary]
+model = "small"
+language = "zh"
 ```
 
 | Model    | Size  | Speed (M1) | Languages                |
@@ -240,21 +272,30 @@ The first time you select a model, pywhispercpp downloads it to `~/.cache/pywhis
 The shipped `config.example.toml` is the source of truth — every field shown there is also the program's default. Copy it to the user config dir (`./start.sh` does this on first run) and uncomment/edit the lines you care about; anything left out falls back to the default.
 
 ```toml
-[stt]
-model = "small"            # whisper.cpp model; see model table below
-language = "auto"          # auto | en | zh
-beam_size = 1              # 1 = greedy (fastest); up to 10 for higher accuracy
-# initial_prompt = ""      # default is an embedded-software-engineer bias;
-                           # set to "" to disable. See "Initial prompt" below.
+[profile.primary]
+key = "alt_r"           # alt_r | ctrl_r | cmd_r | shift_r | caps_lock | f12
+                        # Default is platform-aware: alt_r on macOS,
+                        # ctrl_r on Linux/Windows.
+model = "small"         # whisper.cpp model; see model table below
+language = "auto"       # auto | en | zh
+beam_size = 1           # 1 = greedy (fastest); up to 10 for higher accuracy
+# initial_prompt = ""   # default is an embedded-software-engineer bias;
+                        # set to "" to disable. See "Initial prompt" below.
+
+# Optional. Delete the entire [profile.secondary] block to run with
+# one key only. Default key is cmd_r; default language is zh.
+[profile.secondary]
+key = "cmd_r"
+model = "small"
+language = "zh"
+beam_size = 1
+# initial_prompt = ""   # per-profile; same bias as primary by default
 
 [audio]
 device = null              # null = system default mic; or an integer index from --list-devices
 sample_rate = 16000        # whisper expects 16 kHz; do not change
 silence_threshold = 0.005  # skip transcribe when audio RMS is below this floor
                            # (0 disables the gate; lower = more sensitive)
-
-[hotkey]
-key = "alt_r"              # see valid keys above
 
 [inject]
 restore_clipboard_ms = 50  # how long to wait before restoring the prior clipboard contents
@@ -273,12 +314,14 @@ $EDITOR ~/Library/Application\ Support/speakinput/config.toml
 ## How it works
 
 ```
-hotkey press   →  AudioRecorder starts capturing
+hotkey press   →  look up profile by key  →  AudioRecorder starts capturing
 hotkey release →  AudioRecorder stops
               →  silence gate: if RMS < threshold, skip (no hallucination)
-              →  WhisperCppTranscriber transcribes the buffer
+              →  profile.transcriber.transcribe(audio)
               →  TypingInjector types the result (or pastes via clipboard for non-ASCII)
 ```
+
+The App keeps a `key → profile` map. When a key fires, the matching profile's transcriber runs (with that profile's language + initial_prompt). When two profiles share a model file, they share a `WhisperCppTranscriber` instance — one model load, ~466 MB resident, two keys.
 
 Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams. v2 will add:
 
@@ -302,7 +345,7 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 
 **A random short phrase appears when I didn't say anything / accidentally tapped the hotkey.** Whisper hallucinates on near-empty audio — the silence gate should catch this. If you still see phantom text, your environment may be noisy enough that the RMS exceeds the default `0.005` floor. Lower it: `speakinput -S 0.01` or set `[audio].silence_threshold = 0.01` in config.toml. Set to `0` to disable the gate entirely (whisper will see every recording, including silence).
 
-**Output contains "DMA", "FreeRTOS", "OpenOCD" etc. that I didn't say.** The shipped `initial_prompt` biases whisper toward embedded-software vocabulary — see [Initial prompt](#initial-prompt-vocabulary-biasing). It's a one-shot token prior: whisper overweights those words because they appear in the seed. If your dictation isn't embedded (or you want mixed/general speech), either set `stt.initial_prompt = ""` in `config.toml` to disable the bias, or pass a domain-appropriate comma-separated list of the words you actually use. The phantom outputs are strongest right after the prompt tokens, weakest mid-sentence.
+**Output contains "DMA", "FreeRTOS", "OpenOCD" etc. that I didn't say.** The shipped `initial_prompt` biases whisper toward embedded-software vocabulary — see [Initial prompt](#initial-prompt-vocabulary-biasing). It's a one-shot token prior: whisper overweights those words because they appear in the seed. If your dictation isn't embedded (or you want mixed/general speech), either set `[profile.primary].initial_prompt = ""` (and the same for `secondary` if you have one) in `config.toml` to disable the bias, or pass a domain-appropriate comma-separated list of the words you actually use. The phantom outputs are strongest right after the prompt tokens, weakest mid-sentence.
 
 ## Development
 

@@ -47,7 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "medium",
         ),
         default=None,
-        help="Override the whisper model from config (default: small)",
+        help="Override the primary profile's whisper model (default: small)",
     )
     parser.add_argument(
         "-l",
@@ -66,8 +66,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--language",
         choices=("auto", "en", "zh"),
         default=None,
-        help="Override stt.language from config (auto | en | zh). 'auto' "
-        "detects per utterance; explicit values skip the language ID pass.",
+        help="Override the primary profile's language (auto | en | zh). "
+        "'auto' detects per utterance; explicit values skip the language "
+        "ID pass. Secondary profile's language is configured in config.toml.",
     )
     parser.add_argument(
         "-D",
@@ -117,8 +118,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         metavar="TEXT",
-        help='Whisper initial_prompt — bias the decoder toward specific '
-        'vocabulary (e.g. names, jargon, acronyms). Empty for no prompt.',
+        help='Override the primary profile\'s whisper initial_prompt — '
+        'bias the decoder toward specific vocabulary (e.g. names, jargon, '
+        'acronyms). Empty for no prompt. Secondary profile is configured '
+        'via config.toml.',
     )
     parser.add_argument(
         "-v",
@@ -158,7 +161,7 @@ def _list_models() -> int:
         print(f"  {name}{suffix}")
     print()
     print("English-only models are faster. Multilingual models support")
-    print("Chinese and other languages via stt.language in config.toml.")
+    print("Chinese and other languages via profile.*.language in config.toml.")
     return 0
 
 
@@ -167,13 +170,18 @@ def _diagnose(config: Config) -> int:
 
     import numpy as np
 
+    from speakinput.app import _build_transcribers
     from speakinput.audio import AudioRecorder
-    from speakinput.transcriber import WhisperCppTranscriber
 
-    # Bootstrap the model the same way the live app does, so a misconfigured
-    # `stt.model` surfaces here rather than at first transcribe().
+    # Bootstrap the primary profile's model the same way the live app
+    # does, so a misconfigured `profile.primary.model` surfaces here
+    # rather than at first transcribe(). We build transcribers for all
+    # profiles so a secondary-only misconfiguration also surfaces (the
+    # `_build_transcribers` helper applies the same auto-upgrade path).
     try:
-        model_path = ensure_model(config.stt.model)
+        transcribers = _build_transcribers(
+            [config.primary] + ([config.secondary] if config.secondary else [])
+        )
     except ModelNotFoundError as exc:
         print(f"model error: {exc}", file=sys.stderr)
         return 2
@@ -182,12 +190,7 @@ def _diagnose(config: Config) -> int:
         return 2
 
     print("loading model into memory...", file=sys.stderr)
-    transcriber = WhisperCppTranscriber(
-        model=model_path,
-        language=config.stt.language,
-        beam_size=config.stt.beam_size,
-        initial_prompt=config.stt.initial_prompt,
-    )
+    transcriber = transcribers[config.primary.key]
     # Force a warmup pass so the user can see if the model actually works.
     transcriber.transcribe(np.zeros(1600, dtype=np.float32), 16000)
     print("model loaded", file=sys.stderr)

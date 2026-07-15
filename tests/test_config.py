@@ -5,26 +5,45 @@ import pytest
 from speakinput.config import (
     AudioConfig,
     Config,
-    HotkeyConfig,
     InjectConfig,
-    STTConfig,
+    Profile,
     load_config,
+    primary_profile,
+    secondary_profile,
 )
+
+
+# --- default construction --------------------------------------------------
 
 
 def test_default_construction():
     cfg = Config()
-    assert cfg.stt == STTConfig()
+    assert cfg.primary == primary_profile()
+    assert cfg.secondary is None
     assert cfg.audio == AudioConfig()
-    assert cfg.hotkey == HotkeyConfig()
     assert cfg.inject == InjectConfig()
 
 
-def test_default_inject_has_trailing_space_on():
-    from speakinput.config import InjectConfig
+def test_primary_profile_default_key_is_platform_aware():
+    """primary_profile() picks the platform default at call time."""
+    import sys as _sys
 
-    assert InjectConfig().trailing_space is True
-    assert Config().inject.trailing_space is True
+    from speakinput.config import _default_primary_key
+
+    assert primary_profile().key == _default_primary_key()
+
+
+def test_secondary_profile_default_key_is_cmd_r():
+    """secondary_profile() defaults to cmd_r on every platform."""
+    assert secondary_profile().key == "cmd_r"
+
+
+def test_secondary_profile_default_language_is_zh():
+    """Secondary is for the non-primary language by default (zh)."""
+    assert secondary_profile().language == "zh"
+
+
+# --- from_dict: required primary ------------------------------------------
 
 
 def test_from_dict_reads_trailing_space():
@@ -39,41 +58,25 @@ def test_with_overrides_trailing_space():
     assert cfg.inject.trailing_space is True  # original untouched
 
 
-def test_validation_rejects_unknown_model():
-    with pytest.raises(ValueError, match="stt.model"):
-        Config(stt=STTConfig(model="bogus")).validate()
-
-
-def test_validation_rejects_unknown_hotkey():
-    with pytest.raises(ValueError, match="hotkey.key"):
-        Config(hotkey=HotkeyConfig(key="super")).validate()
-
-
-def test_validation_rejects_zero_sample_rate():
-    with pytest.raises(ValueError, match="sample_rate"):
-        Config(audio=AudioConfig(sample_rate=0)).validate()
-
-
-def test_validation_rejects_out_of_range_beam_size():
-    with pytest.raises(ValueError, match="beam_size"):
-        Config(stt=STTConfig(beam_size=0)).validate()
-    with pytest.raises(ValueError, match="beam_size"):
-        Config(stt=STTConfig(beam_size=11)).validate()
-
-
 def test_from_dict_overrides_sections():
     cfg = Config.from_dict(
         {
-            "stt": {"model": "small.en", "language": "en", "beam_size": 5},
+            "profile": {
+                "primary": {
+                    "key": "f12",
+                    "model": "small.en",
+                    "language": "en",
+                    "beam_size": 5,
+                }
+            },
             "audio": {"device": 2, "sample_rate": 16000},
-            "hotkey": {"key": "f12"},
             "inject": {"restore_clipboard_ms": 100},
         }
     )
-    assert cfg.stt.model == "small.en"
-    assert cfg.stt.beam_size == 5
+    assert cfg.primary.key == "f12"
+    assert cfg.primary.model == "small.en"
+    assert cfg.primary.beam_size == 5
     assert cfg.audio.device == 2
-    assert cfg.hotkey.key == "f12"
     assert cfg.inject.restore_clipboard_ms == 100
 
 
@@ -87,162 +90,277 @@ def test_from_dict_explicit_none_device_is_none():
     assert cfg.audio.device is None
 
 
+def test_from_dict_partial_primary_uses_defaults_for_missing_fields():
+    """When the user only sets `key = "f12"` in [profile.primary], the
+    other fields still take their default values."""
+    cfg = Config.from_dict({"profile": {"primary": {"key": "f12"}}})
+    assert cfg.primary.key == "f12"
+    assert cfg.primary.model == "small"
+    assert cfg.primary.language == "auto"
+    assert cfg.primary.beam_size == 1
+    assert cfg.primary.initial_prompt  # non-empty default
+
+
+def test_from_dict_partial_secondary_uses_defaults_for_missing_fields():
+    """Same for [profile.secondary]: missing fields default sensibly."""
+    cfg = Config.from_dict({"profile": {"secondary": {"language": "en"}}})
+    assert cfg.secondary is not None
+    assert cfg.secondary.key == "cmd_r"
+    assert cfg.secondary.model == "small"
+    assert cfg.secondary.language == "en"
+    assert cfg.secondary.beam_size == 1
+
+
+def test_from_dict_missing_secondary_section_disables_secondary():
+    """To disable the secondary profile, the user omits the
+    `[profile.secondary]` block entirely. With no `secondary` key in
+    the `[profile]` table, `cfg.secondary` is None and only the
+    primary key is wired."""
+    cfg = Config.from_dict({"profile": {"primary": {}}})
+    assert cfg.secondary is None
+
+
+def test_from_dict_explicit_empty_secondary_section_uses_defaults():
+    """An empty `[profile.secondary]` table (no fields inside) means
+    'use all the default secondary values', NOT 'disable the
+    secondary profile'. To disable, omit the section entirely. This
+    is the same convention as [audio] / [inject]: an empty section
+    is a request for defaults, not a no-op."""
+    cfg = Config.from_dict({"profile": {"secondary": {}}})
+    assert cfg.secondary is not None
+    assert cfg.secondary.key == "cmd_r"
+    assert cfg.secondary.language == "zh"
+
+
+# --- with_overrides --------------------------------------------------------
+
+
+def test_with_overrides_applies_to_primary():
+    """CLI flags like -m / -g / -P flow to the primary profile."""
+    cfg = Config()
+    new = cfg.with_overrides(model="base.en", language="en")
+    assert new.primary.model == "base.en"
+    assert new.primary.language == "en"
+    # Original is frozen: untouched.
+    assert cfg.primary.model == "small"
+    assert cfg.primary.language == "auto"
+
+
 def test_with_overrides_does_not_mutate_original():
     cfg = Config()
     new = cfg.with_overrides(model="base.en", key="f12")
-    assert new.stt.model == "base.en"
-    assert new.hotkey.key == "f12"
-    # Original is frozen dataclass: untouched.
-    assert cfg.stt.model == "small"
-    assert cfg.stt.language == "auto"
-    # The default hotkey is platform-aware (alt_r on macOS, ctrl_r elsewhere).
-    from speakinput.config import _default_hotkey
-    assert cfg.hotkey.key == _default_hotkey()
+    assert new.primary.model == "base.en"
+    assert new.primary.key == "f12"
+    # The default hotkey is platform-aware.
+    from speakinput.config import _default_primary_key
+    assert cfg.primary.key == _default_primary_key()
+
+
+def test_with_overrides_initial_prompt():
+    """-P / --initial-prompt must reach the primary profile."""
+    cfg = Config()
+    new = cfg.with_overrides(initial_prompt="kubectl apply -f deployment.yaml")
+    assert new.primary.initial_prompt == "kubectl apply -f deployment.yaml"
+    assert cfg.primary.initial_prompt != new.primary.initial_prompt
+
+
+def test_with_overrides_initial_prompt_clear_to_empty():
+    cfg = Config()
+    new = cfg.with_overrides(initial_prompt="")
+    assert new.primary.initial_prompt == ""
+
+
+def test_with_overrides_silence_threshold():
+    cfg = Config()
+    new = cfg.with_overrides(silence_threshold=0.02)
+    assert new.audio.silence_threshold == 0.02
+    assert cfg.audio.silence_threshold == 0.005
+
+
+# --- load_config ------------------------------------------------------------
 
 
 def test_load_config_returns_defaults_when_missing(tmp_path: Path):
-    """No file at the path? Return (Config(), None) — defaults plus a None
-    source path so the banner can show 'no config.toml found'. The program
-    must not auto-write anything; the user copies config.example.toml
-    themselves (or via start.sh)."""
+    """No file at the path? Return (Config(), None). The default
+    secondary is None — single-profile mode is the no-config fallback."""
     path = tmp_path / "config.toml"
     assert not path.exists()
     cfg, source = load_config(path)
-    assert cfg.stt.model == "small"
-    assert cfg.stt.language == "auto"
-    # The default hotkey is platform-aware (alt_r on macOS, ctrl_r elsewhere).
-    from speakinput.config import _default_hotkey
-    assert cfg.hotkey.key == _default_hotkey()
+    assert cfg.primary.model == "small"
+    assert cfg.primary.language == "auto"
+    assert cfg.secondary is None
+    from speakinput.config import _default_primary_key
+    assert cfg.primary.key == _default_primary_key()
     assert source is None
-    # The path must still be absent — load_config never touches the filesystem.
+    # load_config never touches the filesystem.
     assert not path.exists()
 
 
-def test_load_config_reads_existing(tmp_path: Path):
+def test_load_config_reads_primary(tmp_path: Path):
     path = tmp_path / "config.toml"
     path.write_text(
-        '[stt]\nmodel = "tiny.en"\nlanguage = "en"\n',
+        '[profile.primary]\nmodel = "tiny.en"\nlanguage = "en"\n',
         encoding="utf-8",
     )
     cfg, source = load_config(path)
-    assert cfg.stt.model == "tiny.en"
-    assert cfg.stt.language == "en"
+    assert cfg.primary.model == "tiny.en"
+    assert cfg.primary.language == "en"
+    assert cfg.secondary is None
+    assert source == path
+
+
+def test_load_config_reads_secondary(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[profile.primary]\nkey = "alt_r"\n'
+        '[profile.secondary]\nkey = "cmd_r"\nlanguage = "zh"\n',
+        encoding="utf-8",
+    )
+    cfg, source = load_config(path)
+    assert cfg.primary.key == "alt_r"
+    assert cfg.secondary is not None
+    assert cfg.secondary.key == "cmd_r"
+    assert cfg.secondary.language == "zh"
     assert source == path
 
 
 def test_load_config_explicit_none_path_uses_default(tmp_path: Path, monkeypatch):
-    """Calling load_config() with no argument must resolve to
-    default_config_path() — that way the banner shows the same path
-    the user would see in --help, and CLI `-c` overrides win when set.
-    """
     target = tmp_path / "explicit_default.toml"
-    target.write_text('[stt]\nmodel = "medium"\n', encoding="utf-8")
-    # When default_config_path() is called, return our test path.
+    target.write_text('[profile.primary]\nmodel = "medium"\n', encoding="utf-8")
     monkeypatch.setattr(
         "speakinput.config.default_config_path", lambda: target
     )
     cfg, source = load_config()
-    assert cfg.stt.model == "medium"
+    assert cfg.primary.model == "medium"
     assert source == target
 
 
-# --- platform-aware hotkey default -----------------------------------------
+# --- platform-aware primary hotkey ----------------------------------------
 
 
-def test_default_hotkey_on_macos_is_alt_r(monkeypatch):
-    """On Darwin the canonical push-to-talk key is Right Option (`alt_r`)
-    — large, thumb-reachable, free of Cmd-shortcut conflicts."""
+def test_default_primary_key_on_macos_is_alt_r(monkeypatch):
+    """On Darwin, Right Option (`alt_r`) is the canonical push-to-talk key."""
     import sys as _sys
 
-    from speakinput.config import _default_hotkey
+    from speakinput.config import _default_primary_key
 
     monkeypatch.setattr(_sys, "platform", "darwin")
-    assert _default_hotkey() == "alt_r"
+    assert _default_primary_key() == "alt_r"
 
 
-def test_default_hotkey_on_linux_is_ctrl_r(monkeypatch):
-    """On Linux/Windows, Alt is heavily used for menu mnemonics, so
-    default to Right Ctrl instead."""
+def test_default_primary_key_on_linux_is_ctrl_r(monkeypatch):
     import sys as _sys
 
-    from speakinput.config import _default_hotkey
+    from speakinput.config import _default_primary_key
 
     monkeypatch.setattr(_sys, "platform", "linux")
-    assert _default_hotkey() == "ctrl_r"
+    assert _default_primary_key() == "ctrl_r"
     monkeypatch.setattr(_sys, "platform", "win32")
-    assert _default_hotkey() == "ctrl_r"
+    assert _default_primary_key() == "ctrl_r"
 
 
-def test_config_default_hotkey_follows_platform(monkeypatch):
-    """Config() and HotkeyConfig() pick up the platform default at
-    instantiation time. On macOS that resolves to alt_r; elsewhere
-    ctrl_r. The user can still pin a different value explicitly."""
+def test_primary_default_hotkey_follows_platform(monkeypatch):
     import sys as _sys
-    from speakinput.config import Config, HotkeyConfig
 
     monkeypatch.setattr(_sys, "platform", "darwin")
-    assert HotkeyConfig().key == "alt_r"
-    assert Config().hotkey.key == "alt_r"
+    assert primary_profile().key == "alt_r"
+    assert Config().primary.key == "alt_r"
 
     monkeypatch.setattr(_sys, "platform", "linux")
-    assert HotkeyConfig().key == "ctrl_r"
-    assert Config().hotkey.key == "ctrl_r"
+    assert primary_profile().key == "ctrl_r"
+    assert Config().primary.key == "ctrl_r"
 
 
-def test_explicit_hotkey_in_config_overrides_platform_default(tmp_path: Path):
-    """A user who pinned `[hotkey] key = "alt_r"` in their config.toml
-    on Linux should still get alt_r — their explicit choice wins over
-    the platform default."""
-    from speakinput.config import load_config
-
+def test_explicit_primary_hotkey_in_config_overrides_platform_default(tmp_path: Path):
+    """A user who pinned `key = "alt_r"` in their config.toml on Linux
+    should still get alt_r — their explicit choice wins over the
+    platform default."""
     path = tmp_path / "config.toml"
-    path.write_text('[hotkey]\nkey = "alt_r"\n', encoding="utf-8")
+    path.write_text('[profile.primary]\nkey = "alt_r"\n', encoding="utf-8")
     cfg, _ = load_config(path)
-    assert cfg.hotkey.key == "alt_r"
+    assert cfg.primary.key == "alt_r"
 
 
 # --- multilingual / Chinese support ---------------------------------------
 
 
 def test_default_model_is_multilingual():
-    """The shipped default should be `small` (multilingual) so first-run
-    Chinese works out of the box without any config editing."""
-    assert Config().stt.model == "small"
-    assert Config().stt.language == "auto"
+    """Shipped default is `small` (multilingual) so first-run Chinese
+    works out of the box without any config editing."""
+    assert Config().primary.model == "small"
+    assert Config().primary.language == "auto"
 
 
 def test_validation_accepts_multilingual_models():
     for m in ("tiny", "base", "small", "medium"):
-        Config(stt=STTConfig(model=m, language="zh")).validate()
+        Config(primary=Profile(model=m, language="zh")).validate()
 
 
 def test_validation_accepts_auto_language():
-    Config(stt=STTConfig(model="base", language="auto")).validate()
-    Config(stt=STTConfig(model="small.en", language="auto")).validate()
+    Config(primary=Profile(model="base", language="auto")).validate()
+    Config(primary=Profile(model="small.en", language="auto")).validate()
+
+
+def test_validation_rejects_unknown_model():
+    with pytest.raises(ValueError, match="primary.model"):
+        Config(primary=Profile(model="bogus")).validate()
+
+
+def test_validation_rejects_unknown_hotkey():
+    with pytest.raises(ValueError, match="primary.key"):
+        Config(primary=Profile(key="super")).validate()
+
+
+def test_validation_rejects_zero_sample_rate():
+    with pytest.raises(ValueError, match="sample_rate"):
+        Config(audio=AudioConfig(sample_rate=0)).validate()
+
+
+def test_validation_rejects_out_of_range_beam_size():
+    with pytest.raises(ValueError, match="beam_size"):
+        Config(primary=Profile(beam_size=0)).validate()
+    with pytest.raises(ValueError, match="beam_size"):
+        Config(primary=Profile(beam_size=11)).validate()
 
 
 def test_validation_rejects_unknown_language():
-    with pytest.raises(ValueError, match="stt.language"):
-        Config(stt=STTConfig(model="base", language="fr")).validate()
+    with pytest.raises(ValueError, match="primary.language"):
+        Config(primary=Profile(model="base", language="fr")).validate()
 
 
 def test_validation_rejects_english_only_model_with_chinese():
-    """tiny.en / base.en / small.en can't do Chinese. Fail fast with a clear
-    error rather than feeding it to whisper and getting nonsense back."""
     with pytest.raises(ValueError, match="English-only"):
-        Config(stt=STTConfig(model="base.en", language="zh")).validate()
+        Config(primary=Profile(model="base.en", language="zh")).validate()
 
 
 def test_validation_allows_english_only_model_with_en_or_auto():
-    Config(stt=STTConfig(model="base.en", language="en")).validate()
-    Config(stt=STTConfig(model="base.en", language="auto")).validate()
+    Config(primary=Profile(model="base.en", language="en")).validate()
+    Config(primary=Profile(model="base.en", language="auto")).validate()
+
+
+def test_validation_runs_for_secondary_profile():
+    """A bad model in the secondary profile must also be caught."""
+    with pytest.raises(ValueError, match="secondary.model"):
+        Config(
+            primary=Profile(),
+            secondary=Profile(model="bogus", language="zh"),
+        ).validate()
+
+
+def test_validation_rejects_same_key_in_both_profiles():
+    """Two profiles sharing a key is a configuration error — there's no
+    way to dispatch a press to the right one."""
+    with pytest.raises(ValueError, match="same key"):
+        Config(
+            primary=Profile(key="alt_r"),
+            secondary=Profile(key="alt_r"),
+        ).validate()
 
 
 # --- CLI arg surface -------------------------------------------------------
 
 
 def test_cli_language_argument_is_parsed():
-    """`-g zh` / `--language zh` must reach the config via with_overrides."""
     from speakinput.cli import _build_parser
 
     args = _build_parser().parse_args(["--language", "zh"])
@@ -257,7 +375,6 @@ def test_cli_language_short_flag():
 
 
 def test_cli_language_defaults_to_none():
-    """When the flag is absent, the config file's value wins."""
     from speakinput.cli import _build_parser
 
     args = _build_parser().parse_args([])
@@ -265,94 +382,13 @@ def test_cli_language_defaults_to_none():
 
 
 def test_cli_rejects_unknown_language():
-    """Whisper supports ~100 languages; we expose a curated set only."""
     from speakinput.cli import _build_parser
 
     with pytest.raises(SystemExit):
         _build_parser().parse_args(["--language", "fr"])
 
 
-def test_with_overrides_changes_language():
-    cfg = Config()
-    new = cfg.with_overrides(language="zh")
-    assert new.stt.language == "zh"
-    assert cfg.stt.language == "auto"  # original untouched
-
-
-# --- silence threshold -----------------------------------------------------
-
-
-def test_default_silence_threshold():
-    """Default silence_threshold is 0.005 — above room noise, below speech."""
-    assert Config().audio.silence_threshold == 0.005
-
-
-def test_with_overrides_silence_threshold():
-    cfg = Config()
-    new = cfg.with_overrides(silence_threshold=0.02)
-    assert new.audio.silence_threshold == 0.02
-    assert cfg.audio.silence_threshold == 0.005
-
-
-def test_cli_silence_threshold_short_flag():
-    """-S/--silence-threshold must reach the config via with_overrides."""
-    from speakinput.cli import _build_parser
-
-    args = _build_parser().parse_args(["-S", "0.02"])
-    assert args.silence_threshold == 0.02
-
-
-def test_cli_silence_threshold_long_flag():
-    from speakinput.cli import _build_parser
-
-    args = _build_parser().parse_args(["--silence-threshold", "0"])
-    assert args.silence_threshold == 0
-
-
-def test_cli_silence_threshold_defaults_to_none():
-    from speakinput.cli import _build_parser
-
-    args = _build_parser().parse_args([])
-    assert args.silence_threshold is None
-
-
-# --- initial_prompt --------------------------------------------------------
-
-
-def test_default_initial_prompt_biases_toward_embedded_vocabulary():
-    """The shipped default biases whisper toward embedded software engineer
-    vocabulary: C/C++, RTOS, MCU peripherals, debug tools, common acronyms.
-    Disable by setting initial_prompt = "" in config.toml."""
-    prompt = Config().stt.initial_prompt
-    assert prompt  # non-empty
-    # Spot-check a few representative tokens.
-    for token in ("FreeRTOS", "GPIO", "ISR", "OpenOCD", "DMA", "RTOS", "PWM", "mutex"):
-        assert token in prompt
-
-
-def test_with_overrides_initial_prompt():
-    cfg = Config()
-    new = cfg.with_overrides(initial_prompt="kubectl apply -f deployment.yaml")
-    assert new.stt.initial_prompt == "kubectl apply -f deployment.yaml"
-    # Original default is the embedded-vocab bias; the override is what wins.
-    assert cfg.stt.initial_prompt != new.stt.initial_prompt
-
-
-def test_with_overrides_initial_prompt_clear_to_empty():
-    """Setting initial_prompt="" via override disables the bias entirely,
-    even when the config default is the embedded-vocab prompt."""
-    cfg = Config()
-    new = cfg.with_overrides(initial_prompt="")
-    assert new.stt.initial_prompt == ""
-
-
-def test_from_dict_reads_initial_prompt():
-    cfg = Config.from_dict({"stt": {"initial_prompt": "K8s, SRE, kubectl"}})
-    assert cfg.stt.initial_prompt == "K8s, SRE, kubectl"
-
-
 def test_cli_initial_prompt_short_flag():
-    """-P/--initial-prompt must reach the config via with_overrides."""
     from speakinput.cli import _build_parser
 
     args = _build_parser().parse_args(["-P", "kubectl"])
@@ -374,10 +410,53 @@ def test_cli_initial_prompt_defaults_to_none():
 
 
 def test_cli_initial_prompt_with_spaces():
-    """Multi-word prompts must round-trip through the CLI intact."""
     from speakinput.cli import _build_parser
 
-    args = _build_parser().parse_args(
-        ["-P", "kubectl apply -f deployment.yaml"]
-    )
+    args = _build_parser().parse_args(["-P", "kubectl apply -f deployment.yaml"])
     assert args.initial_prompt == "kubectl apply -f deployment.yaml"
+
+
+def test_cli_silence_threshold_short_flag():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["-S", "0.02"])
+    assert args.silence_threshold == 0.02
+
+
+def test_cli_silence_threshold_long_flag():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["--silence-threshold", "0"])
+    assert args.silence_threshold == 0
+
+
+def test_cli_silence_threshold_defaults_to_none():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args([])
+    assert args.silence_threshold is None
+
+
+# --- silence threshold ----------------------------------------------------
+
+
+def test_default_silence_threshold():
+    assert Config().audio.silence_threshold == 0.005
+
+
+# --- initial_prompt default ------------------------------------------------
+
+
+def test_default_initial_prompt_biases_toward_embedded_vocabulary():
+    """The shipped default biases whisper toward embedded software engineer
+    vocabulary. Disable by setting initial_prompt = "" in config.toml."""
+    prompt = Config().primary.initial_prompt
+    assert prompt  # non-empty
+    for token in ("FreeRTOS", "GPIO", "ISR", "OpenOCD", "DMA", "RTOS", "PWM", "mutex"):
+        assert token in prompt
+
+
+def test_secondary_profile_has_same_default_prompt():
+    """Both profiles start with the embedded-vocab bias; users override
+    per profile as needed."""
+    assert secondary_profile().initial_prompt == primary_profile().initial_prompt

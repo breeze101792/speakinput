@@ -6,14 +6,43 @@
 #   ./start.sh          # does the copy for you if config.toml is missing
 #
 # Every field shown here is the default the program uses when no config
-# file is present, with one exception: [hotkey].key is platform-aware
-# (alt_r on macOS, ctrl_r on Linux/Windows). The value below is for
-# macOS — change it on Linux/Windows if you want to pin a different key.
+# file is present.
+#
+# Speak Input runs one OR two profiles. A profile binds one hotkey to
+# one STT setup (model + language + prompt). The typical use is two
+# profiles so a single key speaks one language:
+#
+#   - primary:   right alt   (or right ctrl on Linux/Windows) → English
+#   - secondary: right cmd   (or Super on Linux/Windows)    → Chinese
+#
+# Hold right alt, speak English, release → text is typed in English.
+# Hold right cmd, speak Chinese, release → text is typed in Chinese.
+# Whisper never has to guess the language, and the encoder doesn't pay
+# for a language-ID pass on every utterance.
+#
+# To use only one language, delete the entire [profile.secondary]
+# block — the right-alt key keeps working, the right-cmd key is not
+# wired, and only the primary model is loaded.
+#
+# The two profiles can share the same model file. The default uses
+# `small` (multilingual) for both, and the program loads it into RAM
+# once. To speed up the English path, set `primary.model = "small.en"`
+# — note that the secondary profile's language must then be `en` or
+# `auto` to keep the model valid.
 
-[stt]
+# --- profile 1 (required) --------------------------------------------------
+# The primary profile. Hold this key to record; release to inject.
+# The default key is platform-aware: alt_r on macOS, ctrl_r on Linux/Windows.
+
+[profile.primary]
+key = "alt_r"               # alt_r | ctrl_r | cmd_r | shift_r | caps_lock | f12
+                            # Default is platform-aware: alt_r on macOS,
+                            # ctrl_r on Linux/Windows. Override here.
 model = "small"             # tiny.en | base.en | small.en
                             # tiny | base | small | medium  (multilingual)
 language = "auto"           # auto | en | zh
+                            # 'auto' lets whisper detect; pin 'en' to skip
+                            # the language-ID pass (faster).
 beam_size = 1               # 1 = greedy (fastest); 2..10 = beam search
 # initial_prompt = "C, C++, Rust, RTOS, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, scheduler, mutex, GDB, OpenOCD, JTAG, ..."
                             # bias the decoder toward specific vocabulary;
@@ -21,17 +50,31 @@ beam_size = 1               # 1 = greedy (fastest); 2..10 = beam search
                             # is an embedded-software-engineer bias; set to ""
                             # to disable.
 
+# --- profile 2 (optional, disabled by default) ----------------------------
+# Uncomment the entire block below to add a second language on a
+# second hotkey. On macOS, the default key is `cmd_r` (right Command).
+# On Linux/Windows `cmd_r` is mapped to the Super key by pynput.
+#
+# With this block commented out, only the primary key is wired and
+# only the primary model is loaded into RAM.
+
+# [profile.secondary]
+# key = "cmd_r"
+# model = "small"
+# language = "zh"           # explicit language — skips the auto-detect pass
+# beam_size = 1
+# # initial_prompt = "C, C++, Rust, RTOS, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, scheduler, mutex, GDB, OpenOCD, JTAG, ..."
+                            # per-profile lexical bias; same vocabulary bank
+                            # as primary by default.
+
+# --- global audio / injection ---------------------------------------------
+
 [audio]
 sample_rate = 16000         # whisper expects 16 kHz; do not change
 silence_threshold = 0.005   # skip transcribe when audio RMS is below this
                             # (0 disables the gate; lower = more sensitive)
 # device = null             # uncomment to pin a specific input device;
                             # use `speakinput --list-devices` to see indices
-
-[hotkey]
-key = "alt_r"               # alt_r | ctrl_r | cmd_r | shift_r | caps_lock | f12
-                            # Default is platform-aware: alt_r on macOS,
-                            # ctrl_r on Linux/Windows. Override here.
 
 [inject]
 restore_clipboard_ms = 50   # how long to wait before restoring the prior
