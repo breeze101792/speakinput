@@ -206,7 +206,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-P`  | `--initial-prompt TEXT` | Override `stt.initial_prompt` for this run (default: embedded-software-engineer bias; see [Initial prompt](#initial-prompt-vocabulary-biasing)) |
 | `-v`  | `--verbose`           | Enable debug logging from python logging        |
 
-By default the push-to-talk key is **Right Option (Alt)**. Hold it, speak, release. The recognized text is typed into whatever field has focus, **with a trailing space** so the next word doesn't run into the last one. Disable the trailing space with `--no-trailing-space` if you want pure dictation (e.g. when typing into a code editor).
+By default the push-to-talk key is **Right Option (Alt)** on macOS and **Right Ctrl** on Linux/Windows. The choice is platform-aware — Alt is heavily used for menu mnemonics on PC desktops, so the default flips to Right Ctrl there. Hold the key, speak, release. The recognized text is typed into whatever field has focus, **with a trailing space** so the next word doesn't run into the last one. Disable the trailing space with `--no-trailing-space` if you want pure dictation (e.g. when typing into a code editor).
 
 To change the hotkey, edit the config:
 
@@ -292,7 +292,7 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 
 **Nothing happens when I hold the hotkey.** Check both macOS permissions above. Run with `-v` to see debug logs.
 
-**The right-Option hotkey triggers menu mnemonics.** v1 uses `suppress=False` so the key reaches other apps — useful for Alt-Tab, but it can arm menu shortcuts in some apps. v2 will add a `suppress=True` mode for that case.
+**The right-Option hotkey (macOS default) triggers menu mnemonics.** v1 uses `suppress=False` so the key reaches other apps — useful for Alt-Tab, but it can arm menu shortcuts in some apps. v2 will add a `suppress=True` mode for that case. On Linux/Windows the default is Right Ctrl, which has fewer menu-mnemonic conflicts.
 
 **`pywhispercpp` fails to load the model.** Make sure the model name matches exactly (case-sensitive, e.g. `base.en` not `Base.en`). Run `speakinput --diagnose` to surface the error directly.
 

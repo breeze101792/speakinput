@@ -6,8 +6,9 @@
 #   ./start.sh          # does the copy for you if config.toml is missing
 #
 # Every field shown here is the default the program uses when no config
-# file is present. To customize, uncomment or change the lines you care
-# about — anything left out falls back to the value below.
+# file is present, with one exception: [hotkey].key is platform-aware
+# (alt_r on macOS, ctrl_r on Linux/Windows). The value below is for
+# macOS — change it on Linux/Windows if you want to pin a different key.
 
 [stt]
 model = "small"             # tiny.en | base.en | small.en
@@ -29,6 +30,8 @@ silence_threshold = 0.005   # skip transcribe when audio RMS is below this
 
 [hotkey]
 key = "alt_r"               # alt_r | ctrl_r | cmd_r | shift_r | caps_lock | f12
+                            # Default is platform-aware: alt_r on macOS,
+                            # ctrl_r on Linux/Windows. Override here.
 
 [inject]
 restore_clipboard_ms = 50   # how long to wait before restoring the prior

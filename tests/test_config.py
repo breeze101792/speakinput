@@ -95,7 +95,9 @@ def test_with_overrides_does_not_mutate_original():
     # Original is frozen dataclass: untouched.
     assert cfg.stt.model == "small"
     assert cfg.stt.language == "auto"
-    assert cfg.hotkey.key == "alt_r"
+    # The default hotkey is platform-aware (alt_r on macOS, ctrl_r elsewhere).
+    from speakinput.config import _default_hotkey
+    assert cfg.hotkey.key == _default_hotkey()
 
 
 def test_load_config_returns_defaults_when_missing(tmp_path: Path):
@@ -108,7 +110,9 @@ def test_load_config_returns_defaults_when_missing(tmp_path: Path):
     cfg, source = load_config(path)
     assert cfg.stt.model == "small"
     assert cfg.stt.language == "auto"
-    assert cfg.hotkey.key == "alt_r"
+    # The default hotkey is platform-aware (alt_r on macOS, ctrl_r elsewhere).
+    from speakinput.config import _default_hotkey
+    assert cfg.hotkey.key == _default_hotkey()
     assert source is None
     # The path must still be absent — load_config never touches the filesystem.
     assert not path.exists()
@@ -140,6 +144,61 @@ def test_load_config_explicit_none_path_uses_default(tmp_path: Path, monkeypatch
     cfg, source = load_config()
     assert cfg.stt.model == "medium"
     assert source == target
+
+
+# --- platform-aware hotkey default -----------------------------------------
+
+
+def test_default_hotkey_on_macos_is_alt_r(monkeypatch):
+    """On Darwin the canonical push-to-talk key is Right Option (`alt_r`)
+    — large, thumb-reachable, free of Cmd-shortcut conflicts."""
+    import sys as _sys
+
+    from speakinput.config import _default_hotkey
+
+    monkeypatch.setattr(_sys, "platform", "darwin")
+    assert _default_hotkey() == "alt_r"
+
+
+def test_default_hotkey_on_linux_is_ctrl_r(monkeypatch):
+    """On Linux/Windows, Alt is heavily used for menu mnemonics, so
+    default to Right Ctrl instead."""
+    import sys as _sys
+
+    from speakinput.config import _default_hotkey
+
+    monkeypatch.setattr(_sys, "platform", "linux")
+    assert _default_hotkey() == "ctrl_r"
+    monkeypatch.setattr(_sys, "platform", "win32")
+    assert _default_hotkey() == "ctrl_r"
+
+
+def test_config_default_hotkey_follows_platform(monkeypatch):
+    """Config() and HotkeyConfig() pick up the platform default at
+    instantiation time. On macOS that resolves to alt_r; elsewhere
+    ctrl_r. The user can still pin a different value explicitly."""
+    import sys as _sys
+    from speakinput.config import Config, HotkeyConfig
+
+    monkeypatch.setattr(_sys, "platform", "darwin")
+    assert HotkeyConfig().key == "alt_r"
+    assert Config().hotkey.key == "alt_r"
+
+    monkeypatch.setattr(_sys, "platform", "linux")
+    assert HotkeyConfig().key == "ctrl_r"
+    assert Config().hotkey.key == "ctrl_r"
+
+
+def test_explicit_hotkey_in_config_overrides_platform_default(tmp_path: Path):
+    """A user who pinned `[hotkey] key = "alt_r"` in their config.toml
+    on Linux should still get alt_r — their explicit choice wins over
+    the platform default."""
+    from speakinput.config import load_config
+
+    path = tmp_path / "config.toml"
+    path.write_text('[hotkey]\nkey = "alt_r"\n', encoding="utf-8")
+    cfg, _ = load_config(path)
+    assert cfg.hotkey.key == "alt_r"
 
 
 # --- multilingual / Chinese support ---------------------------------------

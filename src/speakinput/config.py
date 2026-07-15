@@ -9,6 +9,7 @@ is missing, the program uses hard-coded defaults — every value in
 
 from __future__ import annotations
 
+import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -40,6 +41,25 @@ VALID_HOTKEYS = ("alt_r", "ctrl_r", "cmd_r", "shift_r", "caps_lock", "f12")
 # Model names that are English-only. Pairing one with a non-English language
 # would be a misconfiguration; we surface it at validate() time.
 _ENGLISH_ONLY_MODELS = frozenset({"tiny.en", "base.en", "small.en"})
+
+
+def _default_hotkey() -> str:
+    """Pick a hotkey that fits the platform's keyboard conventions.
+
+    On macOS, Right Option (`alt_r`) is the canonical push-to-talk key —
+    most users have it free, it sits under the right thumb, and it
+    doesn't conflict with the common Cmd-based shortcuts.
+
+    On Linux/Windows, Alt is heavily used for menu mnemonics in many
+    desktop apps, so we default to Right Ctrl (`ctrl_r`) instead. PC
+    keyboards also tend to have a larger Right Ctrl than Mac keyboards
+    have Right Option, making it easier to find by feel.
+
+    Override in config.toml with [hotkey].key = "...".
+    """
+    if sys.platform == "darwin":
+        return "alt_r"
+    return "ctrl_r"
 
 
 @dataclass(frozen=True)
@@ -103,7 +123,10 @@ class AudioConfig:
 
 @dataclass(frozen=True)
 class HotkeyConfig:
-    key: str = "alt_r"
+    # Default is platform-aware (see _default_hotkey). Use a
+    # default_factory rather than a literal so the value is resolved
+    # at instantiation time, not at class-definition time.
+    key: str = field(default_factory=_default_hotkey)
 
 
 @dataclass(frozen=True)
