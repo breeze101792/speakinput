@@ -23,10 +23,16 @@ if [[ -x .venv/bin/python ]]; then
     PY=.venv/bin/python
 else
     PY=""
-    for candidate in python3.13 python3.12 python3.11 python3; do
+    # Probe candidates newest-first; the version check is "is it >= 3.11",
+    # not "is it equal to 3.11" — the old `sort -V | tail` check was inverted
+    # and rejected Python 3.12/3.13/3.14.
+    for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
         if command -v "$candidate" >/dev/null 2>&1; then
             ver=$("$candidate" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-            if [[ "$(printf '%s\n3.11' "$ver" | sort -V | tail -n1)" == "3.11" ]]; then
+            # `sort -V` puts the higher version last; if the higher of
+            # (candidate, 3.11) is the candidate, candidate >= 3.11.
+            higher=$(printf '%s\n3.11\n' "$ver" | sort -V | tail -n1)
+            if [[ "$higher" != "3.11" ]]; then
                 PY=$(command -v "$candidate")
                 break
             fi

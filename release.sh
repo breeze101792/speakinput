@@ -56,11 +56,12 @@ find_python() {
         echo ".venv/bin/python"
         return
     fi
-    local candidate ver
-    for candidate in python3.13 python3.12 python3.11 python3; do
+    local candidate ver higher
+    for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
         if command -v "$candidate" >/dev/null 2>&1; then
             ver=$("$candidate" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-            if [[ "$(printf '%s\n3.11' "$ver" | sort -V | tail -n1)" == "3.11" ]]; then
+            higher=$(printf '%s\n3.11\n' "$ver" | sort -V | tail -n1)
+            if [[ "$higher" != "3.11" ]]; then
                 command -v "$candidate"
                 return
             fi
