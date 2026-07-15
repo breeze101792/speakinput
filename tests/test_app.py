@@ -15,14 +15,30 @@ def _stub_hotkey_listener(monkeypatch):
     """Replace HotkeyListener with a no-op mock for the whole module.
 
     pynput's keyboard.Listener.init crashes on this test environment
-    (macOS HIToolbox) — see earlier commits — so every test that would
-    start a real listener uses this stub. The class mock returns a
-    fresh listener instance per construction so per-profile assertions
-    work as expected.
+    (macOS HIToolbox / headless Linux with no X11 display) — see
+    earlier commits — so every test that would start a real listener
+    uses this stub. The class mock returns a fresh listener instance
+    per construction so per-profile assertions work as expected.
+
+    `app.run()` also calls `resolve_key()` from `speakinput.hotkey`,
+    which dereferences `keyboard.Key.<name>`. On a real macOS box
+    pynput imports fine, but on headless Linux pynput's import-time
+    X11 connect fails and `speakinput.hotkey.keyboard` ends up as
+    None. We stub that module-level `keyboard` to a MagicMock with
+    matching `Key.<name>` attributes so `resolve_key` works in
+    either environment.
     """
     fake_listener_cls = MagicMock()
     fake_listener_cls.side_effect = lambda *a, **kw: MagicMock()
     monkeypatch.setattr("speakinput.app.HotkeyListener", fake_listener_cls)
+    fake_keyboard = MagicMock()
+    fake_keyboard.Key.alt_r = "alt_r_key"
+    fake_keyboard.Key.ctrl_r = "ctrl_r_key"
+    fake_keyboard.Key.cmd_r = "cmd_r_key"
+    fake_keyboard.Key.shift_r = "shift_r_key"
+    fake_keyboard.Key.caps_lock = "caps_lock_key"
+    fake_keyboard.Key.f12 = "f12_key"
+    monkeypatch.setattr("speakinput.hotkey.keyboard", fake_keyboard, raising=False)
     return fake_listener_cls
 
 
