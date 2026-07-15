@@ -58,6 +58,12 @@ Both flags have CLI overrides: `-S/--silence-threshold` and `-A/--auto-stop-seco
 
 When auto-stop fires, the release path runs the same as a manual release: same buffer-trim step, same silence-gate check, same transcriber. The only difference is who flipped the bit.
 
+### Multi-sentence sessions: chunked re-arm
+
+Auto-stop doesn't end the session. If you keep holding the key, the captured sentence is trimmed, transcribed, and typed — and a fresh watchdog is armed for the **next** sentence. You can dictate a whole paragraph in one key-hold; each sentence lands at the cursor as soon as the silence gap tells the system you're done with it. When you finally release the key, whatever audio was buffered during the last transcribe gets drained and processed as a final chunk, then the recorder tears down.
+
+This is the default behavior; there is no config flag to disable it (set `auto_stop_seconds = 0` if you want the old "release the key yourself" behavior).
+
 ## Two profiles, one key per language
 
 Speak Input runs **one or two profiles**. A profile binds one hotkey to one STT setup (model + language + prompt). The typical setup is two profiles, so a single key speaks one language and the model never has to guess:

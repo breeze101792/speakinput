@@ -38,7 +38,7 @@ def _build_app(debug: bool = False, dry_run: bool = False, config: Config | None
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)  # 1s of "silence"
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)  # 1s of "silence"
 
     if transcribers is None:
         t = MagicMock()
@@ -116,7 +116,7 @@ def test_release_silence_skips_transcribe(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     injector = MagicMock()
     transcribers = {config.primary.key: transcriber}
@@ -146,7 +146,7 @@ def test_release_silence_threshold_zero_disables_gate(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     transcriber.transcribe.return_value = ""
     transcribers = {config.primary.key: transcriber}
@@ -172,7 +172,7 @@ def test_release_loud_audio_passes_gate(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = np.full(16000, 0.5, dtype=np.float32)
+    recorder.drain.return_value = np.full(16000, 0.5, dtype=np.float32)
     transcriber = MagicMock()
     transcriber.transcribe.return_value = "hello"
     transcribers = {config.primary.key: transcriber}
@@ -216,7 +216,7 @@ def test_debug_mode_logs_press_start_and_end(capsys):
 
 def test_debug_mode_logs_audio_stats(capsys):
     app, recorder, _, _, _ = _build_app(debug=True)
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
     app.on_hotkey_press(app.config.primary)
     app.on_hotkey_release(app.config.primary)
     captured = capsys.readouterr()
@@ -494,7 +494,7 @@ def test_secondary_profile_press_uses_secondary_transcriber(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
 
     app = App(
         config=config,
@@ -530,7 +530,7 @@ def test_primary_profile_press_uses_primary_transcriber(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
 
     app = App(
         config=config,
@@ -747,7 +747,7 @@ def test_auto_stop_disabled_when_seconds_zero(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     transcribers = {config.primary.key: transcriber}
 
@@ -771,7 +771,7 @@ def test_auto_stop_watchdog_started_when_enabled():
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.5  # loud -> won't trigger
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     transcribers = {config.primary.key: transcriber}
 
@@ -798,7 +798,7 @@ def test_auto_stop_watchdog_cleared_on_release():
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.5
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     transcribers = {config.primary.key: transcriber}
 
@@ -824,7 +824,7 @@ def test_auto_stop_watchdog_fires_after_silence_window(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0  # pure silence from the start
-    recorder.stop.return_value = np.full(16000, 0.5, dtype=np.float32)  # 1s of "loud" so gate passes
+    recorder.drain.return_value = np.full(16000, 0.5, dtype=np.float32)  # 1s of "loud" so gate passes
     transcriber = MagicMock()
     transcriber.transcribe.return_value = "watchdog fired"
     transcribers = {config.primary.key: transcriber}
@@ -860,7 +860,7 @@ def test_auto_stop_disabled_when_silence_threshold_zero():
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     transcribers = {config.primary.key: transcriber}
 
@@ -895,7 +895,7 @@ def test_release_trims_trailing_silence(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = audio
+    recorder.drain.return_value = audio
     transcriber = MagicMock()
     transcribers = {config.primary.key: transcriber}
 
@@ -928,7 +928,7 @@ def test_release_does_not_trim_when_buffer_is_pure_speech(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.stop.return_value = audio
+    recorder.drain.return_value = audio
     transcriber = MagicMock()
     transcribers = {config.primary.key: transcriber}
 
@@ -988,3 +988,267 @@ def test_run_banner_shows_auto_stop_off(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert "auto-stop after off" in captured.err
+
+
+# --- chunked auto-stop: re-arm between chunks -----------------------------
+
+
+def test_watchdog_chunk_drains_and_injects_then_rearms():
+    """When the watchdog fires mid-press (user still holding the key),
+    the captured audio is drained+transcribed+injected, and a fresh
+    watchdog is armed for the next sentence. The recorder is NOT torn
+    down — only its buffer is cleared."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig
+
+    config = Config(audio=AudioConfig(auto_stop_seconds=0.1, silence_threshold=0.005))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    chunk_audio = np.full(16000, 0.3, dtype=np.float32)  # 1s of "speech"
+    recorder.drain.return_value = chunk_audio
+    transcriber = MagicMock()
+    transcriber.transcribe.return_value = "first sentence"
+    injector = MagicMock()
+    feedback = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=injector,
+        feedback=feedback,
+    )
+    # Simulate a press so the busy lock is held.
+    app._busy.acquire()
+    # Direct call to the watchdog's on_trigger: this is what
+    # SilenceWatchdog would do after seeing the auto-stop window of
+    # silence.
+    app._on_watchdog_chunk(app.config.primary)
+
+    # The chunk was drained (NOT stopped) and injected.
+    recorder.drain.assert_called_once()
+    recorder.stop.assert_not_called()
+    recorder.close.assert_not_called()
+    transcriber.transcribe.assert_called_once()
+    injector.inject.assert_called_once_with("first sentence")
+    # A fresh watchdog was armed for the next sentence.
+    assert app._watchdog is not None
+    # The busy lock is still held — we're in a multi-chunk press.
+    assert app._busy.locked()
+
+
+def test_watchdog_chunk_rearms_using_configured_threshold():
+    """The re-armed watchdog must use the configured silence_threshold
+    and auto_stop_seconds, not stale values."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig
+
+    config = Config(audio=AudioConfig(auto_stop_seconds=0.3, silence_threshold=0.02))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.zeros(0, dtype=np.float32)
+    transcriber = MagicMock()
+    injector = MagicMock()
+    feedback = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=injector,
+        feedback=feedback,
+    )
+    app._busy.acquire()
+    app._on_watchdog_chunk(app.config.primary)
+    wd = app._watchdog
+    assert wd is not None
+    assert wd._threshold == 0.02
+    assert wd._auto_stop_seconds == 0.3
+
+
+def test_watchdog_chunk_empty_audio_does_not_inject_but_rearms():
+    """If the auto-stop fires during a buffer that was actually
+    silence, the silence gate skips the transcribe+inject. We still
+    re-arm so the next sentence gets caught."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig
+
+    config = Config(audio=AudioConfig(auto_stop_seconds=0.1, silence_threshold=0.005))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.zeros(0, dtype=np.float32)
+    transcriber = MagicMock()
+    injector = MagicMock()
+    feedback = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=injector,
+        feedback=feedback,
+    )
+    app._busy.acquire()
+    app._on_watchdog_chunk(app.config.primary)
+
+    transcriber.transcribe.assert_not_called()
+    injector.inject.assert_not_called()
+    # But the watchdog was re-armed.
+    assert app._watchdog is not None
+
+
+def test_manual_release_during_chunked_session_finalizes():
+    """If the user releases the hotkey during a chunked session, the
+    manual release path finalizes — no fresh watchdog, busy lock
+    released, recorder closed. No chunk body is running concurrently
+    in this test; the test exercises the manual-release path on its
+    own. The race-with-chunk-body case is covered by
+    `test_watchdog_chunk_bails_out_when_manual_release_already_pending`."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig
+
+    config = Config(audio=AudioConfig(auto_stop_seconds=0.1, silence_threshold=0.005))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(16000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    transcriber.transcribe.return_value = "goodbye"
+    injector = MagicMock()
+    feedback = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=injector,
+        feedback=feedback,
+    )
+    # Simulate an in-flight press.
+    app._busy.acquire()
+    app._active_profile = app.config.primary
+    app._press_started_at = 0.0
+
+    app.on_hotkey_release(app.config.primary)
+
+    # The recorder is closed (final path), the busy lock is released.
+    recorder.close.assert_called_once()
+    recorder.drain.assert_called_once()
+    assert not app._busy.locked()
+    assert app._watchdog is None
+    assert app._active_profile is None
+    feedback.set_state.assert_any_call("idle")
+    # The drained audio was transcribed+injected.
+    transcriber.transcribe.assert_called_once()
+    injector.inject.assert_called_once_with("goodbye")
+
+
+def test_watchdog_chunk_bails_out_when_manual_release_already_pending():
+    """If the user has already released (manual flag set) by the time
+    the chunked body runs, the chunk body should NOT re-arm a new
+    watchdog and NOT re-inject. The finalize is the manual release's
+    job."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig
+
+    config = Config(audio=AudioConfig(auto_stop_seconds=0.1, silence_threshold=0.005))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(8000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    injector = MagicMock()
+    feedback = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=injector,
+        feedback=feedback,
+    )
+    app._busy.acquire()
+    # Simulate manual release having already been called: flag is set,
+    # but the chunk body is still running (e.g. delayed watchdog).
+    app._manual_release_pending = True
+    app._on_watchdog_chunk(app.config.primary)
+
+    # The chunk body bailed: no fresh watchdog was armed.
+    assert app._watchdog is None
+    # No transcribe was called by the chunk path (the manual release
+    # path's _finalize will handle it).
+    transcriber.transcribe.assert_not_called()
+    injector.inject.assert_not_called()
+
+
+def test_watchdog_chunk_does_not_rearm_if_recorder_closed():
+    """If the recorder is closed out from under the chunk body
+    (e.g. shutdown), the chunk body must not try to arm a watchdog
+    on a closed recorder."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig
+
+    config = Config(audio=AudioConfig(auto_stop_seconds=0.1, silence_threshold=0.005))
+    recorder = MagicMock()
+    # The chunk body itself calls is_recording exactly once, at the
+    # re-arm gate. We want that one call to return False. Earlier
+    # incidental calls (none in the chunk body itself, but the
+    # watchdog's poll loop may run) should also be fine returning
+    # False — a closed recorder is closed.
+    recorder.is_recording.return_value = False
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(8000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    injector = MagicMock()
+    feedback = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=injector,
+        feedback=feedback,
+    )
+    app._busy.acquire()
+
+    app._on_watchdog_chunk(app.config.primary)
+
+    # No re-arm because is_recording was False.
+    assert app._watchdog is None
+
+
+def test_auto_stop_off_single_release_still_works(capsys):
+    """Sanity: when auto_stop_seconds = 0, behavior is unchanged from
+    before the chunked feature — one drain+process per press."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig
+
+    config = Config(audio=AudioConfig(auto_stop_seconds=0, silence_threshold=0))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(16000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    transcriber.transcribe.return_value = "hello"
+    injector = MagicMock()
+    feedback = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=injector,
+        feedback=feedback,
+    )
+
+    app.on_hotkey_press(app.config.primary)
+    assert app._watchdog is None  # feature off
+    app.on_hotkey_release(app.config.primary)
+    # Single drain+process path. The close+release happened.
+    recorder.drain.assert_called_once()
+    recorder.close.assert_called_once()
+    assert not app._busy.locked()
+    injector.inject.assert_called_once_with("hello")

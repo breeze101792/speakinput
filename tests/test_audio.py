@@ -179,3 +179,60 @@ def test_recorder_current_rms_resets_on_start(fake_sd):
     r.start()
     assert r.current_rms() == 0.0
     r.stop()
+
+
+def test_recorder_drain_returns_buffer_and_keeps_recording(fake_sd):
+    """drain() is the chunked-release path: return what was recorded
+    since the last start/drain, keep the stream alive so more audio
+    can be captured. After drain the live RMS resets to 0."""
+    from speakinput.audio import AudioRecorder
+
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    cb(np.full((480, 1), 0.3, dtype=np.float32), 480, None, None)
+    cb(np.full((480, 1), 0.4, dtype=np.float32), 480, None, None)
+    drained = r.drain()
+    assert r.is_recording()  # still recording
+    assert drained.size == 960
+    assert r.current_rms() == 0.0  # reset after drain
+    # A new callback after drain accumulates into a fresh buffer.
+    cb(np.full((240, 1), 0.5, dtype=np.float32), 240, None, None)
+    drained2 = r.drain()
+    assert drained2.size == 240
+    r.close()
+
+
+def test_recorder_drain_on_empty_buffer_returns_empty(fake_sd):
+    """Draining with no audio in flight returns an empty array without
+    raising."""
+    from speakinput.audio import AudioRecorder
+
+    r = AudioRecorder()
+    r.start()
+    out = r.drain()
+    assert out.size == 0
+    assert out.dtype == np.float32
+    assert r.is_recording()
+    r.close()
+
+
+def test_recorder_close_is_idempotent(fake_sd):
+    """Calling close() twice is a no-op."""
+    from speakinput.audio import AudioRecorder
+
+    r, _ = _make_recorder_with_captured_callback(fake_sd)
+    r.close()
+    r.close()  # second call must not raise
+    assert not r.is_recording()
+
+
+def test_recorder_stop_equivalent_to_drain_then_close(fake_sd):
+    """stop() should still return the full buffer and tear down the
+    stream, preserving the existing single-chunk release behavior."""
+    from speakinput.audio import AudioRecorder
+
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    cb(np.full((800, 1), 0.2, dtype=np.float32), 800, None, None)
+    cb(np.full((800, 1), 0.3, dtype=np.float32), 800, None, None)
+    out = r.stop()
+    assert not r.is_recording()
+    assert out.size == 1600

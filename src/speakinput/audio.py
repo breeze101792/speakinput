@@ -25,6 +25,8 @@ class AudioError(RuntimeError):
 class Recorder(Protocol):
     def start(self) -> None: ...
     def stop(self) -> np.ndarray: ...
+    def drain(self) -> np.ndarray: ...
+    def close(self) -> None: ...
     def is_recording(self) -> bool: ...
     def current_rms(self) -> float: ...
 
@@ -105,18 +107,61 @@ class AudioRecorder:
             self._last_rms = rms
 
     def stop(self) -> np.ndarray:
-        if not self._recording:
-            return np.zeros(0, dtype=np.float32)
-        assert self._stream is not None
-        self._stream.stop()
-        self._stream.close()
-        self._recording = False
+        """Drain the buffer and close the PortAudio stream.
+
+        Equivalent to `drain()` followed by `close()`. Returns whatever
+        audio was recorded since the last `start()` or `drain()`.
+        """
+        audio = self.drain()
+        self.close()
+        return audio
+
+    def drain(self) -> np.ndarray:
+        """Return the recorded buffer since the last start/drain and
+        clear the in-memory state. The PortAudio stream stays open so
+        subsequent audio callbacks continue to accumulate into a fresh
+        buffer.
+
+        Used by the chunked auto-stop path: when silence triggers an
+        auto-release mid-press, we drain the captured audio for
+        transcription, then keep listening for the next sentence
+        without paying the cost of tearing down and reopening the
+        stream.
+        """
         chunks = self._chunks or []
-        self._chunks = None
-        self._stream = None
+        self._chunks = []
+        with self._rms_lock:
+            self._last_rms = 0.0
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks).astype(np.float32, copy=False)
+
+    def close(self) -> None:
+        """Stop and close the PortAudio stream. Idempotent.
+
+        After `close()`, the recorder is no longer recording and must
+        be `start()`-ed again to capture more audio. Any in-flight
+        audio callbacks from PortAudio that arrive after close are
+        silently dropped (the `_chunks` list is None).
+        """
+        if self._stream is None:
+            return
+        try:
+            self._stream.stop()
+        except Exception:
+            pass
+        try:
+            self._stream.close()
+        except Exception:
+            pass
+        self._stream = None
+        self._recording = False
+        # Don't drop _chunks here — `drain()` may still want to read
+        # what was buffered before close. _on_audio appends are still
+        # safe because the list object isn't replaced.
+        # Reset RMS so a stale chunk callback doesn't leak across close.
+        with self._rms_lock:
+            self._last_rms = 0.0
 
     # --- v2 streaming seam: not consumed in v1, kept for the overlapped-stream upgrade.
     def chunk_generator(

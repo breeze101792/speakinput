@@ -128,14 +128,31 @@ class App:
         self.debug = debug
         self._shutdown = threading.Event()
         self._busy = threading.Lock()
+        # Serializes the chunked-release body: when auto-stop fires
+        # mid-press it drains, transcribes, and re-arms the watchdog.
+        # A manual release that arrives during the chunked body must
+        # wait for it to finish before tearing the recorder down.
+        # Acquired at the start of the chunked body and held across the
+        # whole drain→process→re-arm sequence. NOT held during
+        # transcribe+inject (the injection is the slow part, and we
+        # want the watchdog's NEXT chunk to be allowed to start
+        # recording the user's next sentence while the previous one is
+        # being typed out).
+        self._body_lock = threading.Lock()
         self._press_started_at: float | None = None
         # The profile that's currently being recorded. Set on press,
         # consumed on release, cleared at the end. None outside of a
         # press/release pair.
         self._active_profile: Profile | None = None
+        # True when the user has released the hotkey and we're in the
+        # final-cleanup window. The chunked body checks this between
+        # drains so a manual release finalizes the session without
+        # re-arming the watchdog for another chunk.
+        self._manual_release_pending: bool = False
         # Auto-stop watchdog. Started in on_hotkey_press when
         # `auto_stop_seconds > 0`, stopped in on_hotkey_release. None
-        # when the feature is disabled.
+        # when the feature is disabled. Replaced (not appended) on
+        # every chunked re-arm so a stale watchdog is never running.
         self._watchdog: SilenceWatchdog | None = None
         self.listeners: dict[str, HotkeyListener] = {}
 
@@ -152,6 +169,7 @@ class App:
             return
         self._busy.acquire()
         self._active_profile = profile
+        self._manual_release_pending = False
         self._press_started_at = time.monotonic()
         _dbg(self.debug, f"key press start ({profile.key})")
         try:
@@ -164,53 +182,153 @@ class App:
             return
         # Start the auto-stop watchdog if the user has it enabled. The
         # watchdog polls the recorder's live RMS in a background thread
-        # and synthesizes a release when N seconds of silence pass. The
-        # manual release path will tear the watchdog down in
-        # on_hotkey_release; whichever fires first wins, the other is a
-        # no-op.
+        # and, when N seconds of silence pass, calls _on_watchdog_chunk
+        # which drains the captured audio, transcribes+injects it, and
+        # re-arms a fresh watchdog for the next chunk. The manual
+        # release path (on_hotkey_release) sets a pending flag and
+        # finalizes the session through _finalize().
         auto_stop = self.config.audio.auto_stop_seconds
         if auto_stop > 0 and self.config.audio.silence_threshold > 0:
-            self._watchdog = SilenceWatchdog(
-                recorder=self.recorder,
-                threshold=self.config.audio.silence_threshold,
-                auto_stop_seconds=auto_stop,
-                on_trigger=lambda: self.on_hotkey_release(profile),
-            )
-            self._watchdog.start()
+            self._arm_watchdog(profile)
         self.feedback.set_state("listening")
 
-    def on_hotkey_release(self, profile: Profile) -> None:
-        if not self.recorder.is_recording():
-            # Press callback failed; nothing to do.
-            return
-        if self._active_profile is not profile:
-            # Press and release keys don't match (shouldn't happen with
-            # one key held at a time, but guard anyway). Release the
-            # active profile instead of the release-side argument.
-            profile = self._active_profile
-        # Tear down the auto-stop watchdog first, so a slow transcribe
-        # doesn't keep its polling loop running. stop() is safe to call
-        # even if the watchdog already triggered itself — both paths
-        # end up at this same release body.
+    def _arm_watchdog(self, profile: Profile) -> None:
+        """Create and start a fresh SilenceWatchdog for the current chunk.
+
+        Replaces any prior watchdog. Called by the chunked body after
+        each successful drain+inject so a stale watchdog is never
+        running. The watchdog's on_trigger is _on_watchdog_chunk.
+        """
         if self._watchdog is not None:
             self._watchdog.stop()
             self._watchdog = None
+        wd = SilenceWatchdog(
+            recorder=self.recorder,
+            threshold=self.config.audio.silence_threshold,
+            auto_stop_seconds=self.config.audio.auto_stop_seconds,
+            on_trigger=lambda: self._on_watchdog_chunk(profile),
+        )
+        wd.start()
+        self._watchdog = wd
+
+    def _on_watchdog_chunk(self, profile: Profile) -> None:
+        """Watchdog fired: silence threshold reached mid-press.
+
+        Drain the captured buffer, transcribe and inject it, then
+        re-arm a fresh watchdog for the next sentence. If the user has
+        released the hotkey in the meantime, finalize the session
+        instead of re-arming.
+
+        Runs on the watchdog's own thread. The _body_lock is acquired
+        only across the brief drain→re-arm window; transcribe+inject
+        runs OUTSIDE the lock so the next chunk can start recording
+        while the previous one is being typed out.
+        """
+        if self._manual_release_pending:
+            # Manual release beat us to the finalization. Just exit;
+            # on_hotkey_release will tear the recorder down.
+            return
+        with self._body_lock:
+            if self._manual_release_pending:
+                return
+            audio = self.recorder.drain()
+            if self._manual_release_pending:
+                return
+        # Transcribe+inject OUTSIDE the body lock so the recorder can
+        # start capturing the next chunk while whisper chews on this
+        # one. The chunked path keeps the recorder running.
+        if audio.size:
+            self._process_and_inject(audio, profile)
+        # Re-arm only if the user is still holding the key. If they
+        # released during the transcribe, the manual-release path
+        # will tear the recorder down and we're done.
+        if self._manual_release_pending:
+            return
+        # Don't re-arm if the recorder has been closed out from under
+        # us (e.g. shutdown() or finalize() ran on another thread).
+        if not self.recorder.is_recording():
+            return
+        self._arm_watchdog(profile)
+
+    def on_hotkey_release(self, profile: Profile) -> None:
+        """Final release path: the user has let go of the hotkey.
+
+        Sets a flag the chunked body checks, stops any active watchdog,
+        and runs the final drain+transcribe+inject+close. If the
+        chunked body is mid-flight, it sees the flag and bails out
+        before re-arming; the finalize below picks up whatever audio
+        accumulated during the transcribe.
+        """
+        if not self.recorder.is_recording():
+            # Press callback failed; nothing to do.
+            return
+        # Tell the chunked body (if any) to bail on re-arming.
+        self._manual_release_pending = True
+        # Stop the active watchdog. If the watchdog has already fired
+        # and is in _on_watchdog_chunk, stopping it has no effect on
+        # the chunk body (it doesn't re-check the stop event), but the
+        # _arm_watchdog call at the end of the chunk body is a no-op
+        # for the final release because we check the flag right after.
+        if self._watchdog is not None:
+            self._watchdog.stop()
+            self._watchdog = None
+        if self._active_profile is not profile:
+            # Press and release keys don't match (shouldn't happen with
+            # one key held at a time, but guard anyway). Use the active
+            # profile for the final transcribe+inject.
+            profile = self._active_profile
         held_for = (
             time.monotonic() - self._press_started_at if self._press_started_at is not None else 0.0
         )
         self._press_started_at = None
         _dbg(self.debug, f"key press end (held {held_for:.2f}s, key={profile.key})")
         self.feedback.set_state("processing")
+        self._finalize(profile)
+
+    def _finalize(self, profile: Profile | None) -> None:
+        """Drain whatever audio is buffered, transcribe+inject, tear
+        down the recorder, and release the busy lock.
+
+        Called by on_hotkey_release (manual) after a final drain.
+        Idempotent-ish: if the recorder isn't recording, just releases
+        the busy lock and returns.
+        """
         try:
-            audio = self.recorder.stop()
+            audio = self.recorder.drain() if self.recorder.is_recording() else np.zeros(0, dtype=np.float32)
         except Exception:
-            log.exception("failed to stop recorder")
-            self._busy.release()
-            self._active_profile = None
+            log.exception("failed to drain recorder")
+            audio = np.zeros(0, dtype=np.float32)
+        try:
+            self.recorder.close()
+        except Exception:
+            log.exception("failed to close recorder")
+        if audio.size:
+            self._process_and_inject(audio, profile)
+        self._busy.release()
+        self._active_profile = None
+        self._manual_release_pending = False
+        self._watchdog = None
+        self.feedback.set_state("idle")
+
+    def _process_and_inject(self, audio: np.ndarray, profile: Profile | None) -> None:
+        """Trim, silence-gate, transcribe, and inject a chunk of audio.
+
+        Pulled out of the release path so the chunked watchdog body
+        and the final release body share it. Silent short-circuits
+        are normal (the user spoke but auto-stopped during a brief
+        pause) — debug-mode logs make the difference between "silence
+        skipped" and "stuck" observable.
+        """
+        if not self.recorder.is_recording() and not audio.size:
             return
-        duration = audio.size / max(self.config.audio.sample_rate, 1)
+        if profile is None:
+            profile = self._active_profile
+        if profile is None:
+            log.warning("no active profile; skipping inject")
+            return
         import numpy as np  # local import keeps the hot path lean
 
+        duration = audio.size / max(self.config.audio.sample_rate, 1)
         # Trim trailing silence BEFORE computing the silence-gate RMS,
         # so a long silent tail doesn't fool the gate into thinking the
         # whole buffer is silent. The trim only chops trailing samples,
@@ -241,25 +359,16 @@ class App:
                 self.debug,
                 f"silence gate: rms={rms:.4f} < {threshold:.4f}, skipping transcribe",
             )
-            self._busy.release()
-            self._active_profile = None
-            self.feedback.set_state("idle")
             return
         try:
             transcriber = self.transcribers[profile.key]
         except KeyError:
             log.exception("no transcriber wired for key %r", profile.key)
-            self._busy.release()
-            self._active_profile = None
-            self.feedback.set_state("idle")
             return
         try:
             text = transcriber.transcribe(audio, self.config.audio.sample_rate)
         except Exception:
             log.exception("transcription failed")
-            self._busy.release()
-            self._active_profile = None
-            self.feedback.set_state("idle")
             return
         # Always print the transcript in debug mode, even when empty, so the
         # user can tell the difference between "silence" and "stuck".
@@ -273,9 +382,6 @@ class App:
                     self.injector.inject(text)
                 except Exception:
                     log.exception("injection failed")
-        self._busy.release()
-        self._active_profile = None
-        self.feedback.set_state("idle")
 
     def _make_press_cb(self, profile: Profile):
         def cb() -> None:
