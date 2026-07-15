@@ -27,6 +27,13 @@ def _stub_hotkey_listener(monkeypatch):
     None. We stub that module-level `keyboard` to a MagicMock with
     matching `Key.<name>` attributes so `resolve_key` works in
     either environment.
+
+    The same goes for the new `EvdevHotkeyListener`: it would try to
+    open `/dev/input/event*`, which fails on every test environment
+    (no real keyboard, no permissions, or just no /dev/input in CI
+    containers). We stub it to a no-op MagicMock for symmetry. Tests
+    that specifically exercise evdev behavior live in test_hotkey.py
+    with a properly-shaped fake.
     """
     fake_listener_cls = MagicMock()
     fake_listener_cls.side_effect = lambda *a, **kw: MagicMock()
@@ -39,6 +46,9 @@ def _stub_hotkey_listener(monkeypatch):
     fake_keyboard.Key.caps_lock = "caps_lock_key"
     fake_keyboard.Key.f12 = "f12_key"
     monkeypatch.setattr("speakinput.hotkey.keyboard", fake_keyboard, raising=False)
+    fake_evdev_listener_cls = MagicMock()
+    fake_evdev_listener_cls.side_effect = lambda *a, **kw: MagicMock()
+    monkeypatch.setattr("speakinput.app.EvdevHotkeyListener", fake_evdev_listener_cls)
     return fake_listener_cls
 
 
@@ -581,6 +591,59 @@ def test_two_listeners_started_for_two_profiles(monkeypatch):
     app._shutdown.set()
     app.run()
     assert set(app.listeners.keys()) == {"alt_r", "cmd_r"}
+
+
+def test_run_uses_evdev_listener_on_wayland(monkeypatch, capsys):
+    """On a Wayland session (XDG_SESSION_TYPE=wayland), app.run() must
+    construct EvdevHotkeyListener instead of the pynput-based
+    HotkeyListener. The autouse fixture stubs both, so we just verify
+    the right one was called."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+
+    config = Config(primary=Profile(key="alt_r"))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    # Banner reflects the chosen backend.
+    assert "evdev" in captured.err
+    # The autouse stub captured both class-level calls; check evdev won.
+    import speakinput.app as appmod
+    assert appmod.EvdevHotkeyListener.called
+    assert not appmod.HotkeyListener.called
+
+
+def test_run_uses_pynput_listener_on_x11(monkeypatch, capsys):
+    """Counterpart to the Wayland test: when XDG_SESSION_TYPE is unset
+    or x11, pynput's HotkeyListener is used and the banner doesn't
+    mention evdev."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+    monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+    config = Config(primary=Profile(key="alt_r"))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert "evdev" not in captured.err
+    import speakinput.app as appmod
+    assert appmod.HotkeyListener.called
+    assert not appmod.EvdevHotkeyListener.called
 
 
 def test_shutdown_stops_all_listeners(monkeypatch):

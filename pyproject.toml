@@ -15,6 +15,7 @@ dependencies = [
     "sounddevice>=0.4.6",
     "numpy>=1.26",
     "pynput>=1.7.7",
+    "evdev>=1.4 ; sys_platform == 'linux'",
     "pyperclip>=1.8",
     "platformdirs>=4",
 ]

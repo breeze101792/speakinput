@@ -223,6 +223,34 @@ Run `./start.sh --debug` and look for the line that says either `This process is
 
 macOS sometimes resets these permissions after a macOS update, after major Python upgrades (e.g. 3.13 → 3.14), or after the `.venv` is rebuilt. The venv python path changes, and the old permission entry no longer matches. Re-run steps 3–5 and the issue goes away.
 
+## Linux / Wayland
+
+Speak Input auto-detects Wayland sessions (`XDG_SESSION_TYPE=wayland`) and uses a second hotkey listener that reads the Linux kernel input subsystem directly via `python-evdev`, bypassing pynput's X11-only backend. On X11 Linux (or any Linux session where pynput can reach a display) it uses pynput as before.
+
+No configuration is required to enable this — it's a runtime decision based on the session type. The startup banner line `[startup] hotkey   : evdev (Linux Wayland session — pynput bypassed)` confirms the evdev backend is active.
+
+### Permissions
+
+The evdev backend reads `/dev/input/eventN` directly, so the user must be able to open those files. On most distros this is handled by membership in the `input` group:
+
+```bash
+sudo usermod -aG input $USER
+# log out and back in (group membership is applied at login)
+```
+
+Verify with `ls -l /dev/input/event*` — your user should be able to `cat` one of them (Ctrl-C to stop). If `/dev/input` doesn't exist at all, you're in a sandboxed/container environment without kernel input devices exposed; this is the runtime's problem, not the program's.
+
+### Double-fires with other key-grabbers
+
+The evdev backend does **not** use `EVIOCGRAB` — it observes events while the focused application also receives them, so the user can type normally in other apps while speakinput is running. The trade-off: if another key-grabber is also watching the same device (e.g. `sxhkd`, `kglobalacceld`, or a screen-reader), it will see the same hotkey press and may act on it too. If you see the hotkey fire twice (or other odd behavior), check your other key-grabbers and either disable them for the configured key or pause the other process while dictating.
+
+The right-Super physical key (`cmd_r` on a default Linux profile) may not exist on every keyboard. If the configured `cmd_r` key doesn't trigger, edit `config.toml` and switch the secondary profile's key to something your keyboard has, e.g. `key = "ctrl_r"` (right-Ctrl) or `key = "f12"`.
+
+### v2 follow-ups (not in this release)
+
+- `[hotkey].device_path` config knob for multi-keyboard setups (laptop + external USB). The current auto-detect picks the first keyboard-shaped device it finds; users with multiple keyboards who want a specific one selected will need this.
+- Optional `EVIOCGRAB` mode for users who want exclusive device grab (toggle via config). Documented as a non-default because the cost (you can't type anywhere else while speakinput is running) is heavy for a background push-to-talk app.
+
 ## Usage
 
 ```bash
@@ -370,7 +398,11 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 
 **Key detection works but transcript never appears in the focused app.** This is the Accessibility permission — see the [macOS permissions](#macos-permissions) section. Run with `--debug` to confirm: the `[debug] key press end` and `[debug] transcript: '...'` lines will appear, but the receiving app stays empty. Add the venv python to **Privacy & Security → Accessibility**, log out/in, and try again.
 
-**Nothing happens when I hold the hotkey.** Check both macOS permissions above. Run with `-v` to see debug logs.
+**Nothing happens when I hold the hotkey.** On macOS, check both macOS permissions above. On Linux, verify the user is in the `input` group (see [Linux / Wayland](#linux--wayland)), and that `/dev/input/event*` is readable. Run with `-v` to see debug logs.
+
+**On Linux Wayland, the listener fails to start with "no keyboard device found in /dev/input".** Either the user isn't in the `input` group, or `/dev/input` is empty (sandboxed/container env). See [Linux / Wayland](#linux--wayland).
+
+**On Linux, the hotkey fires twice or other apps also see it.** Another key-grabber is also watching the device. The evdev backend intentionally does not grab exclusively — see the [double-fires](#double-fires-with-other-key-grabbers) note for workarounds.
 
 **The right-Option hotkey (macOS default) triggers menu mnemonics.** v1 uses `suppress=False` so the key reaches other apps — useful for Alt-Tab, but it can arm menu shortcuts in some apps. v2 will add a `suppress=True` mode for that case. On Linux/Windows the default is Right Ctrl, which has fewer menu-mnemonic conflicts.
 

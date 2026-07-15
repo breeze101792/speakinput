@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
@@ -12,7 +13,12 @@ from pathlib import Path
 from speakinput.audio import AudioRecorder
 from speakinput.config import Config, Profile
 from speakinput.feedback import Feedback, NullFeedback
-from speakinput.hotkey import HotkeyListener, resolve_key
+from speakinput.hotkey import (
+    EvdevHotkeyListener,
+    HotkeyListener,
+    resolve_evdev_key,
+    resolve_key,
+)
 from speakinput.injector import Injector, TypingInjector
 from speakinput.models import (
     ModelDownloadError,
@@ -408,12 +414,31 @@ class App:
                 raise SystemExit(2) from exc
         self._print_banner()
         self.feedback.start()
-        for profile in self._profiles:
-            listener = HotkeyListener(
-                key=resolve_key(profile.key),
-                on_press=self._make_press_cb(profile),
-                on_release=self._make_release_cb(profile),
+        use_evdev = (
+            sys.platform == "linux"
+            and os.environ.get("XDG_SESSION_TYPE") == "wayland"
+        )
+        # Print the chosen hotkey backend so the user can verify which
+        # code path is active (helpful for permission issues on Wayland).
+        if use_evdev:
+            print(
+                "[startup] hotkey   : evdev (Linux Wayland session — pynput bypassed)",
+                file=sys.stderr,
+                flush=True,
             )
+        for profile in self._profiles:
+            if use_evdev:
+                listener = EvdevHotkeyListener(
+                    keycode=resolve_evdev_key(profile.key),
+                    on_press=self._make_press_cb(profile),
+                    on_release=self._make_release_cb(profile),
+                )
+            else:
+                listener = HotkeyListener(
+                    key=resolve_key(profile.key),
+                    on_press=self._make_press_cb(profile),
+                    on_release=self._make_release_cb(profile),
+                )
             self.listeners[profile.key] = listener
             listener.start()
         keys = ", ".join(p.key for p in self._profiles)
