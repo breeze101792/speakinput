@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
@@ -25,6 +26,7 @@ class Recorder(Protocol):
     def start(self) -> None: ...
     def stop(self) -> np.ndarray: ...
     def is_recording(self) -> bool: ...
+    def current_rms(self) -> float: ...
 
 
 @dataclass
@@ -42,6 +44,11 @@ class AudioRecorder:
     _stream: object | None = None
     _chunks: list[np.ndarray] | None = None
     _recording: bool = False
+    # The most recent chunk's RMS, updated from the audio callback and
+    # read by the auto-stop watchdog. Guarded by `_rms_lock` because the
+    # callback and the watchdog run on different threads.
+    _last_rms: float = 0.0
+    _rms_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def _require_sounddevice(self) -> None:
         if sd is None:
@@ -53,11 +60,24 @@ class AudioRecorder:
     def is_recording(self) -> bool:
         return self._recording
 
+    def current_rms(self) -> float:
+        """Return the RMS of the most recently received audio chunk.
+
+        Returns 0.0 when no audio has arrived yet. The value updates
+        asynchronously as the PortAudio callback delivers chunks, so
+        callers should sample it on a polling loop (the auto-stop
+        watchdog does this at ~20 Hz).
+        """
+        with self._rms_lock:
+            return self._last_rms
+
     def start(self) -> None:
         if self._recording:
             return
         self._require_sounddevice()
         self._chunks = []
+        with self._rms_lock:
+            self._last_rms = 0.0
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
@@ -71,9 +91,18 @@ class AudioRecorder:
     def _on_audio(self, indata, frames, time, status) -> None:  # noqa: ANN001 (sounddevice API)
         # status flags (overflow/underflow) are non-fatal; keep the audio and
         # let the caller surface the issue if needed.
+        chunk = indata.copy().reshape(-1)
         if self._chunks is not None:
-            # Copy because the buffer is reused by PortAudio.
-            self._chunks.append(indata.copy().reshape(-1))
+            self._chunks.append(chunk)
+        # Track the most recent chunk's RMS for the auto-stop watchdog.
+        # Computed once per callback so the watchdog's polling loop is a
+        # cheap lock+read, not a full-buffer scan.
+        if chunk.size:
+            rms = float(np.sqrt(np.mean(chunk * chunk)))
+        else:
+            rms = 0.0
+        with self._rms_lock:
+            self._last_rms = rms
 
     def stop(self) -> np.ndarray:
         if not self._recording:

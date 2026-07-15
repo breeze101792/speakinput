@@ -163,12 +163,24 @@ def secondary_profile() -> Profile:
 class AudioConfig:
     device: int | None = None
     sample_rate: int = 16000
-    # Audio whose RMS is below this floor is treated as silence and never
-    # sent to the model. Stops whisper from hallucinating on near-empty
-    # recordings (e.g. user pressed the hotkey by accident). 0 disables
-    # the gate. Default 0.005 — quiet enough to swallow room noise,
-    # loud enough to admit any actual speech.
+    # Audio whose RMS is below this floor is treated as silence. Two
+    # related things use it:
+    #   1. The pre-transcribe gate: if the whole buffer's RMS is below
+    #      this, skip whisper entirely. Stops whisper from hallucinating
+    #      on near-empty recordings (e.g. user pressed the hotkey by
+    #      accident). 0 disables.
+    #   2. The auto-stop watchdog: while the key is held, if `auto_stop_seconds`
+    #      of sub-threshold audio passes in a row, the watchdog
+    #      synthesizes a release so the user doesn't have to time it
+    #      themselves. Trailing silence is also trimmed from the
+    #      buffer before transcribe.
     silence_threshold: float = 0.005
+    # Seconds of consecutive sub-threshold audio that triggers an
+    # auto-stop while the key is held. 0 disables the watchdog entirely
+    # (the old "release the key yourself" behavior). Default 0.8s — a
+    # normal end-of-sentence pause. Lower it for snappier response,
+    # raise it if the watchdog is chopping mid-sentence pauses.
+    auto_stop_seconds: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -265,6 +277,8 @@ class Config:
             raise ValueError("audio.sample_rate must be positive")
         if self.audio.silence_threshold < 0:
             raise ValueError("audio.silence_threshold must be >= 0 (0 disables)")
+        if self.audio.auto_stop_seconds < 0:
+            raise ValueError("audio.auto_stop_seconds must be >= 0 (0 disables)")
 
     def with_overrides(self, **overrides: Any) -> "Config":
         """Return a copy with select fields overridden (used by CLI flags).

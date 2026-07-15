@@ -20,6 +20,7 @@ from speakinput.models import (
     ensure_model,
     resolve_for_language,
 )
+from speakinput.silence import SilenceWatchdog, trim_trailing_silence
 from speakinput.transcriber import Transcriber, WhisperCppTranscriber
 
 log = logging.getLogger("speakinput")
@@ -132,6 +133,10 @@ class App:
         # consumed on release, cleared at the end. None outside of a
         # press/release pair.
         self._active_profile: Profile | None = None
+        # Auto-stop watchdog. Started in on_hotkey_press when
+        # `auto_stop_seconds > 0`, stopped in on_hotkey_release. None
+        # when the feature is disabled.
+        self._watchdog: SilenceWatchdog | None = None
         self.listeners: dict[str, HotkeyListener] = {}
 
     @property
@@ -157,6 +162,21 @@ class App:
             self._press_started_at = None
             self._active_profile = None
             return
+        # Start the auto-stop watchdog if the user has it enabled. The
+        # watchdog polls the recorder's live RMS in a background thread
+        # and synthesizes a release when N seconds of silence pass. The
+        # manual release path will tear the watchdog down in
+        # on_hotkey_release; whichever fires first wins, the other is a
+        # no-op.
+        auto_stop = self.config.audio.auto_stop_seconds
+        if auto_stop > 0 and self.config.audio.silence_threshold > 0:
+            self._watchdog = SilenceWatchdog(
+                recorder=self.recorder,
+                threshold=self.config.audio.silence_threshold,
+                auto_stop_seconds=auto_stop,
+                on_trigger=lambda: self.on_hotkey_release(profile),
+            )
+            self._watchdog.start()
         self.feedback.set_state("listening")
 
     def on_hotkey_release(self, profile: Profile) -> None:
@@ -168,6 +188,13 @@ class App:
             # one key held at a time, but guard anyway). Release the
             # active profile instead of the release-side argument.
             profile = self._active_profile
+        # Tear down the auto-stop watchdog first, so a slow transcribe
+        # doesn't keep its polling loop running. stop() is safe to call
+        # even if the watchdog already triggered itself — both paths
+        # end up at this same release body.
+        if self._watchdog is not None:
+            self._watchdog.stop()
+            self._watchdog = None
         held_for = (
             time.monotonic() - self._press_started_at if self._press_started_at is not None else 0.0
         )
@@ -184,6 +211,22 @@ class App:
         duration = audio.size / max(self.config.audio.sample_rate, 1)
         import numpy as np  # local import keeps the hot path lean
 
+        # Trim trailing silence BEFORE computing the silence-gate RMS,
+        # so a long silent tail doesn't fool the gate into thinking the
+        # whole buffer is silent. The trim only chops trailing samples,
+        # never the leading portion of the speech.
+        threshold = self.config.audio.silence_threshold
+        if threshold > 0 and audio.size:
+            trimmed = trim_trailing_silence(
+                audio, self.config.audio.sample_rate, threshold
+            )
+            if trimmed.size != audio.size:
+                _dbg(
+                    self.debug,
+                    f"trimmed trailing silence: {audio.size} -> {trimmed.size} samples "
+                    f"({(audio.size - trimmed.size) / max(self.config.audio.sample_rate, 1):.2f}s)",
+                )
+                audio = trimmed
         rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
         _dbg(
             self.debug,
@@ -193,7 +236,6 @@ class App:
         # doesn't hallucinate on them. The default 0.005 is well above
         # the noise floor of a quiet room but well below any actual
         # speech. Set to 0 in config.toml to disable.
-        threshold = self.config.audio.silence_threshold
         if threshold > 0 and rms < threshold:
             _dbg(
                 self.debug,
@@ -289,6 +331,8 @@ class App:
         inject_mode = "off (dry-run)" if self.dry_run else "on"
         threshold = cfg.audio.silence_threshold
         threshold_str = "off" if threshold == 0 else f"{threshold:g}"
+        auto_stop = cfg.audio.auto_stop_seconds
+        auto_stop_str = "off" if auto_stop == 0 else f"{auto_stop:g}s"
         if self.config_source is not None:
             source_str = str(self.config_source)
         else:
@@ -316,7 +360,7 @@ class App:
             *profile_lines,
             f"models   : loaded {distinct} into memory{dedupe_str}",
             f"sample   : {cfg.audio.sample_rate} Hz, device={device}",
-            f"silence  : rms<{threshold_str} -> skip",
+            f"silence  : rms<{threshold_str} -> skip; auto-stop after {auto_stop_str}",
             f"inject   : {inject_mode}, trailing_space={cfg.inject.trailing_space}",
         ]
         for line in lines:
@@ -324,6 +368,9 @@ class App:
 
     def shutdown(self) -> None:
         self._shutdown.set()
+        if self._watchdog is not None:
+            self._watchdog.stop()
+            self._watchdog = None
         for key, listener in self.listeners.items():
             try:
                 listener.stop()

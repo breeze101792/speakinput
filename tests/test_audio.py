@@ -139,3 +139,43 @@ def test_list_input_devices_filters_by_input_channels(fake_sd):
     assert len(devices) == 1
     assert devices[0]["name"] == "Mic"
     assert devices[0]["index"] == 0
+
+
+def test_recorder_current_rms_is_zero_before_any_audio(fake_sd):
+    """Before the first audio callback fires, current_rms() returns 0.0."""
+    from speakinput.audio import AudioRecorder
+
+    r = AudioRecorder()
+    r.start()
+    assert r.current_rms() == 0.0
+    r.stop()
+
+
+def test_recorder_current_rms_reflects_last_chunk(fake_sd):
+    """The watchdog polls current_rms() to detect silence; it must
+    reflect the most recent chunk's RMS, not the running average."""
+    from speakinput.audio import AudioRecorder
+
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    # First chunk: loud (RMS = 0.5)
+    cb(np.full((480, 1), 0.5, dtype=np.float32), 480, None, None)
+    assert r.current_rms() == pytest.approx(0.5, abs=1e-5)
+    # Second chunk: silent
+    cb(np.zeros((480, 1), dtype=np.float32), 480, None, None)
+    assert r.current_rms() == 0.0
+    r.stop()
+
+
+def test_recorder_current_rms_resets_on_start(fake_sd):
+    """Starting a new recording should reset the live RMS to 0.0,
+    not carry over from a previous run."""
+    from speakinput.audio import AudioRecorder
+
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    cb(np.full((480, 1), 0.5, dtype=np.float32), 480, None, None)
+    r.stop()
+    # Now restart — fresh state.
+    fake_sd.InputStream.return_value = MagicMock()
+    r.start()
+    assert r.current_rms() == 0.0
+    r.stop()

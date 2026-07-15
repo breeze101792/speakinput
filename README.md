@@ -37,6 +37,27 @@ speakinput -m base.en             # pick a different model; downloaded on first 
 
 If the download fails (no internet, firewall, disk full), Speak Input exits with code 2 and a clear error message — the listener never starts. Fix the underlying problem and re-run.
 
+## Auto-stop on silence
+
+By default Speak Input stops the recording automatically when **0.8 seconds of consecutive silence** passes while you're holding the key. You don't have to time the release — finish your sentence, pause, and the recorder stops by itself. Two things are wired together:
+
+- **Trailing-silence trim** runs on every release, whether manual or auto. The audio buffer is walked backwards in 30ms hops and any trailing silent portion is dropped, so whisper doesn't see a long silent tail (a real source of hallucinated filler text).
+- **Auto-stop watchdog** is a small background thread that polls the recorder's live RMS at ~20Hz. When the configured number of seconds of sub-threshold audio passes, it synthesizes a release for the active profile.
+
+The two related config knobs are both under `[audio]`:
+
+```toml
+[audio]
+silence_threshold = 0.005   # RMS floor: below this counts as "silence"
+auto_stop_seconds = 0.8     # auto-stop after this many seconds of silence
+                            # 0 disables; the old "release the key yourself"
+                            # behavior comes back
+```
+
+Both flags have CLI overrides: `-S/--silence-threshold` and `-A/--auto-stop-seconds`. Lower `auto_stop_seconds` for snappier response; raise it if the watchdog is chopping mid-sentence pauses. Set it to `0` to disable entirely — manual release works exactly as before.
+
+When auto-stop fires, the release path runs the same as a manual release: same buffer-trim step, same silence-gate check, same transcriber. The only difference is who flipped the bit.
+
 ## Two profiles, one key per language
 
 Speak Input runs **one or two profiles**. A profile binds one hotkey to one STT setup (model + language + prompt). The typical setup is two profiles, so a single key speaks one language and the model never has to guess:
@@ -226,6 +247,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-t`  | `--trailing-space`    | Append a space after each transcript (default)  |
 | `-T`  | `--no-trailing-space` | Don't append a space after each transcript      |
 | `-S`  | `--silence-threshold FLOAT` | Skip transcribe when audio RMS is below this floor (0 disables; default 0.005) |
+| `-A`  | `--auto-stop-seconds FLOAT` | Auto-stop after this many seconds of silence while the key is held (0 disables; default 0.8). Trailing silence is also trimmed from the buffer before transcribe. See [Auto-stop on silence](#auto-stop-on-silence) |
 | `-P`  | `--initial-prompt TEXT` | Override the **primary** profile's `initial_prompt` for this run (default: embedded-software-engineer bias; see [Initial prompt](#initial-prompt-vocabulary-biasing)) |
 | `-v`  | `--verbose`           | Enable debug logging from python logging        |
 
@@ -294,8 +316,13 @@ beam_size = 1
 [audio]
 device = null              # null = system default mic; or an integer index from --list-devices
 sample_rate = 16000        # whisper expects 16 kHz; do not change
-silence_threshold = 0.005  # skip transcribe when audio RMS is below this floor
-                           # (0 disables the gate; lower = more sensitive)
+silence_threshold = 0.005  # RMS floor used by the silence gate and the
+                           # auto-stop watchdog. Audio below this counts
+                           # as silence. 0 disables both.
+auto_stop_seconds = 0.8    # auto-stop after this many seconds of
+                           # continuous silence while the key is held.
+                           # Trailing silence is also trimmed from the
+                           # buffer before transcribe. 0 disables.
 
 [inject]
 restore_clipboard_ms = 50  # how long to wait before restoring the prior clipboard contents
@@ -315,9 +342,13 @@ $EDITOR ~/Library/Application\ Support/speakinput/config.toml
 
 ```
 hotkey press   →  look up profile by key  →  AudioRecorder starts capturing
+                →  silence watchdog starts polling live RMS
+                →  if 0.8s of sub-threshold audio passes → auto-release
+                →  if hotkey is released manually first → cancel watchdog
 hotkey release →  AudioRecorder stops
-              →  silence gate: if RMS < threshold, skip (no hallucination)
-              →  profile.transcriber.transcribe(audio)
+              →  trim trailing silence from the buffer (30ms hops)
+              →  silence gate: if whole buffer's RMS < threshold, skip
+              →  profile.transcriber.transcribe(buffer)
               →  TypingInjector types the result (or pastes via clipboard for non-ASCII)
 ```
 

@@ -177,6 +177,57 @@ def test_with_overrides_silence_threshold():
     assert cfg.audio.silence_threshold == 0.005
 
 
+# --- auto_stop_seconds ---------------------------------------------------
+
+
+def test_default_auto_stop_seconds():
+    assert Config().audio.auto_stop_seconds == 0.8
+
+
+def test_validation_rejects_negative_auto_stop_seconds():
+    with pytest.raises(ValueError, match="auto_stop_seconds"):
+        Config(audio=AudioConfig(auto_stop_seconds=-0.1)).validate()
+
+
+def test_validation_allows_zero_auto_stop_seconds():
+    """auto_stop_seconds=0 is the documented way to disable the
+    watchdog — must validate, not error."""
+    Config(audio=AudioConfig(auto_stop_seconds=0)).validate()
+
+
+def test_with_overrides_auto_stop_seconds():
+    cfg = Config()
+    new = cfg.with_overrides(auto_stop_seconds=1.5)
+    assert new.audio.auto_stop_seconds == 1.5
+    assert cfg.audio.auto_stop_seconds == 0.8  # original untouched
+
+
+def test_cli_auto_stop_seconds_short_flag():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["-A", "1.2"])
+    assert args.auto_stop_seconds == 1.2
+
+
+def test_cli_auto_stop_seconds_long_flag():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args(["--auto-stop-seconds", "0"])
+    assert args.auto_stop_seconds == 0
+
+
+def test_cli_auto_stop_seconds_defaults_to_none():
+    from speakinput.cli import _build_parser
+
+    args = _build_parser().parse_args([])
+    assert args.auto_stop_seconds is None
+
+
+def test_from_dict_reads_auto_stop_seconds():
+    cfg = Config.from_dict({"audio": {"auto_stop_seconds": 2.0}})
+    assert cfg.audio.auto_stop_seconds == 2.0
+
+
 # --- load_config ------------------------------------------------------------
 
 

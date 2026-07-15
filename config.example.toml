@@ -71,8 +71,15 @@ beam_size = 1               # 1 = greedy (fastest); 2..10 = beam search
 
 [audio]
 sample_rate = 16000         # whisper expects 16 kHz; do not change
-silence_threshold = 0.005   # skip transcribe when audio RMS is below this
-                            # (0 disables the gate; lower = more sensitive)
+silence_threshold = 0.005   # RMS floor used by the silence gate and the
+                            # auto-stop watchdog. Audio below this is
+                            # treated as silence. 0 disables both.
+auto_stop_seconds = 0.8     # auto-stop after this many seconds of
+                            # continuous silence while the key is held.
+                            # Trailing silence is also trimmed from the
+                            # buffer before transcribe. Set to 0 to
+                            # disable — you'll keep the key held until
+                            # you release it yourself.
 # device = null             # uncomment to pin a specific input device;
                             # use `speakinput --list-devices` to see indices
 

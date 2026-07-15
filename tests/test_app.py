@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import time
 
 from speakinput.config import AudioConfig, Config, Profile
 
@@ -33,9 +34,10 @@ def _build_app(debug: bool = False, dry_run: bool = False, config: Config | None
     hotkey; override it to simulate a multi-profile setup."""
     from speakinput.app import App
 
-    config = config or Config(audio=AudioConfig(silence_threshold=0))
+    config = config or Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)  # 1s of "silence"
 
     if transcribers is None:
@@ -110,9 +112,10 @@ def test_release_silence_skips_transcribe(capsys):
     why nothing was typed."""
     from speakinput.app import App
 
-    config = Config(audio=AudioConfig(silence_threshold=0.005))
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     injector = MagicMock()
@@ -139,9 +142,10 @@ def test_release_silence_skips_transcribe(capsys):
 def test_release_silence_threshold_zero_disables_gate(capsys):
     from speakinput.app import App
 
-    config = Config(audio=AudioConfig(silence_threshold=0))
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
     transcriber = MagicMock()
     transcriber.transcribe.return_value = ""
@@ -164,9 +168,10 @@ def test_release_silence_threshold_zero_disables_gate(capsys):
 def test_release_loud_audio_passes_gate(capsys):
     from speakinput.app import App
 
-    config = Config(audio=AudioConfig(silence_threshold=0.005))
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
     recorder.stop.return_value = np.full(16000, 0.5, dtype=np.float32)
     transcriber = MagicMock()
     transcriber.transcribe.return_value = "hello"
@@ -476,7 +481,7 @@ def test_secondary_profile_press_uses_secondary_transcriber(capsys):
     from speakinput.app import App
 
     config = Config(
-        audio=AudioConfig(silence_threshold=0),
+        audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0),
         primary=Profile(key="alt_r", model="small", language="en"),
         secondary=Profile(key="cmd_r", model="small", language="zh"),
     )
@@ -488,6 +493,7 @@ def test_secondary_profile_press_uses_secondary_transcriber(capsys):
 
     recorder = MagicMock()
     recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
 
     app = App(
@@ -512,7 +518,7 @@ def test_primary_profile_press_uses_primary_transcriber(capsys):
     from speakinput.app import App
 
     config = Config(
-        audio=AudioConfig(silence_threshold=0),
+        audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0),
         primary=Profile(key="alt_r", model="small", language="en"),
         secondary=Profile(key="cmd_r", model="small", language="zh"),
     )
@@ -523,6 +529,7 @@ def test_primary_profile_press_uses_primary_transcriber(capsys):
 
     recorder = MagicMock()
     recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
     recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
 
     app = App(
@@ -726,3 +733,258 @@ def test_run_passes_initial_prompt_to_transcriber(monkeypatch):
         fake_model_cls.call_args.kwargs["initial_prompt"]
         == "kubectl apply -f deployment.yaml"
     )
+
+
+# --- auto-stop watchdog --------------------------------------------------
+
+
+def test_auto_stop_disabled_when_seconds_zero(capsys):
+    """auto_stop_seconds=0 must NOT start a watchdog — preserves the
+    old "release the key yourself" behavior."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app.on_hotkey_press(config.primary)
+    assert app._watchdog is None  # watchdog never started
+    app.on_hotkey_release(config.primary)
+
+
+def test_auto_stop_watchdog_started_when_enabled():
+    """With auto_stop_seconds > 0, on_hotkey_press creates a watchdog."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0.2))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.5  # loud -> won't trigger
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app.on_hotkey_press(config.primary)
+    try:
+        assert app._watchdog is not None
+    finally:
+        app.on_hotkey_release(config.primary)
+
+
+def test_auto_stop_watchdog_cleared_on_release():
+    """The watchdog reference is cleared after release so a fresh press
+    gets a fresh watchdog."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0.2))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.5
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+    assert app._watchdog is None
+
+
+def test_auto_stop_watchdog_fires_after_silence_window(capsys):
+    """End-to-end: with auto_stop_seconds=0.1 and current_rms() returning
+    silence, the watchdog should call on_hotkey_release within ~0.2s.
+    The transcriber then runs as if the user had released the key."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0.1))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0  # pure silence from the start
+    recorder.stop.return_value = np.full(16000, 0.5, dtype=np.float32)  # 1s of "loud" so gate passes
+    transcriber = MagicMock()
+    transcriber.transcribe.return_value = "watchdog fired"
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    # Press but DO NOT release manually — the watchdog should.
+    app.on_hotkey_press(config.primary)
+    # Wait for the watchdog to fire (auto-stop=0.1s + a poll slack).
+    deadline = time.monotonic() + 1.0
+    while transcriber.transcribe.call_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    transcriber.transcribe.assert_called_once()
+    # Injector was called with the transcriber's result.
+    app.injector.inject.assert_called_once_with("watchdog fired")
+    # Cleanup: tell the watchdog to stop (it should already be done, but
+    # make the test self-contained).
+    if app._watchdog is not None:
+        app._watchdog.stop()
+
+
+def test_auto_stop_disabled_when_silence_threshold_zero():
+    """If silence_threshold=0 the watchdog is meaningless (no audio is
+    ever 'silent'). Don't start one — saves the polling thread."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0.5))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app.on_hotkey_press(config.primary)
+    try:
+        assert app._watchdog is None
+    finally:
+        app.on_hotkey_release(config.primary)
+
+
+# --- trailing-silence trim -----------------------------------------------
+
+
+def test_release_trims_trailing_silence(capsys):
+    """When the audio buffer has a silent tail, the release path must
+    trim it down before computing the silence-gate RMS and transcribing."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
+    sr = config.audio.sample_rate
+    # 100ms of loud (RMS 0.5) followed by 200ms of silence.
+    audio = np.concatenate(
+        [np.full(sr // 10, 0.5, dtype=np.float32), np.zeros(sr // 5, dtype=np.float32)]
+    )
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.stop.return_value = audio
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+        debug=True,
+    )
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+
+    # Trim log line printed.
+    captured = capsys.readouterr()
+    assert "trimmed trailing silence" in captured.err
+    # The transcriber received a buffer that is SHORTER than the original.
+    call_audio = transcriber.transcribe.call_args.args[0]
+    assert call_audio.size < audio.size
+
+
+def test_release_does_not_trim_when_buffer_is_pure_speech(capsys):
+    """A buffer of pure loud audio should reach whisper unchanged."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
+    sr = config.audio.sample_rate
+    audio = np.full(sr // 5, 0.5, dtype=np.float32)  # 200ms loud
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.stop.return_value = audio
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+        debug=True,
+    )
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+
+    captured = capsys.readouterr()
+    assert "trimmed trailing silence" not in captured.err
+
+
+# --- banner shows auto-stop --------------------------------------------
+
+
+def test_run_banner_shows_auto_stop_seconds(monkeypatch, capsys):
+    """The startup banner must show the auto_stop_seconds value so the
+    user can verify the feature is configured as expected."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(primary=Profile(key="alt_r"))
+    config = config.with_overrides(auto_stop_seconds=1.2)
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert "auto-stop after 1.2s" in captured.err
+
+
+def test_run_banner_shows_auto_stop_off(monkeypatch, capsys):
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config(primary=Profile(key="alt_r"))
+    config = config.with_overrides(auto_stop_seconds=0)
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert "auto-stop after off" in captured.err

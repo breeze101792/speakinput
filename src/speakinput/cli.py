@@ -113,6 +113,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip transcribe when audio RMS is below this floor (0 disables, default: 0.005)",
     )
     parser.add_argument(
+        "-A",
+        "--auto-stop-seconds",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Auto-stop after this many seconds of consecutive silence while the "
+        "key is held (0 disables, default: 0.8). Trailing silence is also "
+        "trimmed from the buffer before transcribe.",
+    )
+    parser.add_argument(
         "-P",
         "--initial-prompt",
         type=str,
@@ -245,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         config = config.with_overrides(trailing_space=args.trailing_space)
     if args.silence_threshold is not None:
         config = config.with_overrides(silence_threshold=args.silence_threshold)
+    if args.auto_stop_seconds is not None:
+        config = config.with_overrides(auto_stop_seconds=args.auto_stop_seconds)
     if args.initial_prompt is not None:
         config = config.with_overrides(initial_prompt=args.initial_prompt)
 
