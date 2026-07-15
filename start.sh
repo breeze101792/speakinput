@@ -76,8 +76,10 @@ fi
 #    Use IFS= and process substitution so the path with a space
 #    ("Application Support") survives word-splitting. `read` returns 1 on
 #    EOF (no trailing newline) — that's not an error, swallow it.
-IFS= read -r user_cfg_dir < <("$PY" -c 'from platformdirs import user_config_dir; print(user_config_dir("speakinput", appauthor=False), end="")') || true
-if [[ ! -f "$user_cfg_dir/config.toml" && -f config.example.toml ]]; then
+#    Use .venv/bin/python explicitly (not $PY) so the venv's `platformdirs`
+#    is on the path; the system python won't have it installed.
+IFS= read -r user_cfg_dir < <(.venv/bin/python -c 'from platformdirs import user_config_dir; print(user_config_dir("speakinput", appauthor=False), end="")') || true
+if [[ -n "$user_cfg_dir" && ! -f "$user_cfg_dir/config.toml" && -f config.example.toml ]]; then
     if mkdir -p "$user_cfg_dir" 2>/dev/null; then
         cp config.example.toml "$user_cfg_dir/config.toml"
         log "created $user_cfg_dir/config.toml from config.example.toml"
