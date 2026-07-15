@@ -229,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     acquire_instance_lock()
 
     try:
-        config = load_config(args.config)
+        config, config_source = load_config(args.config)
     except Exception as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 1
@@ -248,7 +248,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.diagnose:
         return _diagnose(config)
 
-    app = App(config, dry_run=args.no_inject, debug=args.debug)
+    app = App(
+        config,
+        dry_run=args.no_inject,
+        debug=args.debug,
+        config_source=config_source,
+    )
     try:
         app.run()
     except KeyboardInterrupt:

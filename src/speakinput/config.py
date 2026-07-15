@@ -183,19 +183,22 @@ def default_config_path() -> Path:
     return Path(user_config_dir(APP_NAME, appauthor=False)) / "config.toml"
 
 
-def load_config(path: Path | None = None) -> Config:
+def load_config(path: Path | None = None) -> tuple["Config", Path | None]:
     """Load config from `path`, falling back to the user config dir.
 
-    If the resolved file is missing, returns a `Config()` populated with
-    the hard-coded defaults — every value matches what's in
-    `config.example.toml`. The program does not auto-write a config file;
-    the user runs `./start.sh` (which copies the example on first run)
-    or `cp config.example.toml ~/.config/speakinput/config.toml`.
+    Returns ``(config, source_path)``. If the resolved file is missing,
+    returns ``(Config(), None)`` — the dataclass defaults. The program
+    does not auto-write a config file; the user runs `./start.sh` (which
+    copies the example on first run) or
+    `cp config.example.toml ~/.config/speakinput/config.toml`.
+
+    The returned `source_path` is non-None when a user-edited file was
+    read, None when the program is running on its baked-in defaults.
     """
     resolved = path or default_config_path()
     if not resolved.exists():
-        return Config()
+        return Config(), None
     cfg = Config.from_toml(resolved)
     cfg.validate()
-    return cfg
+    return cfg, resolved
 

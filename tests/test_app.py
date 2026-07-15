@@ -462,13 +462,44 @@ def test_run_prints_startup_banner(monkeypatch, capsys):
     app.run()
 
     captured = capsys.readouterr()
+    assert "[startup] config   : (defaults — no config.toml found)" in captured.err
     assert "[startup] model    : small" in captured.err
     assert "[startup] language : auto" in captured.err
     assert "[startup] hotkey   : alt_r" in captured.err
     assert "[startup] sample   :" in captured.err
     assert "[startup] silence  :" in captured.err
-    assert "[startup] prompt   : on" in captured.err  # default is the embedded-vocab bias
+    assert "[startup] prompt   :" in captured.err  # default is the embedded-vocab bias; full prompt follows
     assert "[startup] inject   :" in captured.err
+
+
+def test_run_banner_shows_config_source_when_file_loaded(monkeypatch, capsys, tmp_path):
+    """When the config was loaded from a file, the banner must show the
+    source path so the user can verify the right file is being read."""
+    from pathlib import Path
+
+    from speakinput.app import App
+    from speakinput.config import Config
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+
+    config = Config()
+    config_path = Path("/Users/me/Library/Application Support/speakinput/config.toml")
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        injector=MagicMock(),
+        feedback=MagicMock(),
+        config_source=config_path,
+    )
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert f"[startup] config   : {config_path}" in captured.err
+    assert "(defaults" not in captured.err
 
 
 def test_run_passes_initial_prompt_to_transcriber(monkeypatch):

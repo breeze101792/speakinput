@@ -99,15 +99,17 @@ def test_with_overrides_does_not_mutate_original():
 
 
 def test_load_config_returns_defaults_when_missing(tmp_path: Path):
-    """No file at the path? Return a Config() populated with the dataclass
-    defaults. The program must not auto-write anything; the user copies
-    config.example.toml themselves (or via start.sh)."""
+    """No file at the path? Return (Config(), None) — defaults plus a None
+    source path so the banner can show 'no config.toml found'. The program
+    must not auto-write anything; the user copies config.example.toml
+    themselves (or via start.sh)."""
     path = tmp_path / "config.toml"
     assert not path.exists()
-    cfg = load_config(path)
+    cfg, source = load_config(path)
     assert cfg.stt.model == "small"
     assert cfg.stt.language == "auto"
     assert cfg.hotkey.key == "alt_r"
+    assert source is None
     # The path must still be absent — load_config never touches the filesystem.
     assert not path.exists()
 
@@ -118,9 +120,26 @@ def test_load_config_reads_existing(tmp_path: Path):
         '[stt]\nmodel = "tiny.en"\nlanguage = "en"\n',
         encoding="utf-8",
     )
-    cfg = load_config(path)
+    cfg, source = load_config(path)
     assert cfg.stt.model == "tiny.en"
     assert cfg.stt.language == "en"
+    assert source == path
+
+
+def test_load_config_explicit_none_path_uses_default(tmp_path: Path, monkeypatch):
+    """Calling load_config() with no argument must resolve to
+    default_config_path() — that way the banner shows the same path
+    the user would see in --help, and CLI `-c` overrides win when set.
+    """
+    target = tmp_path / "explicit_default.toml"
+    target.write_text('[stt]\nmodel = "medium"\n', encoding="utf-8")
+    # When default_config_path() is called, return our test path.
+    monkeypatch.setattr(
+        "speakinput.config.default_config_path", lambda: target
+    )
+    cfg, source = load_config()
+    assert cfg.stt.model == "medium"
+    assert source == target
 
 
 # --- multilingual / Chinese support ---------------------------------------

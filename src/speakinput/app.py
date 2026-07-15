@@ -7,6 +7,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 
 from speakinput.audio import AudioRecorder
 from speakinput.config import Config
@@ -40,8 +41,14 @@ class App:
         feedback: Feedback | None = None,
         dry_run: bool = False,
         debug: bool = False,
+        config_source: Path | None = None,
     ) -> None:
         self.config = config
+        # Path the config was loaded from, or None when running on
+        # baked-in defaults (no user-edited file was found). Surfaced in
+        # the startup banner so the user can verify whether their
+        # config.toml is actually being read.
+        self.config_source = config_source
         self.recorder = recorder or AudioRecorder(
             sample_rate=config.audio.sample_rate,
             device=config.audio.device,
@@ -206,7 +213,12 @@ class App:
         threshold = cfg.audio.silence_threshold
         threshold_str = "off" if threshold == 0 else f"{threshold:g}"
         prompt_str = "off" if not cfg.stt.initial_prompt else repr(cfg.stt.initial_prompt)
+        if self.config_source is not None:
+            source_str = str(self.config_source)
+        else:
+            source_str = "(defaults — no config.toml found)"
         lines = [
+            f"config   : {source_str}",
             f"model    : {cfg.stt.model}",
             f"language : {cfg.stt.language}",
             f"hotkey   : {cfg.hotkey.key}",
