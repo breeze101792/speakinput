@@ -27,13 +27,18 @@ cd "$(dirname "$0")"
 HOSTNAME_SHORT=$(hostname -s 2>/dev/null || hostname)
 VENV_DIR=".venv_${HOSTNAME_SHORT}"
 
-log() { printf '\033[1;34m[setup.sh]\033[0m %s\n' "$*"; }
+# All script status output goes to stderr. stdout is reserved for
+# data the script returns (e.g. the picker echoes the chosen backend
+# so the caller can do `BACKEND=$(pick_backend ...)`). This way the
+# status messages never leak into command substitution.
+log() { printf '\033[1;34m[setup.sh]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[setup.sh]\033[0m %s\n' "$*" >&2; }
 err() { printf '\033[1;31m[setup.sh]\033[0m %s\n' "$*" >&2; }
-step() { printf '\033[1;36m[setup.sh]\033[0m ▶ %s\n' "$*"; }
-ok() { printf '\033[1;32m[setup.sh]\033[0m ✓ %s\n' "$*"; }
+step() { printf '\033[1;36m[setup.sh]\033[0m ▶ %s\n' "$*" >&2; }
+ok() { printf '\033[1;32m[setup.sh]\033[0m ✓ %s\n' "$*" >&2; }
 
 DRY_RUN=0
+BACKEND_OVERRIDE=""
 
 usage() {
     cat <<EOF
@@ -54,6 +59,7 @@ that this script installs into).
 Usage:
     ./setup.sh [--help|-h|help]
     ./setup.sh [--dry-run]
+    ./setup.sh [--backend BACKEND]
 
 Options:
     --help, -h, help   Print this message and exit.
@@ -64,6 +70,13 @@ Options:
                        Note: this script is fundamentally interactive
                        (it asks before every install), so --dry-run is
                        the only way to use it from CI.
+    --backend BACKEND  Skip the backend picker and use BACKEND directly.
+                       One of: cuda | vulkan | coreml | cpu.
+                       Example: --backend vulkan on an NVIDIA box when
+                       the CUDA build is broken (e.g. CUDA 13 vs older
+                       whisper.cpp source). If --backend isn't given,
+                       the script auto-detects and then asks you to
+                       confirm or override.
 
 This script is interactive-only. It NEVER touches the system Python —
 every pip operation goes into the project's venv ($VENV_DIR). System
@@ -72,17 +85,25 @@ asked about at TWO levels: first our [y/n/a] prompt, then the
 package manager's own 'Proceed with installation? [Y/n]' prompt.
 Answer 'n' at either level to skip that step, 'a' to abort.
 
-If you have already reviewed the plan once and just want to re-run
-the rebuild on the same machine, answer 'y' at our prompt and then
-'Y' at pacman/apt/dnf's prompt — that's two confirmations for two
-different systems that will both be changing your machine.
-
 After a successful run, restart with ./start.sh. The startup banner
 should now report the GPU backend instead of "cpu".
 EOF
 }
 
 # --- arg parsing ----------------------------------------------------------
+# Note: --backend BACKEND consumes two argv slots. We handle it
+# before the single-arg case dispatch so the value isn't matched
+# against the single-arg patterns below.
+if [[ "${1:-}" == "--backend" ]]; then
+    if [[ -z "${2:-}" ]]; then
+        err "--backend requires a value: cuda | vulkan | coreml | cpu"
+        usage >&2
+        exit 2
+    fi
+    BACKEND_OVERRIDE=$2
+    shift 2
+fi
+
 case "${1:-}" in
     --help|-h|help)
         usage
@@ -90,6 +111,11 @@ case "${1:-}" in
         ;;
     --dry-run)
         DRY_RUN=1
+        ;;
+    --backend)
+        err "--backend requires a value: cuda | vulkan | coreml | cpu"
+        usage >&2
+        exit 2
         ;;
     "")
         ;;
@@ -99,6 +125,19 @@ case "${1:-}" in
         exit 2
         ;;
 esac
+
+# Validate the --backend value up front. The picker would also
+# catch this but failing fast on a CLI mistake is friendlier.
+if [[ -n "$BACKEND_OVERRIDE" ]]; then
+    case "$BACKEND_OVERRIDE" in
+        cuda|vulkan|coreml|cpu) ;;
+        *)
+            err "invalid --backend value: '$BACKEND_OVERRIDE'"
+            err "expected one of: cuda | vulkan | coreml | cpu"
+            exit 2
+            ;;
+    esac
+fi
 
 # --- helpers --------------------------------------------------------------
 
@@ -275,7 +314,7 @@ prompt_gpu() {
     # interactive input — which is the right behavior).
     local reply
     if [[ -r /dev/tty ]]; then
-        read -r -p "No GPU detected. Pick a backend: [n]vidia [a]md [i]ntel [s]kip CPU? " reply < /dev/tty
+        read -r -p "No GPU detected. Pick a vendor: [n]vidia [a]md [i]ntel [s]kip CPU? " reply < /dev/tty
     else
         warn "no GPU detected and no TTY available — defaulting to CPU-only"
         echo skip
@@ -288,6 +327,129 @@ prompt_gpu() {
         s|S|skip|"")       echo skip ;;
         *)                 warn "unrecognized answer '$reply' — defaulting to skip"; echo skip ;;
     esac
+}
+
+# Map a detected vendor to the suggested backend. This is *only* a
+# suggestion; the user can pick a different backend via the picker.
+suggest_backend_for_vendor() {
+    case "$1" in
+        nvidia) echo cuda ;;
+        apple)  echo coreml ;;
+        amd|intel|arm|unknown) echo vulkan ;;
+        *)      echo cpu ;;
+    esac
+}
+
+pick_backend() {
+    # The user always gets the final say. We show the auto-detected
+    # GPU, the suggested backend based on it, and let them either
+    # confirm the suggestion or pick a different backend. The vendor
+    # (which determines which system packages we install) is set
+    # independently and is NOT changed by the picker — even if you
+    # pick 'vulkan' on an NVIDIA box, we still install nvidia-utils
+    # + vulkan-icd-loader (you need both for vulkan to work on
+    # NVIDIA hardware).
+    local vendor=$1
+    local suggested
+    suggested=$(suggest_backend_for_vendor "$vendor")
+
+    # --backend flag overrides the picker entirely. Useful for
+    # scripting and for users who already know what they want.
+    if [[ -n "$BACKEND_OVERRIDE" ]]; then
+        log "backend override from --backend flag: $BACKEND_OVERRIDE"
+        if [[ "$BACKEND_OVERRIDE" != "$suggested" ]]; then
+            warn "user-chosen backend '$BACKEND_OVERRIDE' differs from"
+            warn "auto-suggested '$suggested' for vendor '$vendor'"
+            if [[ "$vendor" == "nvidia" && "$BACKEND_OVERRIDE" == "vulkan" ]]; then
+                log "this is a common choice when the CUDA build is broken"
+            fi
+        fi
+        echo "$BACKEND_OVERRIDE"
+        return
+    fi
+
+    # In --dry-run mode, just return the suggestion silently.
+    # The main pipeline already prints "GPU=$GPU backend=$BACKEND"
+    # in its plan; we don't need to repeat it inside the picker.
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "$suggested"
+        return
+    fi
+
+    if [[ ! -r /dev/tty ]]; then
+        warn "no TTY for the backend picker — using suggested backend: $suggested"
+        echo "$suggested"
+        return
+    fi
+
+    # Build a list of options. We always offer 'cpu' as an escape
+    # hatch (sometimes the user just wants to opt out). 'coreml' is
+    # only offered on macOS.
+    local options=("c)uda" "v)ulkan" "cpu (skip GPU)")
+    if [[ "$PLATFORM" == "macos" ]]; then
+        options=("c)uda" "m)etal/coreml" "v)ulkan" "cpu (skip GPU)")
+    fi
+
+    local reply
+    while true; do
+        # Show what's on the table. The user can confirm the
+        # suggestion (Enter / y) or pick a different letter.
+        # /dev/tty writes are wrapped in `|| true` so a sandboxed
+        # environment (where /dev/tty exists but isn't openable)
+        # prints its own "can't read" error and falls back, instead
+        # of spamming the user with bash errors.
+        printf '\n' > /dev/tty 2>/dev/null || true
+        log "GPU vendor: $vendor"
+        log "Suggested backend: $suggested"
+        log "Available backends on this platform:"
+        local opt
+        for opt in "${options[@]}"; do
+            printf '  %s\n' "$opt" > /dev/tty 2>/dev/null || true
+        done
+        printf 'Which backend? [Enter = %s, or type one of the letters above] ' "$suggested" > /dev/tty 2>/dev/null || {
+            warn "couldn't write to /dev/tty — using suggested: $suggested"
+            echo "$suggested"
+            return
+        }
+        if ! read -r reply < /dev/tty 2>/dev/null; then
+            warn "couldn't read from /dev/tty — using suggested: $suggested"
+            echo "$suggested"
+            return
+        fi
+
+        # Empty / 'y' / 'yes' → confirm the suggestion
+        case "${reply:-}" in
+            ""|y|Y|yes|YES)
+                echo "$suggested"
+                return
+                ;;
+            c|C|cuda|CUDA)
+                echo cuda
+                return
+                ;;
+            v|V|vulkan|VULKAN)
+                echo vulkan
+                return
+                ;;
+            m|M|coreml|COREML|metal|METAL)
+                if [[ "$PLATFORM" == "macos" ]]; then
+                    echo coreml
+                    return
+                else
+                    printf '   coreml is macOS-only — pick another option\n' > /dev/tty 2>/dev/null || true
+                    continue
+                fi
+                ;;
+            cpu|CPU)
+                echo cpu
+                return
+                ;;
+            *)
+                printf '   unrecognized: %s\n' "$reply" > /dev/tty 2>/dev/null || true
+                printf '   press Enter to accept the suggested backend, or type c / v / cpu\n' > /dev/tty 2>/dev/null || true
+                ;;
+        esac
+    done
 }
 
 # --- 2. install runtime libs per distro -----------------------------------
@@ -565,19 +727,23 @@ if [[ "$GPU" == "unknown" ]]; then
     GPU=$(prompt_gpu)
 fi
 
-case "$GPU" in
-    nvidia) BACKEND=cuda;   ENV_DESC="GGML_CUDA=1" ;;
-    amd)    BACKEND=vulkan; ENV_DESC="GGML_VULKAN=1" ;;
-    intel)  BACKEND=vulkan; ENV_DESC="GGML_VULKAN=1" ;;
-    arm)    BACKEND=vulkan; ENV_DESC="GGML_VULKAN=1" ;;
-    apple)  BACKEND=coreml; ENV_DESC="WHISPER_COREML=1" ;;
-    skip)
-        log "no GPU install performed — pywhispercpp will stay CPU-only"
-        log "re-run with a vendor if you change your mind"
+# The user picks the backend *now*. We suggest one based on the
+# detected vendor, but the user can pick any of cuda / vulkan /
+# coreml / cpu. The vendor (which determines the runtime install)
+# stays as $GPU; only the backend changes.
+BACKEND=$(pick_backend "$GPU")
+
+case "$BACKEND" in
+    cuda)   ENV_DESC="GGML_CUDA=1" ;;
+    vulkan) ENV_DESC="GGML_VULKAN=1" ;;
+    coreml) ENV_DESC="WHISPER_COREML=1" ;;
+    cpu)
+        log "backend=cpu (skip GPU) — nothing to install or rebuild"
+        log "the shipped CPU-only wheel will be used as-is"
         exit 0
         ;;
     *)
-        err "unhandled GPU: $GPU"
+        err "unhandled backend: $BACKEND"
         exit 1
         ;;
 esac
@@ -587,11 +753,15 @@ log "GPU=$GPU  backend=$BACKEND  env=$ENV_DESC"
 require_venv
 
 # Step 1: runtime libs.
-step "installing $BACKEND runtime (vendor=$GPU, pkg_mgr=$PKG_MGR)"
+step "installing GPU runtime (vendor=$GPU, pkg_mgr=$PKG_MGR, backend=$BACKEND)"
 # Print a preview of what the next step will try to install so the
 # user sees it in the log before any confirm prompt fires. The
-# actual command line is built per-distro and shown again in the
-# confirm() prompt, but a one-liner up front helps with scrollback.
+# packages here are determined by the VENDOR, not the backend:
+# the nvidia-utils driver is needed for both CUDA and Vulkan on
+# NVIDIA, vulkan-radeon is needed for both CUDA and Vulkan on AMD,
+# etc. The actual backend (CUDA vs Vulkan vs CoreML) is selected
+# at the pip-rebuild step. So we install the right driver and
+# loader regardless of which backend the user picked.
 case "$GPU:$PKG_MGR" in
     nvidia:pacman) log "will install via pacman: cuda nvidia-utils vulkan-icd-loader (if not present)" ;;
     nvidia:apt)    log "will install via apt:    nvidia-cuda-toolkit nvidia-driver-535 vulkan-loader (if not present)" ;;

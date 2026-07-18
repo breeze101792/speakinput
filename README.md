@@ -53,12 +53,27 @@ If you see `cpu` on Linux and you have a GPU, follow the install instructions be
 
 Run `./setup.sh` once after `./start.sh`. It auto-detects the GPU vendor (via `lspci` on Linux, `system_profiler` on macOS) and the system package manager, installs the right runtime (CUDA toolkit, Vulkan ICD, or CoreML on Apple Silicon), then rebuilds `pywhispercpp` against the matching backend. The script is idempotent — re-running is safe — and is **interactive-only**: it asks before every mutating step at *two* levels, first its own `[y/n/a]` prompt, then the package manager's own `Proceed with installation? [Y/n]` prompt. There is no `--yes` / `--noconfirm` / `-y` flag, by design — the user is asked every time, on every install, and the package manager's prompt is never bypassed. `pip install` always goes into the project's per-host venv (`$VENV_DIR`); the system Python is never touched.
 
-```bash
-./setup.sh            # auto-detect, prompt before each install
-./setup.sh --dry-run  # preview the plan, no installs (the only way to use it from CI)
+The script also lets you **pick the backend** explicitly. After auto-detection prints `GPU=nvidia, suggested backend=cuda`, you see a prompt like:
+
+```
+Which backend? [Enter = cuda, or type one of the letters above]
 ```
 
-If `./setup.sh` can't auto-detect (e.g. you're on a headless box, or the GPU is a niche vendor), it'll prompt you for the backend. Or fall back to the manual recipe below.
+Press Enter to accept the suggestion, or type `v` (Vulkan), `c` (CUDA), `m` (CoreML on macOS), or `cpu` (skip GPU entirely). The vendor (which determines which system packages get installed) is detected automatically; only the backend is up to you. This is useful when:
+
+- The auto-suggested backend is broken on your system (e.g. CUDA 13 vs older whisper.cpp source — pick Vulkan on an NVIDIA box).
+- You're on Apple Silicon and want CUDA-style throughput via Metal instead of CoreML.
+- You just want to skip GPU on this machine.
+
+```bash
+./setup.sh                       # auto-detect, prompt for backend, then prompt for each install
+./setup.sh --backend vulkan      # skip the backend prompt, use Vulkan directly
+./setup.sh --backend cuda        # force CUDA (e.g. for testing)
+./setup.sh --backend cpu         # skip GPU entirely, use the shipped CPU wheel
+./setup.sh --dry-run             # preview the plan, no installs (the only way to use it from CI)
+```
+
+If `./setup.sh` can't auto-detect (e.g. you're on a headless box, or the GPU is a niche vendor), it'll prompt you for the vendor too. Or fall back to the manual recipe below.
 
 ### Pick a backend
 
@@ -71,6 +86,8 @@ If `./setup.sh` can't auto-detect (e.g. you're on a headless box, or the GPU is 
 | HIP/ROCm | Older AMD discrete | AMD only |
 
 Pick the first row that matches your hardware. CUDA is the fastest on NVIDIA, Vulkan is the universal fallback. (OpenVINO is listed for Intel hardware but is not auto-probed by this app yet — see [v2 follow-ups](#v2-follow-ups-not-in-this-release).)
+
+`./setup.sh` suggests the first row that matches your hardware, but you can override at the backend prompt or via `--backend` — see [Quick setup](#quick-setup-recommended) above. The recipes below are the manual fallback for users who want fine-grained control.
 
 ### Install commands (Arch Linux)
 
