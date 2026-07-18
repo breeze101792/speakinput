@@ -12,12 +12,13 @@
 # - Idempotent: re-running skips already-installed packages and the pip
 #   rebuild is `--force-reinstall --no-cache` so it's the same wall-clock
 #   cost the first time and the second time.
-# - Prompts before every mutating step. Nothing happens silently —
-#   the user is asked before any `sudo` or `pip install`. Pass
-#   `--yes` to skip the prompts (e.g. for CI after a `--dry-run`
-#   review), `--dry-run` to print the plan without doing anything.
+# - Asks before every mutating step — both at the script level (our
+#   own [y/n/a] prompt for each install) and at the package-manager
+#   level (pacman/apt/dnf's own 'Proceed?' prompt, with no
+#   --noconfirm / -y flags). The user sees what's about to change
+#   and gets to confirm twice. This script is interactive-only.
 #
-# Usage: ./setup.sh [--help] [--dry-run] [--yes]
+# Usage: ./setup.sh [--help] [--dry-run]
 
 set -euo pipefail
 
@@ -33,7 +34,6 @@ step() { printf '\033[1;36m[setup.sh]\033[0m ▶ %s\n' "$*"; }
 ok() { printf '\033[1;32m[setup.sh]\033[0m ✓ %s\n' "$*"; }
 
 DRY_RUN=0
-ASSUME_YES=0
 
 usage() {
     cat <<EOF
@@ -54,24 +54,28 @@ that this script installs into).
 Usage:
     ./setup.sh [--help|-h|help]
     ./setup.sh [--dry-run]
-    ./setup.sh [--yes|-y]
 
 Options:
     --help, -h, help   Print this message and exit.
     --dry-run          Print the plan and exit without installing anything.
-                       Useful for: (a) previewing what the script will do
-                       on this box, (b) running in CI where the actual
-                       install would fail anyway.
-    --yes, -y          Skip the "install this?" prompts. Mutating steps
-                       (system package install, pip rebuild) still run,
-                       just without asking. Use this once you've
-                       reviewed the --dry-run plan.
+                       Useful for previewing what the script will do on
+                       this box, or for running in a non-interactive
+                       environment where the install would fail anyway.
+                       Note: this script is fundamentally interactive
+                       (it asks before every install), so --dry-run is
+                       the only way to use it from CI.
 
-This script will NEVER touch the system Python. Every pip operation
-goes into the project's venv ($VENV_DIR). System package installs
-(CUDA toolkit, Vulkan ICDs) DO require sudo and are prompted before
-each step — answer 'n' to skip that step, 'a' to abort the whole
-script.
+This script is interactive-only. It NEVER touches the system Python —
+every pip operation goes into the project's venv ($VENV_DIR). System
+package installs (CUDA toolkit, Vulkan ICDs) require sudo and are
+asked about at TWO levels: first our [y/n/a] prompt, then the
+package manager's own 'Proceed with installation? [Y/n]' prompt.
+Answer 'n' at either level to skip that step, 'a' to abort.
+
+If you have already reviewed the plan once and just want to re-run
+the rebuild on the same machine, answer 'y' at our prompt and then
+'Y' at pacman/apt/dnf's prompt — that's two confirmations for two
+different systems that will both be changing your machine.
 
 After a successful run, restart with ./start.sh. The startup banner
 should now report the GPU backend instead of "cpu".
@@ -87,9 +91,6 @@ case "${1:-}" in
     --dry-run)
         DRY_RUN=1
         ;;
-    --yes|-y)
-        ASSUME_YES=1
-        ;;
     "")
         ;;
     *)
@@ -98,13 +99,6 @@ case "${1:-}" in
         exit 2
         ;;
 esac
-
-# In --dry-run mode, implicitly assume yes too — the whole point is
-# to print the plan as if it ran. Without this, every prompt would
-# block on /dev/null and the dry-run would hang in non-TTY contexts.
-if [[ $DRY_RUN -eq 1 ]]; then
-    ASSUME_YES=1
-fi
 
 # --- helpers --------------------------------------------------------------
 
@@ -117,27 +111,28 @@ run() {
     fi
 }
 
-# Ask the user before a mutating step. Honors --yes/--dry-run. The
-# only valid answers are y / n / a:
+# Ask the user before a mutating step. ALWAYS interactive in real-run
+# mode — there is no --yes flag, on purpose. The user wants to be
+# asked every time. --dry-run mode never prompts (it just prints
+# the plan), so CI can still get a useful preview.
+#
+# Only valid answers are y / n / a:
 #   y = run it
 #   n = skip this step (continue script)
 #   a = abort the whole script
 # Anything else re-prompts. The loop is the right shape: the user
 # might fat-finger or be unsure, and we don't want a stray "y" to
 # nuke their system. /dev/tty so this still works under
-# `curl | bash` style invocations.
+# `curl | bash` style invocations (where stdin is the pipe).
 confirm() {
     local prompt=$1
-    if [[ $ASSUME_YES -eq 1 ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
         return 0
     fi
-    # TTY check must come BEFORE any /dev/tty I/O so we don't fail
-    # under `set -u` or in non-interactive pipelines. Under
-    # `curl | bash` there's no TTY at all; we want a clear error
-    # rather than a bash crash.
     if [[ ! -r /dev/tty ]]; then
-        err "no TTY available — re-run with --yes if you want to skip prompts"
-        err "(or answer them on a real terminal)"
+        err "no TTY available — interactive prompt can't be shown"
+        err "this script is interactive-only; run it on a real terminal"
+        err "(use --dry-run to print the plan without installing)"
         return 1
     fi
     local reply
@@ -145,14 +140,11 @@ confirm() {
         # `printf` rather than `echo` so the prompt isn't subject to
         # the user's shell aliases for echo.
         if ! printf '%s [y/n/a] ' "$prompt" > /dev/tty; then
-            # /dev/tty exists but isn't actually openable (e.g. a
-            # sandboxed harness, or running under `nohup`). Bail
-            # out with a clear error rather than spinning forever.
-            err "cannot write to /dev/tty — re-run with --yes on a real terminal"
+            err "cannot write to /dev/tty — run this script on a real terminal"
             return 1
         fi
         if ! read -r reply < /dev/tty; then
-            err "cannot read from /dev/tty — re-run with --yes on a real terminal"
+            err "cannot read from /dev/tty — run this script on a real terminal"
             return 1
         fi
         case "$reply" in
@@ -169,10 +161,13 @@ confirm() {
 
 # Confirm-then-run for system package installs. These are the only
 # step that needs sudo, so we surface that explicitly in the prompt
-# — the user has to know they'll be entering their password. If
-# confirm returns 1 (no), we print a warning and return 0 so the
-# caller can continue; the caller is expected to detect that the
-# install was skipped.
+# — the user has to know they'll be entering their password. We do
+# NOT pass --noconfirm / -y to the package manager: the package
+# manager's own "Proceed with installation? [Y/n]" prompt fires
+# after our prompt, so the user is asked twice, at two different
+# layers. That's intentional — that's what "ask every time" means.
+# If confirm returns 1 (no), we print a warning and the caller
+# can continue.
 confirm_run() {
     local cmd_summary=$1
     shift
@@ -307,9 +302,9 @@ ensure_lspci() {
         return 1
     fi
     case "$PKG_MGR" in
-        pacman) confirm_run "sudo pacman -S --noconfirm --needed pciutils" sudo pacman -S --noconfirm --needed pciutils ;;
-        apt)    confirm_run "sudo apt install -y pciutils"               sudo apt install -y pciutils ;;
-        dnf)    confirm_run "sudo dnf install -y pciutils"               sudo dnf install -y pciutils ;;
+        pacman) confirm_run "sudo pacman -S --needed pciutils" sudo pacman -S --needed pciutils ;;
+        apt)    confirm_run "sudo apt install pciutils"               sudo apt install pciutils ;;
+        dnf)    confirm_run "sudo dnf install pciutils"               sudo dnf install pciutils ;;
     esac
 }
 
@@ -334,8 +329,8 @@ install_arch() {
             pkg_installed_pacman nvidia-utils || pkgs+=(nvidia-utils)
             pkg_installed_pacman vulkan-icd-loader || pkgs+=(vulkan-icd-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo pacman -S --noconfirm --needed ${pkgs[*]}" \
-                    sudo pacman -S --noconfirm --needed "${pkgs[@]}"
+                confirm_run "sudo pacman -S --needed ${pkgs[*]}" \
+                    sudo pacman -S --needed "${pkgs[@]}"
             else
                 ok "Arch NVIDIA runtime already installed"
             fi
@@ -345,8 +340,8 @@ install_arch() {
             pkg_installed_pacman vulkan-radeon      || pkgs+=(vulkan-radeon)
             pkg_installed_pacman vulkan-icd-loader  || pkgs+=(vulkan-icd-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo pacman -S --noconfirm --needed ${pkgs[*]}" \
-                    sudo pacman -S --noconfirm --needed "${pkgs[@]}"
+                confirm_run "sudo pacman -S --needed ${pkgs[*]}" \
+                    sudo pacman -S --needed "${pkgs[@]}"
             else
                 ok "Arch AMD runtime already installed"
             fi
@@ -356,8 +351,8 @@ install_arch() {
             pkg_installed_pacman vulkan-intel      || pkgs+=(vulkan-intel)
             pkg_installed_pacman vulkan-icd-loader || pkgs+=(vulkan-icd-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo pacman -S --noconfirm --needed ${pkgs[*]}" \
-                    sudo pacman -S --noconfirm --needed "${pkgs[@]}"
+                confirm_run "sudo pacman -S --needed ${pkgs[*]}" \
+                    sudo pacman -S --needed "${pkgs[@]}"
             else
                 ok "Arch Intel runtime already installed"
             fi
@@ -367,8 +362,8 @@ install_arch() {
             pkg_installed_pacman vulkan-mali       || pkgs+=(vulkan-mali)
             pkg_installed_pacman vulkan-icd-loader || pkgs+=(vulkan-icd-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo pacman -S --noconfirm --needed ${pkgs[*]}" \
-                    sudo pacman -S --noconfirm --needed "${pkgs[@]}"
+                confirm_run "sudo pacman -S --needed ${pkgs[*]}" \
+                    sudo pacman -S --needed "${pkgs[@]}"
             else
                 ok "Arch ARM/Mali runtime already installed"
             fi
@@ -385,8 +380,8 @@ install_deb() {
             pkg_installed_apt nvidia-driver-535   || pkgs+=(nvidia-driver-535)
             pkg_installed_apt vulkan-loader       || pkgs+=(vulkan-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo apt install -y ${pkgs[*]}" \
-                    sudo apt install -y "${pkgs[@]}"
+                confirm_run "sudo apt install ${pkgs[*]}" \
+                    sudo apt install "${pkgs[@]}"
             else
                 ok "Debian/Ubuntu NVIDIA runtime already installed"
             fi
@@ -396,8 +391,8 @@ install_deb() {
             pkg_installed_apt mesa-vulkan-drivers || pkgs+=(mesa-vulkan-drivers)
             pkg_installed_apt vulkan-loader       || pkgs+=(vulkan-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo apt install -y ${pkgs[*]}" \
-                    sudo apt install -y "${pkgs[@]}"
+                confirm_run "sudo apt install ${pkgs[*]}" \
+                    sudo apt install "${pkgs[@]}"
             else
                 ok "Debian/Ubuntu Vulkan runtime already installed"
             fi
@@ -407,8 +402,8 @@ install_deb() {
             pkg_installed_apt mesa-vulkan-drivers || pkgs+=(mesa-vulkan-drivers)
             pkg_installed_apt vulkan-loader       || pkgs+=(vulkan-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo apt install -y ${pkgs[*]}" \
-                    sudo apt install -y "${pkgs[@]}"
+                confirm_run "sudo apt install ${pkgs[*]}" \
+                    sudo apt install "${pkgs[@]}"
             else
                 ok "Debian/Ubuntu Vulkan runtime already installed"
             fi
@@ -425,8 +420,8 @@ install_fedora() {
             pkg_installed_dnf akmod-nvidia || pkgs+=(akmod-nvidia)
             pkg_installed_dnf vulkan-loader || pkgs+=(vulkan-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo dnf install -y ${pkgs[*]}" \
-                    sudo dnf install -y "${pkgs[@]}"
+                confirm_run "sudo dnf install ${pkgs[*]}" \
+                    sudo dnf install "${pkgs[@]}"
             else
                 ok "Fedora NVIDIA runtime already installed"
             fi
@@ -436,8 +431,8 @@ install_fedora() {
             pkg_installed_dnf mesa-vulkan-drivers || pkgs+=(mesa-vulkan-drivers)
             pkg_installed_dnf vulkan-loader        || pkgs+=(vulkan-loader)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
-                confirm_run "sudo dnf install -y ${pkgs[*]}" \
-                    sudo dnf install -y "${pkgs[@]}"
+                confirm_run "sudo dnf install ${pkgs[*]}" \
+                    sudo dnf install "${pkgs[@]}"
             else
                 ok "Fedora Vulkan runtime already installed"
             fi

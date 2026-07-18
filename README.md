@@ -51,15 +51,12 @@ If you see `cpu` on Linux and you have a GPU, follow the install instructions be
 
 ### Quick setup (recommended)
 
-Run `./setup.sh` once after `./start.sh`. It auto-detects the GPU vendor (via `lspci` on Linux, `system_profiler` on macOS) and the system package manager, installs the right runtime (CUDA toolkit, Vulkan ICD, or CoreML on Apple Silicon), then rebuilds `pywhispercpp` against the matching backend. The script is idempotent — re-running is safe — and asks before every mutating step (`sudo` package installs, the `pip install` rebuild). Use `--yes` to skip the prompts after a `--dry-run` review, or `--dry-run` alone to print the plan without installing anything.
+Run `./setup.sh` once after `./start.sh`. It auto-detects the GPU vendor (via `lspci` on Linux, `system_profiler` on macOS) and the system package manager, installs the right runtime (CUDA toolkit, Vulkan ICD, or CoreML on Apple Silicon), then rebuilds `pywhispercpp` against the matching backend. The script is idempotent — re-running is safe — and is **interactive-only**: it asks before every mutating step at *two* levels, first its own `[y/n/a]` prompt, then the package manager's own `Proceed with installation? [Y/n]` prompt. There is no `--yes` / `--noconfirm` / `-y` flag, by design — the user is asked every time, on every install, and the package manager's prompt is never bypassed. `pip install` always goes into the project's per-host venv (`$VENV_DIR`); the system Python is never touched.
 
 ```bash
 ./setup.sh            # auto-detect, prompt before each install
-./setup.sh --dry-run  # preview the plan, no installs
-./setup.sh --yes      # auto-yes to every prompt (after a --dry-run review)
+./setup.sh --dry-run  # preview the plan, no installs (the only way to use it from CI)
 ```
-
-The script installs `pywhispercpp` into the project's per-host venv (`$VENV_DIR`) only — the system Python is never touched. System package installs (CUDA toolkit, Vulkan ICDs) DO require `sudo` and are prompted before each step. Answer `n` to skip a step, `a` to abort the whole script.
 
 If `./setup.sh` can't auto-detect (e.g. you're on a headless box, or the GPU is a niche vendor), it'll prompt you for the backend. Or fall back to the manual recipe below.
 
@@ -143,7 +140,7 @@ n_threads = 0       # CPU threads for the CPU path (0 = auto)
 - **OpenVINO detection.** Intel's vendor stack (works on Intel CPUs, GPUs, and NPUs) needs a different probe than CUDA/Vulkan because the OpenVINO backend is loaded as a separate `use_openvino=True` path in pywhispercpp. Tracked but not implemented; the README documents the install path for users who want it now.
 - **Per-profile GPU device selection** (e.g. GPU 0 for English, GPU 1 for Chinese, on a multi-GPU workstation).
 - **CoreML / Apple Neural Engine** is the macOS equivalent of GPU and would be 5-10x faster than the current CPU path on M-series Macs. The probe code already lists `metal` / `coreml` strings as a recognized backend; just needs a `WHISPER_COREML=1` install step documented.
-- **An `install-gpu.sh` helper** that auto-detects the GPU vendor via `lspci` and runs the right command. Easy follow-up.
+- **An `install-gpu.sh` helper** that auto-detects the GPU vendor via `lspci` and runs the right command. Easy follow-up. *(Shipped as `./setup.sh` — this follow-up is done.)*
 
 ## Auto-stop on silence
 
