@@ -51,14 +51,15 @@ If you see `cpu` on Linux and you have a GPU, follow the install instructions be
 
 ### Quick setup (recommended)
 
-Run `./setup.sh` once after `./start.sh`. It auto-detects the GPU vendor (via `lspci` on Linux, `system_profiler` on macOS) and the system package manager, installs the right runtime (CUDA toolkit, Vulkan ICD, or CoreML on Apple Silicon), then rebuilds `pywhispercpp` against the matching backend. The script is idempotent — re-running is safe — and has a `--dry-run` mode that prints the plan without installing anything.
+Run `./setup.sh` once after `./start.sh`. It auto-detects the GPU vendor (via `lspci` on Linux, `system_profiler` on macOS) and the system package manager, installs the right runtime (CUDA toolkit, Vulkan ICD, or CoreML on Apple Silicon), then rebuilds `pywhispercpp` against the matching backend. The script is idempotent — re-running is safe — and asks before every mutating step (`sudo` package installs, the `pip install` rebuild). Use `--yes` to skip the prompts after a `--dry-run` review, or `--dry-run` alone to print the plan without installing anything.
 
 ```bash
-./setup.sh            # auto-detect, install, rebuild, verify
-./setup.sh --dry-run  # preview what it would do
+./setup.sh            # auto-detect, prompt before each install
+./setup.sh --dry-run  # preview the plan, no installs
+./setup.sh --yes      # auto-yes to every prompt (after a --dry-run review)
 ```
 
-After it finishes, restart with `./start.sh` and check the banner — it should now say `[transcribe] <backend> (GPU 0)` instead of `cpu`.
+The script installs `pywhispercpp` into the project's per-host venv (`$VENV_DIR`) only — the system Python is never touched. System package installs (CUDA toolkit, Vulkan ICDs) DO require `sudo` and are prompted before each step. Answer `n` to skip a step, `a` to abort the whole script.
 
 If `./setup.sh` can't auto-detect (e.g. you're on a headless box, or the GPU is a niche vendor), it'll prompt you for the backend. Or fall back to the manual recipe below.
 
