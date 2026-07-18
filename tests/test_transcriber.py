@@ -267,3 +267,245 @@ def test_transcribe_drops_blank_audio_marker(fake_pywhispercpp):
     t = WhisperCppTranscriber()
     out = t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
     assert out == ""
+
+
+# --- GPU backend probe + context_params ----------------------------------
+#
+# The probe caches its result for the lifetime of the process. Tests that
+# patch the lib path need to clear the cache explicitly.
+
+
+@pytest.fixture(autouse=False)
+def _clear_gpu_probe_cache():
+    """Clear the lru_cache on _probe_gpu_backend between tests.
+
+    A test may have replaced `_probe_gpu_backend` with a plain lambda
+    (which has no `cache_clear`); we tolerate that and silently skip.
+    """
+    from speakinput import transcriber as t_mod
+
+    _safe_cache_clear(t_mod._probe_gpu_backend)
+    yield
+    _safe_cache_clear(t_mod._probe_gpu_backend)
+
+
+def _safe_cache_clear(fn):
+    cache_clear = getattr(fn, "cache_clear", None)
+    if cache_clear is not None:
+        cache_clear()
+
+
+def _write_fake_lib(tmp_path, content: bytes) -> Path:
+    """Write a fake libwhisper.so at the given path and return the path."""
+    p = tmp_path / "libwhisper.so"
+    p.write_bytes(content)
+    return p
+
+
+def test_probe_returns_none_for_cpu_only_wheel(tmp_path, monkeypatch, _clear_gpu_probe_cache):
+    from speakinput import transcriber as t_mod
+
+    fake = _write_fake_lib(tmp_path, b"this is a CPU-only whisper.cpp build")
+    # Make _locate_libwhisper() return our fake lib without needing the
+    # real _pywhispercpp module's `__file__` to point at it.
+    monkeypatch.setattr(t_mod, "_locate_libwhisper", lambda: fake)
+    assert t_mod._probe_gpu_backend() is None
+
+
+def test_probe_detects_cuda_when_cuda_symbols_present(
+    tmp_path, monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+
+    fake = _write_fake_lib(
+        tmp_path,
+        b"ggml-cuda init successful; loaded ggml_cuda backend v12.0",
+    )
+    monkeypatch.setattr(t_mod, "_locate_libwhisper", lambda: fake)
+    assert t_mod._probe_gpu_backend() == "cuda"
+
+
+def test_probe_detects_vulkan_when_vulkan_symbols_present(
+    tmp_path, monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+
+    fake = _write_fake_lib(tmp_path, b"ggml-vulkan backend ready")
+    monkeypatch.setattr(t_mod, "_locate_libwhisper", lambda: fake)
+    assert t_mod._probe_gpu_backend() == "vulkan"
+
+
+def test_probe_priority_cuda_beats_vulkan(
+    tmp_path, monkeypatch, _clear_gpu_probe_cache
+):
+    """When a lib has BOTH CUDA and Vulkan strings, CUDA wins (priority order)."""
+    from speakinput import transcriber as t_mod
+
+    fake = _write_fake_lib(
+        tmp_path,
+        b"ggml-cuda v12; ggml-vulkan fallback; ggml-cublas init",
+    )
+    monkeypatch.setattr(t_mod, "_locate_libwhisper", lambda: fake)
+    assert t_mod._probe_gpu_backend() == "cuda"
+
+
+def test_probe_returns_none_when_lib_missing(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_locate_libwhisper", lambda: None)
+    assert t_mod._probe_gpu_backend() is None
+
+
+def test_resolve_context_params_auto_picks_gpu_when_available(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "vulkan")
+    params = t_mod._resolve_context_params(use_gpu=None, gpu_device=0)
+    assert params == {"use_gpu": True, "gpu_device": 0, "flash_attn": True}
+
+
+def test_resolve_context_params_auto_skips_when_cpu_only(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: None)
+    assert t_mod._resolve_context_params(use_gpu=None, gpu_device=0) == {}
+
+
+def test_resolve_context_params_force_off_ignores_available_gpu(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "cuda")
+    # Even though a GPU is available, an explicit `use_gpu=False` must
+    # disable it (e.g. a user with a weak iGPU wants CPU for stability).
+    assert t_mod._resolve_context_params(use_gpu=False, gpu_device=0) == {}
+
+
+def test_resolve_context_params_force_on_with_cpu_lib_warns(
+    monkeypatch, _clear_gpu_probe_cache, capsys
+):
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: None)
+    # No GPU present, but user explicitly forced it on. We must NOT
+    # crash — log a warning to stderr and return {}.
+    params = t_mod._resolve_context_params(use_gpu=True, gpu_device=0)
+    assert params == {}
+    captured = capsys.readouterr()
+    assert "use_gpu=true" in captured.err
+    assert "GPU acceleration" in captured.err
+
+
+def test_resolve_context_params_passes_through_gpu_device(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "vulkan")
+    params = t_mod._resolve_context_params(use_gpu=None, gpu_device=2)
+    assert params["gpu_device"] == 2
+
+
+def test_whispercpp_transcriber_passes_context_params(
+    fake_pywhispercpp, _clear_gpu_probe_cache, monkeypatch
+):
+    """When use_gpu=True, the constructor must forward `context_params` to
+    pywhispercpp.Model with use_gpu / gpu_device / flash_attn set."""
+    from speakinput import transcriber as t_mod
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    # Force the probe to see a GPU so the context_params dict is built.
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "vulkan")
+    WhisperCppTranscriber(use_gpu=True, gpu_device=1)
+    kwargs = fake_pywhispercpp.call_args.kwargs
+    assert kwargs["context_params"] == {
+        "use_gpu": True,
+        "gpu_device": 1,
+        "flash_attn": True,
+    }
+
+
+def test_whispercpp_transcriber_omits_context_params_when_cpu(
+    fake_pywhispercpp, _clear_gpu_probe_cache
+):
+    """use_gpu=False → no context_params kwarg, so pywhispercpp uses its
+    CPU defaults. Avoids passing an empty {} that could trigger a
+    strictness check on the C side."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    WhisperCppTranscriber(use_gpu=False)
+    assert "context_params" not in fake_pywhispercpp.call_args.kwargs
+
+
+def test_whispercpp_transcriber_passes_n_threads(fake_pywhispercpp):
+    """n_threads>0 is forwarded as a kwarg; n_threads=0 (default) is omitted
+    so pywhispercpp picks its own default (min(4, cores))."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    WhisperCppTranscriber(n_threads=8)
+    assert fake_pywhispercpp.call_args.kwargs["n_threads"] == 8
+
+    # Reset and try n_threads=0 (the default).
+    fake_pywhispercpp.reset_mock()
+    WhisperCppTranscriber()
+    assert "n_threads" not in fake_pywhispercpp.call_args.kwargs
+
+
+def test_whispercpp_transcriber_rejects_negative_gpu_device(
+    fake_pywhispercpp, _clear_gpu_probe_cache
+):
+    from speakinput.transcriber import TranscriberError, WhisperCppTranscriber
+
+    with pytest.raises(TranscriberError, match="gpu_device"):
+        WhisperCppTranscriber(use_gpu=True, gpu_device=-1)
+
+
+def test_whispercpp_transcriber_rejects_negative_n_threads(fake_pywhispercpp):
+    from speakinput.transcriber import TranscriberError, WhisperCppTranscriber
+
+    with pytest.raises(TranscriberError, match="n_threads"):
+        WhisperCppTranscriber(n_threads=-1)
+
+
+def test_gpu_summary_includes_install_hint_for_cpu_only(
+    monkeypatch, _clear_gpu_probe_cache, capsys
+):
+    """The summary line that the startup banner prints must point users
+    at the README when the wheel is CPU-only — so they know to rebuild."""
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: None)
+    summary = t_mod._gpu_summary(use_gpu=None, gpu_device=0)
+    assert "cpu" in summary
+    assert "GPU acceleration" in summary
+    # And the force-on warning is logged too.
+    t_mod._resolve_context_params(use_gpu=True, gpu_device=0)
+    captured = capsys.readouterr()
+    assert "use_gpu=true" in captured.err
+
+
+def test_gpu_summary_names_the_backend_when_gpu_present(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "cuda")
+    summary = t_mod._gpu_summary(use_gpu=None, gpu_device=0)
+    assert "cuda" in summary
+    assert "GPU 0" in summary
+
+
+def test_gpu_summary_forced_off_explicit(monkeypatch, _clear_gpu_probe_cache):
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "cuda")
+    summary = t_mod._gpu_summary(use_gpu=False, gpu_device=0)
+    assert "cpu" in summary
+    assert "forced" in summary

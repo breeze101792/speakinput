@@ -24,6 +24,8 @@ pip install -e .
 
 On first run `./start.sh` copies `config.example.toml` to `~/Library/Application Support/speakinput/config.toml` so you have a discoverable starting point. The program also runs fine with no config file at all — every value in `config.example.toml` is the same as the hard-coded default. Edit the copied file to customize, or leave it alone and use CLI flags (`-m`, `-g`, `-P`, `-S`, etc.) to override per-run. The config file is git-ignored; only `config.example.toml` is committed.
 
+**Want GPU acceleration?** Run `./setup.sh` once after `./start.sh` — it auto-detects your GPU, installs the right runtime, and rebuilds the whisper wheel against the matching backend. See [GPU acceleration](#gpu-acceleration) for what it does and the manual recipe for fine-grained control.
+
 Speak Input then checks whether the configured model file is present. If not, it downloads it from Hugging Face **at startup**, before the push-to-talk listener starts — you will not be surprised by a multi-hundred-MB download in the middle of a recording session. Subsequent runs reuse the cached model and start in seconds.
 
 ## Model management
@@ -36,6 +38,111 @@ speakinput -m base.en             # pick a different model; downloaded on first 
 ```
 
 If the download fails (no internet, firewall, disk full), Speak Input exits with code 2 and a clear error message — the listener never starts. Fix the underlying problem and re-run.
+
+## GPU acceleration
+
+By default the bundled `pywhispercpp` wheel runs whisper.cpp on the CPU. On Apple Silicon that's fast enough to feel interactive; on x86 Linux with an idle NVIDIA / AMD GPU sitting next to it, CPU-only is much slower than it could be. The startup banner tells you which path is live:
+
+```
+[transcribe] cpu (wheel is CPU-only — see README → 'GPU acceleration')
+```
+
+If you see `cpu` on Linux and you have a GPU, follow the install instructions below. The rebuild is a one-time per-machine step (5-15 min for the CUDA build, similar for Vulkan). After that, the wheel is GPU-enabled forever — no per-session flag needed, the app auto-detects it.
+
+### Quick setup (recommended)
+
+Run `./setup.sh` once after `./start.sh`. It auto-detects the GPU vendor (via `lspci` on Linux, `system_profiler` on macOS) and the system package manager, installs the right runtime (CUDA toolkit, Vulkan ICD, or CoreML on Apple Silicon), then rebuilds `pywhispercpp` against the matching backend. The script is idempotent — re-running is safe — and has a `--dry-run` mode that prints the plan without installing anything.
+
+```bash
+./setup.sh            # auto-detect, install, rebuild, verify
+./setup.sh --dry-run  # preview what it would do
+```
+
+After it finishes, restart with `./start.sh` and check the banner — it should now say `[transcribe] <backend> (GPU 0)` instead of `cpu`.
+
+If `./setup.sh` can't auto-detect (e.g. you're on a headless box, or the GPU is a niche vendor), it'll prompt you for the backend. Or fall back to the manual recipe below.
+
+### Pick a backend
+
+| Backend | Best for | Vendor coverage |
+|---|---|---|
+| **CUDA** (recommended) | NVIDIA GPUs | NVIDIA only |
+| **Vulkan** | AMD, Intel, ARM Mali, NVIDIA | Any vendor |
+| **CoreML** | macOS Apple Silicon | Apple only |
+| **OpenVINO** | Intel CPUs / GPUs / NPUs | Intel only |
+| HIP/ROCm | Older AMD discrete | AMD only |
+
+Pick the first row that matches your hardware. CUDA is the fastest on NVIDIA, Vulkan is the universal fallback. (OpenVINO is listed for Intel hardware but is not auto-probed by this app yet — see [v2 follow-ups](#v2-follow-ups-not-in-this-release).)
+
+### Install commands (Arch Linux)
+
+For **NVIDIA / CUDA** (the recommended path for the user's RTX 4060 Ti):
+
+```bash
+# 1. Install the CUDA toolkit + driver
+sudo pacman -S cuda                    # pulls in nvidia-utils + headers
+
+# 2. Rebuild pywhispercpp with CUDA support. The GGML_CUDA=1 env
+#    var tells the build system to link against cuBLAS. Use --no-cache
+#    so pip doesn't reuse the CPU wheel's cached sdist.
+GGML_CUDA=1 pip install --force-reinstall --no-cache \
+    git+https://github.com/absadiki/pywhispercpp
+
+# 3. Verify the next startup banner says
+#    [transcribe] cuda (GPU 0, flash_attn=on)
+```
+
+For **Vulkan** (any vendor — works on AMD, Intel, ARM, NVIDIA):
+
+```bash
+# 1. Install the vendor driver + the vendor-neutral loader
+sudo pacman -S vulkan-icd-loader
+sudo pacman -S nvidia-utils             # NVIDIA; vulkan-radeon for AMD,
+                                        # vulkan-intel for Intel, vulkan-mali for ARM
+
+# 2. Rebuild pywhispercpp with Vulkan support
+GGML_VULKAN=1 pip install --force-reinstall --no-cache \
+    git+https://github.com/absadiki/pywhispercpp
+
+# 3. Verify
+vulkaninfo --summary                    # should list your GPU
+# [transcribe] vulkan (GPU 0, flash_attn=on)
+```
+
+For **macOS / CoreML** (Apple Silicon Macs — fastest on M1/M2/M3):
+
+```bash
+# Run on the Mac itself; the wheel needs Apple's toolchain.
+WHISPER_COREML=1 pip install --force-reinstall --no-cache \
+    git+https://github.com/absadiki/pywhispercpp
+```
+
+### Per-session controls
+
+Once the wheel is GPU-enabled, the app auto-detects and uses it. You can override per-session without editing `config.toml`:
+
+```bash
+./start.sh --gpu                # force GPU on (warns if wheel is CPU-only)
+./start.sh --no-gpu             # force CPU (useful for power-saving on laptops)
+./start.sh --gpu-device 1       # use the second GPU when multiple are present
+./start.sh --threads 16         # use 16 CPU threads for the CPU path
+```
+
+Or in `config.toml`:
+
+```toml
+[transcribe]
+use_gpu = "auto"    # true | false | "auto"  (default: auto = use GPU if wheel has it)
+gpu_device = 0      # GPU index, default 0
+n_threads = 0       # CPU threads for the CPU path (0 = auto)
+```
+
+### V2 follow-ups (not in this release)
+
+- **OpenVINO detection.** Intel's vendor stack (works on Intel CPUs, GPUs, and NPUs) needs a different probe than CUDA/Vulkan because the OpenVINO backend is loaded as a separate `use_openvino=True` path in pywhispercpp. Tracked but not implemented; the README documents the install path for users who want it now.
+- **Per-profile GPU device selection** (e.g. GPU 0 for English, GPU 1 for Chinese, on a multi-GPU workstation).
+- **CoreML / Apple Neural Engine** is the macOS equivalent of GPU and would be 5-10x faster than the current CPU path on M-series Macs. The probe code already lists `metal` / `coreml` strings as a recognized backend; just needs a `WHISPER_COREML=1` install step documented.
+- **An `install-gpu.sh` helper** that auto-detects the GPU vendor via `lspci` and runs the right command. Easy follow-up.
 
 ## Auto-stop on silence
 
@@ -240,6 +347,18 @@ sudo usermod -aG input $USER
 
 Verify with `ls -l /dev/input/event*` — your user should be able to `cat` one of them (Ctrl-C to stop). If `/dev/input` doesn't exist at all, you're in a sandboxed/container environment without kernel input devices exposed; this is the runtime's problem, not the program's.
 
+### Text injection (the typing part)
+
+On Wayland, the output side is also auto-detected. Speak Input picks the first available of:
+
+1. **`wtype`** — uses the wlroots `virtual-keyboard-unstable-v1` protocol directly. Daemon-free, works on any wlroots-based compositor (Sway, swayfx, Hyprland, river). Not supported on GNOME or KDE. Install: `pacman -S wtype` (Arch), `apt install wtype` (Debian/Ubuntu).
+2. **`ydotool`** — uinput-based, needs the `ydotoold` daemon. Install: `pacman -S ydotool` (Arch), `apt install ydotool` (Debian), then `systemctl --user enable --now ydotool` to start the daemon. Works on more compositors (including eventually GNOME via libei).
+3. **`pynput`** — last-resort fallback. Only works through XWayland, so it does nothing useful on a pure-Wayland session; if you see this in the startup banner, install wtype or ydotool.
+
+The startup banner shows the chosen backend. Override with `[inject].backend = "wtype" | "ydotool" | "pynput"` in `config.toml`.
+
+For the Unicode (CJK, accented) path, speakinput also needs a working clipboard tool. On Wayland that's `wl-copy` / `wl-paste` from the `wl-clipboard` package (`pacman -S wl-clipboard`, `apt install wl-clipboard`). The user's prior clipboard contents are restored after each injection.
+
 ### Double-fires with other key-grabbers
 
 The evdev backend does **not** use `EVIOCGRAB` — it observes events while the focused application also receives them, so the user can type normally in other apps while speakinput is running. The trade-off: if another key-grabber is also watching the same device (e.g. `sxhkd`, `kglobalacceld`, or a screen-reader), it will see the same hotkey press and may act on it too. If you see the hotkey fire twice (or other odd behavior), check your other key-grabbers and either disable them for the configured key or pause the other process while dictating.
@@ -403,6 +522,12 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 **On Linux Wayland, the listener fails to start with "no keyboard device found in /dev/input".** Either the user isn't in the `input` group, or `/dev/input` is empty (sandboxed/container env). See [Linux / Wayland](#linux--wayland).
 
 **On Linux, the hotkey fires twice or other apps also see it.** Another key-grabber is also watching the device. The evdev backend intentionally does not grab exclusively — see the [double-fires](#double-fires-with-other-key-grabbers) note for workarounds.
+
+**Transcription is much slower than on macOS.** The shipped `pywhispercpp` wheel is CPU-only. On Linux x86 that runs whisper.cpp on the CPU cores only, which is much slower than the Apple Silicon M-series path. Rebuild pywhispercpp against CUDA (NVIDIA) or Vulkan (any vendor) — see the [GPU acceleration](#gpu-acceleration) section.
+
+**The startup banner says `cpu (wheel is CPU-only)` even after I ran the install command.** Check the build log for `error: failed to find cuBLAS` (CUDA) or `error: Vulkan headers not found` (Vulkan). The most common cause on Arch is missing the `cuda` / `vulkan-headers` package; the second most common is pip reusing a cached sdist (`--no-cache` fixes that).
+
+**On Linux Wayland, the transcript shows up in debug output but nothing is typed into the focused app.** pynput is X11-only — the output side needs a Wayland-native typing tool. Install `wtype` (preferred, daemon-free) or `ydotool` + start `ydotoold`. See the [Text injection](#text-injection-the-typing-part) section above.
 
 **The right-Option hotkey (macOS default) triggers menu mnemonics.** v1 uses `suppress=False` so the key reaches other apps — useful for Alt-Tab, but it can arm menu shortcuts in some apps. v2 will add a `suppress=True` mode for that case. On Linux/Windows the default is Right Ctrl, which has fewer menu-mnemonic conflicts.
 

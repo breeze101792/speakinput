@@ -105,6 +105,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--gpu",
+        action="store_true",
+        default=None,
+        help="Force GPU acceleration on. If the pywhispercpp wheel is "
+        "CPU-only, logs a warning and falls back to CPU. See README "
+        "→ 'GPU acceleration' for the wheel rebuild instructions.",
+    )
+    parser.add_argument(
+        "--no-gpu",
+        action="store_false",
+        dest="use_gpu",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--gpu-device",
+        type=int,
+        default=None,
+        metavar="N",
+        help="GPU device index when multiple GPUs are present (default: 0)",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of CPU threads for the CPU path (default: 0 = auto, "
+        "min(4, hardware_concurrency()))",
+    )
+    parser.add_argument(
         "-S",
         "--silence-threshold",
         type=float,
@@ -259,6 +289,12 @@ def main(argv: list[str] | None = None) -> int:
         config = config.with_overrides(auto_stop_seconds=args.auto_stop_seconds)
     if args.initial_prompt is not None:
         config = config.with_overrides(initial_prompt=args.initial_prompt)
+    if args.use_gpu is not None:
+        config = config.with_overrides(use_gpu=args.use_gpu)
+    if args.gpu_device is not None:
+        config = config.with_overrides(gpu_device=args.gpu_device)
+    if args.threads is not None:
+        config = config.with_overrides(n_threads=args.threads)
 
     if args.diagnose:
         return _diagnose(config)

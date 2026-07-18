@@ -49,6 +49,21 @@ def _stub_hotkey_listener(monkeypatch):
     fake_evdev_listener_cls = MagicMock()
     fake_evdev_listener_cls.side_effect = lambda *a, **kw: MagicMock()
     monkeypatch.setattr("speakinput.app.EvdevHotkeyListener", fake_evdev_listener_cls)
+    # Also stub pynput's Controller inside the injector module so
+    # `select_injector(...)` can construct a `TypingInjector` on
+    # macOS / X11 Linux / "no wtype/ydotool" fallbacks without
+    # actually starting a HIToolbox or X11 connection.
+    fake_inj_keyboard = MagicMock()
+    fake_inj_keyboard.Key = MagicMock()
+    fake_inj_keyboard.Key.cmd = "cmd"
+    fake_inj_keyboard.Key.ctrl = "ctrl"
+    fake_inj_keyboard.Controller = MagicMock()
+    monkeypatch.setattr(
+        "speakinput.injector.Controller", fake_inj_keyboard.Controller, raising=False
+    )
+    monkeypatch.setattr(
+        "speakinput.injector.Key", fake_inj_keyboard.Key, raising=False
+    )
     return fake_listener_cls
 
 
@@ -644,6 +659,53 @@ def test_run_uses_pynput_listener_on_x11(monkeypatch, capsys):
     import speakinput.app as appmod
     assert appmod.HotkeyListener.called
     assert not appmod.EvdevHotkeyListener.called
+
+
+def test_app_uses_wtype_injector_on_wayland(monkeypatch):
+    """On a Wayland session, App() must construct a WtypeInjector when
+    wtype is on PATH (it is on wlroots-based compositors). The default
+    pynput TypingInjector only works on X11 Linux / XWayland."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    monkeypatch.setattr("speakinput.injector.sys.platform", "linux")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    # Pretend wtype is on PATH; ydotool is not.
+    monkeypatch.setattr(
+        "speakinput.injector.shutil.which",
+        lambda b: "/usr/bin/wtype" if b == "wtype" else None,
+    )
+    config = Config(primary=Profile(key="alt_r"))
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        transcribers={config.primary.key: MagicMock()},
+        injector=None,  # force the auto-select path
+        feedback=MagicMock(),
+    )
+    from speakinput.injector import WtypeInjector
+
+    assert isinstance(app.injector, WtypeInjector)
+
+
+def test_app_uses_pynput_injector_on_macos(monkeypatch):
+    """On macOS, App() must always construct the pynput TypingInjector
+    (HIToolbox) regardless of what Linux tools are installed."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    monkeypatch.setattr("speakinput.injector.sys.platform", "darwin")
+    config = Config(primary=Profile(key="alt_r"))
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        transcribers={config.primary.key: MagicMock()},
+        injector=None,
+        feedback=MagicMock(),
+    )
+    from speakinput.injector import TypingInjector
+
+    assert isinstance(app.injector, TypingInjector)
 
 
 def test_shutdown_stops_all_listeners(monkeypatch):

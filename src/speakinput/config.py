@@ -187,6 +187,33 @@ class AudioConfig:
 class InjectConfig:
     restore_clipboard_ms: int = 50
     trailing_space: bool = True
+    # Output backend. One of:
+    #   "auto"    — platform-driven selection (default)
+    #   "pynput"  — pynput (macOS / Windows / X11 Linux)
+    #   "wtype"   — wtype (wlroots Wayland, daemon-free)
+    #   "ydotool" — ydotool (Wayland fallback, needs ydotoold running)
+    # `auto` resolves at App construction time: macOS/Windows→pynput;
+    # Linux+Wayland→wtype→ydotool→pynput; Linux+X11→pynput.
+    backend: str = "auto"
+
+
+VALID_INJECT_BACKENDS = ("auto", "pynput", "wtype", "ydotool")
+
+
+@dataclass(frozen=True)
+class TranscribeConfig:
+    # GPU use. `None` means "auto-detect from the loaded pywhispercpp
+    # wheel" — use GPU if the wheel was built with a GPU backend
+    # (CUDA/Vulkan/Metal), else stay on CPU. `True` forces GPU on
+    # (with a stderr warning if the wheel is CPU-only). `False`
+    # forces CPU. The TOML "auto" string is normalized to `None`
+    # at load time.
+    use_gpu: bool | None = None
+    gpu_device: int = 0
+    # Number of CPU threads for the CPU path. 0 = pywhispercpp's
+    # default (min(4, hardware_concurrency())). Bump this on big
+    # x86 boxes (16+ cores) where the default leaves cores idle.
+    n_threads: int = 0
 
 
 @dataclass(frozen=True)
@@ -195,6 +222,7 @@ class Config:
     secondary: Profile | None = None
     audio: AudioConfig = field(default_factory=AudioConfig)
     inject: InjectConfig = field(default_factory=InjectConfig)
+    transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
 
     @classmethod
     def from_toml(cls, path: Path) -> "Config":
@@ -231,7 +259,27 @@ class Config:
             audio_raw["device"] = None
         audio = AudioConfig(**audio_raw)
         inject = InjectConfig(**data.get("inject", {}))
-        return cls(primary=primary, secondary=secondary, audio=audio, inject=inject)
+        transcribe_raw = dict(data.get("transcribe", {}))
+        # TOML has no `null` literal in this config; the string "auto"
+        # is the user-facing way to say "let the app decide" and maps
+        # to the Python `None` auto-detect sentinel.
+        if isinstance(transcribe_raw.get("use_gpu"), str):
+            ug = transcribe_raw["use_gpu"].strip().lower()
+            if ug in ("auto", ""):
+                transcribe_raw["use_gpu"] = None
+            elif ug in ("true", "yes", "1"):
+                transcribe_raw["use_gpu"] = True
+            elif ug in ("false", "no", "0"):
+                transcribe_raw["use_gpu"] = False
+            # else: leave the bool as-is; validate() will catch garbage
+        transcribe = TranscribeConfig(**transcribe_raw)
+        return cls(
+            primary=primary,
+            secondary=secondary,
+            audio=audio,
+            inject=inject,
+            transcribe=transcribe,
+        )
 
     def validate(self) -> None:
         for label, profile in (("primary", self.primary), ("secondary", self.secondary)):
@@ -279,6 +327,26 @@ class Config:
             raise ValueError("audio.silence_threshold must be >= 0 (0 disables)")
         if self.audio.auto_stop_seconds < 0:
             raise ValueError("audio.auto_stop_seconds must be >= 0 (0 disables)")
+        if self.inject.backend not in VALID_INJECT_BACKENDS:
+            raise ValueError(
+                f"inject.backend must be one of {VALID_INJECT_BACKENDS}, "
+                f"got {self.inject.backend!r}"
+            )
+        if not isinstance(self.transcribe.use_gpu, (bool, type(None))):
+            raise ValueError(
+                f"transcribe.use_gpu must be a bool or 'auto', "
+                f"got {self.transcribe.use_gpu!r}"
+            )
+        if self.transcribe.gpu_device < 0:
+            raise ValueError(
+                f"transcribe.gpu_device must be >= 0, "
+                f"got {self.transcribe.gpu_device}"
+            )
+        if self.transcribe.n_threads < 0:
+            raise ValueError(
+                f"transcribe.n_threads must be >= 0 (0 = auto), "
+                f"got {self.transcribe.n_threads}"
+            )
 
     def with_overrides(self, **overrides: Any) -> "Config":
         """Return a copy with select fields overridden (used by CLI flags).
@@ -316,8 +384,23 @@ class Config:
             overrides = {k: v for k, v in overrides.items() if k not in inject_keys}
         else:
             inject = self.inject
+        transcribe_keys = set(TranscribeConfig.__annotations__)
+        if any(k in transcribe_keys for k in overrides):
+            transcribe = replace(
+                self.transcribe,
+                **{k: v for k, v in overrides.items() if k in transcribe_keys},
+            )
+            overrides = {k: v for k, v in overrides.items() if k not in transcribe_keys}
+        else:
+            transcribe = self.transcribe
         secondary = overrides.pop("secondary", self.secondary)
-        return Config(primary=primary, secondary=secondary, audio=audio, inject=inject)
+        return Config(
+            primary=primary,
+            secondary=secondary,
+            audio=audio,
+            inject=inject,
+            transcribe=transcribe,
+        )
 
 
 def default_config_path() -> Path:

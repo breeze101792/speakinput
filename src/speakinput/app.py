@@ -19,7 +19,7 @@ from speakinput.hotkey import (
     resolve_evdev_key,
     resolve_key,
 )
-from speakinput.injector import Injector, TypingInjector
+from speakinput.injector import Injector, select_injector
 from speakinput.models import (
     ModelDownloadError,
     ModelNotFoundError,
@@ -27,7 +27,7 @@ from speakinput.models import (
     resolve_for_language,
 )
 from speakinput.silence import SilenceWatchdog, trim_trailing_silence
-from speakinput.transcriber import Transcriber, WhisperCppTranscriber
+from speakinput.transcriber import Transcriber, WhisperCppTranscriber, _gpu_summary
 
 log = logging.getLogger("speakinput")
 
@@ -41,6 +41,10 @@ def _dbg(enabled: bool, msg: str) -> None:
 def _build_transcribers(
     profiles: list[Profile],
     transcriber_overrides: dict[str, Transcriber] | None = None,
+    *,
+    use_gpu: bool | None = None,
+    gpu_device: int = 0,
+    n_threads: int = 0,
 ) -> dict[str, Transcriber]:
     """Construct one Transcriber per profile, sharing instances by model path.
 
@@ -56,6 +60,10 @@ def _build_transcribers(
 
     `transcriber_overrides` lets tests inject mock transcribers keyed by
     the profile's hotkey (e.g. `{"alt_r": mock1, "cmd_r": mock2}`).
+
+    `use_gpu` / `gpu_device` / `n_threads` are forwarded to the
+    `WhisperCppTranscriber` constructor — see
+    `speakinput.transcriber` for the auto-detect behavior.
     """
     overrides = transcriber_overrides or {}
     by_name: dict[str, Path] = {}
@@ -88,6 +96,9 @@ def _build_transcribers(
                 language=profile.language,
                 beam_size=profile.beam_size,
                 initial_prompt=profile.initial_prompt,
+                use_gpu=use_gpu,
+                gpu_device=gpu_device,
+                n_threads=n_threads,
             )
             by_path[str(model_path)] = t
             by_key[profile.key] = t
@@ -125,10 +136,7 @@ class App:
         # resolve and download models first. Tests inject transcribers
         # via the `transcribers` kwarg and skip the bootstrap step.
         self.transcribers: dict[str, Transcriber] = transcribers or {}
-        self.injector = injector or TypingInjector(
-            restore_clipboard_ms=config.inject.restore_clipboard_ms,
-            trailing_space=config.inject.trailing_space,
-        )
+        self.injector = injector or select_injector(config.inject)
         self.feedback = feedback or NullFeedback()
         self.dry_run = dry_run
         self.debug = debug
@@ -405,7 +413,12 @@ class App:
         # If the test (or another caller) injected transcribers, skip.
         if not self.transcribers:
             try:
-                self.transcribers = _build_transcribers(self._profiles)
+                self.transcribers = _build_transcribers(
+                    self._profiles,
+                    use_gpu=self.config.transcribe.use_gpu,
+                    gpu_device=self.config.transcribe.gpu_device,
+                    n_threads=self.config.transcribe.n_threads,
+                )
             except ModelNotFoundError as exc:
                 print(f"model error: {exc}", file=sys.stderr)
                 raise SystemExit(2) from exc
@@ -493,6 +506,7 @@ class App:
             f"sample   : {cfg.audio.sample_rate} Hz, device={device}",
             f"silence  : rms<{threshold_str} -> skip; auto-stop after {auto_stop_str}",
             f"inject   : {inject_mode}, trailing_space={cfg.inject.trailing_space}",
+            f"transcribe: {_gpu_summary(cfg.transcribe.use_gpu, cfg.transcribe.gpu_device)}",
         ]
         for line in lines:
             print(f"[startup] {line}", file=sys.stderr, flush=True)

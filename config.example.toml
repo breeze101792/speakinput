@@ -88,3 +88,24 @@ restore_clipboard_ms = 50   # how long to wait before restoring the prior
                             # clipboard contents (Unicode paste path only)
 trailing_space = true       # append a single space after each transcript
                             # (set false for code editors)
+# backend = "auto"          # Output injection backend. One of:
+                            #   "auto"    — platform-driven (recommended)
+                            #   "pynput"  — pynput (macOS / Windows / X11 Linux)
+                            #   "wtype"   — wtype (wlroots Wayland, daemon-free)
+                            #   "ydotool" — ydotool (Wayland, needs ydotoold)
+                            # On Linux Wayland, "auto" tries wtype first,
+                            # then ydotool, then falls back to pynput.
+
+[transcribe]
+# use_gpu = "auto"          # Enable GPU acceleration. One of:
+                            #   "auto"  — use GPU if the wheel has one (default)
+                            #   true    — force on (warns if wheel is CPU-only)
+                            #   false   — force CPU
+                            # To enable GPU on Linux, you must rebuild the
+                            # pywhispercpp wheel — see README → 'GPU acceleration'.
+                            # The shipped wheel is CPU-only.
+# gpu_device = 0            # GPU index when multiple are present
+# n_threads = 0             # CPU threads for the CPU path. 0 = auto
+                            # (pywhispercpp's default: min(4, cores)).
+                            # Bump this on big x86 boxes (16+ cores) where
+                            # the default leaves cores idle.
