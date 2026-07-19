@@ -181,6 +181,11 @@ class AudioConfig:
     # normal end-of-sentence pause. Lower it for snappier response,
     # raise it if the watchdog is chopping mid-sentence pauses.
     auto_stop_seconds: float = 0.8
+    # Pause any playing media (music, video) when the hotkey is pressed
+    # and resume it when the key is released. On Linux requires
+    # `playerctl` (MPRIS); on macOS uses osascript for Spotify/Music;
+    # on Windows uses PowerShell SMTC. No-op when no backend is found.
+    pause_media: bool = True
 
 
 @dataclass(frozen=True)

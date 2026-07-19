@@ -164,6 +164,13 @@ def _build_parser() -> argparse.ArgumentParser:
         'via config.toml.',
     )
     parser.add_argument(
+        "--pause-media",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pause playing media on hotkey press, resume on release "
+        "(default: on; override with --no-pause-media)",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -283,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
         config = config.with_overrides(language=args.language)
     if args.trailing_space is not None:
         config = config.with_overrides(trailing_space=args.trailing_space)
+    if args.pause_media is not None:
+        config = config.with_overrides(pause_media=args.pause_media)
     if args.silence_threshold is not None:
         config = config.with_overrides(silence_threshold=args.silence_threshold)
     if args.auto_stop_seconds is not None:

@@ -20,6 +20,7 @@ from speakinput.hotkey import (
     resolve_key,
 )
 from speakinput.injector import Injector, select_injector
+from speakinput.media import MediaController
 from speakinput.models import (
     ModelDownloadError,
     ModelNotFoundError,
@@ -137,6 +138,11 @@ class App:
         # via the `transcribers` kwarg and skip the bootstrap step.
         self.transcribers: dict[str, Transcriber] = transcribers or {}
         self.injector = injector or select_injector(config.inject)
+        self.media_controller = (
+            MediaController()
+            if config.audio.pause_media
+            else None
+        )
         self.feedback = feedback or NullFeedback()
         self.dry_run = dry_run
         self.debug = debug
@@ -204,6 +210,9 @@ class App:
         auto_stop = self.config.audio.auto_stop_seconds
         if auto_stop > 0 and self.config.audio.silence_threshold > 0:
             self._arm_watchdog(profile)
+        if self.media_controller is not None:
+            if self.media_controller.pause():
+                _dbg(self.debug, "paused media playback")
         self.feedback.set_state("listening")
 
     def _arm_watchdog(self, profile: Profile) -> None:
@@ -286,6 +295,9 @@ class App:
         if self._watchdog is not None:
             self._watchdog.stop()
             self._watchdog = None
+        if self.media_controller is not None:
+            self.media_controller.resume()
+            _dbg(self.debug, "resumed media playback")
         if self._active_profile is not profile:
             # Press and release keys don't match (shouldn't happen with
             # one key held at a time, but guard anyway). Use the active
@@ -513,6 +525,8 @@ class App:
 
     def shutdown(self) -> None:
         self._shutdown.set()
+        if self.media_controller is not None:
+            self.media_controller.resume()
         if self._watchdog is not None:
             self._watchdog.stop()
             self._watchdog = None

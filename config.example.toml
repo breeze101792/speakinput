@@ -80,6 +80,11 @@ auto_stop_seconds = 0.8     # auto-stop after this many seconds of
                             # buffer before transcribe. Set to 0 to
                             # disable — you'll keep the key held until
                             # you release it yourself.
+# pause_media = true        # Pause any playing media when the hotkey is
+                            # pressed and resume on release. Set false
+                            # to disable. Linux requires playerctl;
+                            # macOS uses osascript; Windows uses
+                            # PowerShell SMTC.
 # device = null             # uncomment to pin a specific input device;
                             # use `speakinput --list-devices` to see indices
 
