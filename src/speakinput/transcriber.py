@@ -163,7 +163,12 @@ def _gpu_summary(use_gpu: bool | None, gpu_device: int) -> str:
 
 
 class Transcriber(Protocol):
-    def transcribe(self, audio: np.ndarray, sample_rate: int) -> str: ...
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        initial_prompt: str | None = None,
+    ) -> str: ...
 
 
 class TranscriberError(RuntimeError):
@@ -245,13 +250,29 @@ class WhisperCppTranscriber:
             **model_kwargs,
         )
 
-    def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        initial_prompt: str | None = None,
+    ) -> str:
         if audio.size == 0:
             return ""
         # pywhispercpp expects a 1-D float32 array already at the model's
         # native rate (16 kHz for whisper). `sample_rate` is accepted for
         # interface parity with future Transcriber implementations.
         del sample_rate
+        # Per-call `initial_prompt` overrides the instance default. The
+        # caller (App) builds a layered prompt: configured lexical bias
+        # + across-press hint (if recent) + within-press chunk text.
+        # `None` means "use whatever the constructor set"; `""` is
+        # treated like `None` (whisper.cpp's "no prompt" sentinel).
+        if initial_prompt is None:
+            effective_prompt = self._initial_prompt
+        elif not initial_prompt:
+            effective_prompt = None
+        else:
+            effective_prompt = initial_prompt
         # When `_language is None` (auto), pywhispercpp runs the language
         # identifier on the first 30s of audio and prints the detected
         # language to stderr. We pass through whichever the caller set.
@@ -259,7 +280,7 @@ class WhisperCppTranscriber:
             audio,
             language=self._language,
             translate=self._translate,
-            initial_prompt=self._initial_prompt,
+            initial_prompt=effective_prompt,
         )
         # pywhispercpp can return the same segment multiple times when
         # whisper's temperature fallback chain re-samples the same low-

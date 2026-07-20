@@ -181,7 +181,9 @@ def test_with_overrides_silence_threshold():
 
 
 def test_default_auto_stop_seconds():
-    assert Config().audio.auto_stop_seconds == 0.8
+    # Default is 0: the user releases the key themselves. Set to a
+    # positive value to enable the chunked auto-stop watchdog.
+    assert Config().audio.auto_stop_seconds == 0
 
 
 def test_validation_rejects_negative_auto_stop_seconds():
@@ -199,7 +201,34 @@ def test_with_overrides_auto_stop_seconds():
     cfg = Config()
     new = cfg.with_overrides(auto_stop_seconds=1.5)
     assert new.audio.auto_stop_seconds == 1.5
-    assert cfg.audio.auto_stop_seconds == 0.8  # original untouched
+    assert cfg.audio.auto_stop_seconds == 0  # original untouched
+
+
+# --- prev_clip_window_seconds --------------------------------------------
+
+
+def test_default_prev_clip_window_seconds():
+    """Default 60s — the previous press's transcript is used as a
+    continuity hint for the next press if the gap is under a minute."""
+    assert Config().audio.prev_clip_window_seconds == 60.0
+
+
+def test_validation_rejects_negative_prev_clip_window_seconds():
+    with pytest.raises(ValueError, match="prev_clip_window_seconds"):
+        Config(audio=AudioConfig(prev_clip_window_seconds=-1)).validate()
+
+
+def test_validation_allows_zero_prev_clip_window_seconds():
+    """0 is the documented way to disable the across-press hint;
+    within-press still flows."""
+    Config(audio=AudioConfig(prev_clip_window_seconds=0)).validate()
+
+
+def test_with_overrides_prev_clip_window_seconds():
+    cfg = Config()
+    new = cfg.with_overrides(prev_clip_window_seconds=120)
+    assert new.audio.prev_clip_window_seconds == 120
+    assert cfg.audio.prev_clip_window_seconds == 60.0  # untouched
 
 
 def test_cli_auto_stop_seconds_short_flag():

@@ -74,12 +74,23 @@ sample_rate = 16000         # whisper expects 16 kHz; do not change
 silence_threshold = 0.005   # RMS floor used by the silence gate and the
                             # auto-stop watchdog. Audio below this is
                             # treated as silence. 0 disables both.
-auto_stop_seconds = 0.8     # auto-stop after this many seconds of
+auto_stop_seconds = 0       # auto-stop after this many seconds of
                             # continuous silence while the key is held.
                             # Trailing silence is also trimmed from the
-                            # buffer before transcribe. Set to 0 to
-                            # disable — you'll keep the key held until
-                            # you release it yourself.
+                            # buffer before transcribe. 0 disables —
+                            # the user releases the key themselves
+                            # (default). Set to a typical end-of-
+                            # sentence pause (e.g. 0.8) to enable the
+                            # chunked auto-stop.
+prev_clip_window_seconds = 60   # When the next press starts within this
+                                # many seconds of the previous
+                                # transcription, that text is appended
+                                # to `initial_prompt` as a continuity
+                                # hint ("picking up where I left
+                                # off"). The within-press chunk
+                                # (across auto-stop chunks) is always
+                                # passed regardless of this window.
+                                # 0 disables the across-press hint.
 # pause_media = true        # Pause any playing media when the hotkey is
                             # pressed and resume on release. Set false
                             # to disable. Linux requires playerctl;

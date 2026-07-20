@@ -1131,6 +1131,49 @@ def test_run_banner_shows_auto_stop_off(monkeypatch, capsys):
     assert "auto-stop after off" in captured.err
 
 
+def test_run_banner_shows_continuity_window(monkeypatch, capsys):
+    """The startup banner must show the prev_clip_window_seconds value
+    so the user can verify the across-press hint is on and at what
+    duration. 0 must show as 'off'."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+    monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+    config = Config(primary=Profile(key="alt_r"))
+    config = config.with_overrides(prev_clip_window_seconds=30)
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app._shutdown.set()
+    app.run()
+    captured = capsys.readouterr()
+    assert "across-press hint within 30s" in captured.err
+    assert "within-press always on" in captured.err
+
+    # 0 must read as 'off' so the user can tell at a glance that the
+    # across-press hint is disabled.
+    config2 = Config(primary=Profile(key="alt_r"))
+    config2 = config2.with_overrides(prev_clip_window_seconds=0)
+    app2 = App(
+        config=config2,
+        recorder=MagicMock(),
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app2._shutdown.set()
+    app2.run()
+    captured2 = capsys.readouterr()
+    assert "across-press hint within off" in captured2.err
+
+
 # --- chunked auto-stop: re-arm between chunks -----------------------------
 
 
@@ -1393,3 +1436,227 @@ def test_auto_stop_off_single_release_still_works(capsys):
     recorder.close.assert_called_once()
     assert not app._busy.locked()
     injector.inject.assert_called_once_with("hello")
+
+
+# --- continuity hint (previous clip as initial_prompt) -------------------
+
+
+def _build_app_with_loud_audio(debug: bool = False, **audio_overrides):
+    """Helper: App whose recorder returns loud audio on drain.
+
+    Used by the continuity tests so the silence gate doesn't short-
+    circuit the transcribe path. Any kwargs are forwarded to
+    AudioConfig (e.g. `prev_clip_window_seconds=0` to disable the
+    across-press hint while keeping the within-press one)."""
+    from speakinput.app import App
+
+    config = Config(
+        audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0, **audio_overrides)
+    )
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(16000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+        debug=debug,
+    )
+    return app, recorder, transcriber
+
+
+def test_continuity_no_hint_on_first_press():
+    """The very first press has no previous clip — the transcriber
+    receives only the configured lexical bias (the profile's
+    `initial_prompt`) as the per-call prompt. No across-press text,
+    no within-press chunk text."""
+    app, _, transcriber = _build_app_with_loud_audio()
+    transcriber.transcribe.return_value = "first sentence"
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    kwargs = transcriber.transcribe.call_args.kwargs
+    prompt = kwargs.get("initial_prompt") or ""
+    # The configured lexical bias is in the prompt (it's the default
+    # embedded-software-engineer vocabulary). The last 200 chars of
+    # the prompt end with "...printf, sprintf, malloc, free, memcpy,
+    # memset, strlen" — assert on that tail to avoid the
+    # per-component truncation interacting with the test.
+    assert "printf" in prompt
+    assert "strlen" in prompt
+    # But no transcript-y content has leaked in from a previous clip.
+    assert "first sentence" not in prompt
+
+
+def test_continuity_within_press_chunks_use_previous_text():
+    """Two auto-stopped chunks in the same press: the second chunk
+    must include the first chunk's text in the initial_prompt."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0.05))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(16000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    transcriber.transcribe.side_effect = ["first sentence", "second sentence"]
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app.on_hotkey_press(app.config.primary)
+    # Simulate the watchdog firing once (mid-press auto-stop) without
+    # going through the real SilenceWatchdog timing.
+    app._on_watchdog_chunk(config.primary)
+    # Then the user releases the key.
+    app.on_hotkey_release(app.config.primary)
+    assert transcriber.transcribe.call_count == 2
+    # First call: configured lexical bias is in the prompt, but no
+    # previous chunk text yet (within-press reset on press).
+    first_prompt = transcriber.transcribe.call_args_list[0].kwargs.get("initial_prompt") or ""
+    assert "first sentence" not in first_prompt
+    # Second call: should include "first sentence" as the within-press
+    # hint.
+    second_prompt = transcriber.transcribe.call_args_list[1].kwargs.get("initial_prompt") or ""
+    assert "first sentence" in second_prompt
+
+
+def test_continuity_across_press_uses_previous_clip_within_window():
+    """Press 1 finishes. Press 2 starts within `prev_clip_window_seconds`.
+    Press 2's first transcribe must include press 1's text as a hint."""
+    app, _, transcriber = _build_app_with_loud_audio(
+        prev_clip_window_seconds=60
+    )
+    transcriber.transcribe.side_effect = ["alpha bravo", "charlie delta"]
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    # Second press — same App, so `_last_clip_text` is in scope.
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    second_kwargs = transcriber.transcribe.call_args_list[1].kwargs
+    assert "alpha bravo" in (second_kwargs.get("initial_prompt") or "")
+
+
+def test_continuity_across_press_skipped_when_window_expired():
+    """If the gap between presses exceeds `prev_clip_window_seconds`,
+    the previous clip must NOT be used as a hint."""
+    app, _, transcriber = _build_app_with_loud_audio(
+        prev_clip_window_seconds=10
+    )
+    transcriber.transcribe.side_effect = ["alpha bravo", "charlie delta"]
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    # Backdate the recorded clip to a time well outside the window.
+    app._last_clip_at = app._last_clip_at - 100.0
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    second_kwargs = transcriber.transcribe.call_args_list[1].kwargs
+    prompt = second_kwargs.get("initial_prompt") or ""
+    assert "alpha bravo" not in prompt
+
+
+def test_continuity_across_press_skipped_when_window_zero():
+    """`prev_clip_window_seconds=0` disables the across-press hint
+    entirely (within-press still works)."""
+    app, _, transcriber = _build_app_with_loud_audio(
+        prev_clip_window_seconds=0
+    )
+    transcriber.transcribe.side_effect = ["alpha bravo", "charlie delta"]
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    second_kwargs = transcriber.transcribe.call_args_list[1].kwargs
+    prompt = second_kwargs.get("initial_prompt") or ""
+    assert "alpha bravo" not in prompt
+
+
+def test_continuity_within_press_overrides_across_press_chunk():
+    """When a press starts with a within-press chunk already recorded,
+    the most recent (chunk) text wins over the older across-press
+    clip. Both should appear in the prompt, but the chunk is the
+    final (most-recent) component."""
+    from speakinput.app import App
+
+    config = Config(
+        audio=AudioConfig(
+            silence_threshold=0,
+            auto_stop_seconds=0.05,
+            prev_clip_window_seconds=60,
+        )
+    )
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(16000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    # press 1 → "earlier clip"; press 2 chunk 1 → "mid sentence";
+    # press 2 chunk 2 (final release) → "continuing thought"
+    transcriber.transcribe.side_effect = [
+        "earlier clip",
+        "mid sentence",
+        "continuing thought",
+    ]
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    # Press 2 — first chunk (mid-press auto-stop)
+    app.on_hotkey_press(app.config.primary)
+    app._on_watchdog_chunk(config.primary)
+    # Then the user releases — the final-release path transcribes
+    # whatever audio is buffered. That's the chunk whose prompt
+    # should contain BOTH the across-press hint ("earlier clip") and
+    # the within-press chunk ("mid sentence").
+    app.on_hotkey_release(app.config.primary)
+    assert transcriber.transcribe.call_count == 3
+    third_prompt = transcriber.transcribe.call_args_list[2].kwargs.get("initial_prompt") or ""
+    assert "earlier clip" in third_prompt
+    assert "mid sentence" in third_prompt
+    # "mid sentence" (within-press, last in the concatenation order)
+    # should come after "earlier clip" (across-press).
+    assert third_prompt.index("earlier clip") < third_prompt.index("mid sentence")
+
+
+def test_continuity_does_not_update_state_on_empty_transcript():
+    """If whisper returns an empty string (silence-gated, hallucination
+    etc.), we must NOT update `_last_clip_text` — otherwise the next
+    press's prompt would include a stale or empty clip."""
+    app, _, transcriber = _build_app_with_loud_audio()
+    transcriber.transcribe.return_value = ""
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    assert app._last_clip_text == ""
+
+
+def test_continuity_prompt_caps_total_length():
+    """A long previous clip must be truncated so the assembled prompt
+    stays under whisper's 224-token cap. We verify the total prompt
+    length is bounded by the cap and the within-press chunk is the
+    one dropped first if everything overflows."""
+    app, _, transcriber = _build_app_with_loud_audio(
+        prev_clip_window_seconds=60
+    )
+    long_text = "x" * 2000
+    transcriber.transcribe.side_effect = [long_text, "second"]
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    second_kwargs = transcriber.transcribe.call_args_list[1].kwargs
+    prompt = second_kwargs.get("initial_prompt") or ""
+    # Cap is 400 chars; the long_text must be truncated AND the total
+    # must be under the cap.
+    assert len(prompt) <= 400

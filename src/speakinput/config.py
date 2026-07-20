@@ -177,10 +177,30 @@ class AudioConfig:
     silence_threshold: float = 0.005
     # Seconds of consecutive sub-threshold audio that triggers an
     # auto-stop while the key is held. 0 disables the watchdog entirely
-    # (the old "release the key yourself" behavior). Default 0.8s — a
-    # normal end-of-sentence pause. Lower it for snappier response,
-    # raise it if the watchdog is chopping mid-sentence pauses.
-    auto_stop_seconds: float = 0.8
+    # (the old "release the key yourself" behavior). Default 0 — by
+    # default the user releases the key themselves; raise it to a
+    # typical end-of-sentence pause (e.g. 0.8) to enable the chunked
+    # auto-stop behavior.
+    auto_stop_seconds: float = 0
+    # Window in seconds during which the most recent transcription is
+    # reused as a continuity hint for the NEXT press. When a new press
+    # starts and the previous clip's text is younger than this window,
+    # the program appends it to `initial_prompt` so whisper doesn't
+    # "reset" the topic between sentences.
+    #
+    # Two layers of context feed the prompt at transcribe time:
+    #   1. The per-profile `initial_prompt` (lexical bias — vocabulary
+    #      names, jargon, style hints). Static; never changes.
+    #   2. The most recent transcript from a previous press, when its
+    #      age is under this window. Across-press continuity only.
+    #   3. Within a single press, the previous auto-stopped chunk's
+    #      text is ALWAYS used — that is not gated by this window.
+    #
+    # The order in the final prompt is (1) + (2) + (3), so the static
+    # vocabulary bias wins, then the across-press topic, then the
+    # within-press sentence-level context. 0 disables the across-press
+    # hint entirely (within-press still flows).
+    prev_clip_window_seconds: float = 60.0
     # Pause any playing media (music, video) when the hotkey is pressed
     # and resume it when the key is released. On Linux requires
     # `playerctl` (MPRIS); on macOS uses osascript for Spotify/Music;
@@ -332,6 +352,10 @@ class Config:
             raise ValueError("audio.silence_threshold must be >= 0 (0 disables)")
         if self.audio.auto_stop_seconds < 0:
             raise ValueError("audio.auto_stop_seconds must be >= 0 (0 disables)")
+        if self.audio.prev_clip_window_seconds < 0:
+            raise ValueError(
+                "audio.prev_clip_window_seconds must be >= 0 (0 disables across-press hint)"
+            )
         if self.inject.backend not in VALID_INJECT_BACKENDS:
             raise ValueError(
                 f"inject.backend must be one of {VALID_INJECT_BACKENDS}, "

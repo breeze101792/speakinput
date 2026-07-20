@@ -161,7 +161,7 @@ n_threads = 0       # CPU threads for the CPU path (0 = auto)
 
 ## Auto-stop on silence
 
-By default Speak Input stops the recording automatically when **0.8 seconds of consecutive silence** passes while you're holding the key. You don't have to time the release — finish your sentence, pause, and the recorder stops by itself. Two things are wired together:
+By default Speak Input stops the recording **when you release the key** — no auto-stop watchdog. If you set `auto_stop_seconds` to a positive value (e.g. `0.8`), the program stops the recording automatically after that many seconds of consecutive silence while you're holding the key, so you don't have to time the release. Two things are wired together:
 
 - **Trailing-silence trim** runs on every release, whether manual or auto. The audio buffer is walked backwards in 30ms hops and any trailing silent portion is dropped, so whisper doesn't see a long silent tail (a real source of hallucinated filler text).
 - **Auto-stop watchdog** is a small background thread that polls the recorder's live RMS at ~20Hz. When the configured number of seconds of sub-threshold audio passes, it synthesizes a release for the active profile.
@@ -171,20 +171,30 @@ The two related config knobs are both under `[audio]`:
 ```toml
 [audio]
 silence_threshold = 0.005   # RMS floor: below this counts as "silence"
-auto_stop_seconds = 0.8     # auto-stop after this many seconds of silence
-                            # 0 disables; the old "release the key yourself"
-                            # behavior comes back
+auto_stop_seconds = 0       # auto-stop after this many seconds of
+                            # silence. 0 disables; you release the key
+                            # yourself. Set to e.g. 0.8 to enable.
 ```
 
-Both flags have CLI overrides: `-S/--silence-threshold` and `-A/--auto-stop-seconds`. Lower `auto_stop_seconds` for snappier response; raise it if the watchdog is chopping mid-sentence pauses. Set it to `0` to disable entirely — manual release works exactly as before.
+Both flags have CLI overrides: `-S/--silence-threshold` and `-A/--auto-stop-seconds`. Lower `auto_stop_seconds` for snappier response; raise it if the watchdog is chopping mid-sentence pauses. The default is `0` — opt in by editing `config.toml` or passing `-A 0.8`.
 
 When auto-stop fires, the release path runs the same as a manual release: same buffer-trim step, same silence-gate check, same transcriber. The only difference is who flipped the bit.
 
 ### Multi-sentence sessions: chunked re-arm
 
-Auto-stop doesn't end the session. If you keep holding the key, the captured sentence is trimmed, transcribed, and typed — and a fresh watchdog is armed for the **next** sentence. You can dictate a whole paragraph in one key-hold; each sentence lands at the cursor as soon as the silence gap tells the system you're done with it. When you finally release the key, whatever audio was buffered during the last transcribe gets drained and processed as a final chunk, then the recorder tears down.
+When `auto_stop_seconds > 0`, auto-stop doesn't end the session. If you keep holding the key, the captured sentence is trimmed, transcribed, and typed — and a fresh watchdog is armed for the **next** sentence. You can dictate a whole paragraph in one key-hold; each sentence lands at the cursor as soon as the silence gap tells the system you're done with it. When you finally release the key, whatever audio was buffered during the last transcribe gets drained and processed as a final chunk, then the recorder tears down. The previous chunk's text is automatically included in the next chunk's `initial_prompt` so multi-sentence dictation stays continuous (see [Continuity hint](#continuity-hint) below).
 
-This is the default behavior; there is no config flag to disable it (set `auto_stop_seconds = 0` if you want the old "release the key yourself" behavior).
+## Continuity hint
+
+Whisper's `initial_prompt` is re-evaluated at the start of every transcription. By default Speak Input feeds it a layered prompt built from three sources, in order:
+
+1. **Configured lexical bias** — the `initial_prompt` you set per profile in `config.toml` (or with `-P` on the command line). The default is the embedded-software-engineer vocabulary bank. Static; never changes.
+2. **Across-press hint** — the most recent successful transcription, if the gap between presses is under `prev_clip_window_seconds` (default **60s**). When you start a new press within a minute of finishing the last one, the previous text is appended to the prompt. Whisper treats it as a topic hint, so technical terms and style from the previous sentence are more likely to carry over.
+3. **Within-press chunk** — the previous auto-stopped chunk's text from the **same** key-hold. Always used, regardless of the across-press window, because mid-press chunks are by definition part of the same thought.
+
+The three sources are concatenated and the result is capped at 400 characters (well under whisper's 224-token prompt limit) — long previous clips are truncated from the end first, and the within-press chunk is dropped first if everything still overflows.
+
+Disable the across-press hint by setting `prev_clip_window_seconds = 0` in `config.toml`. The within-press chunk hint has no config gate — it's part of the same-press auto-stop contract.
 
 ## Two profiles, one key per language
 
@@ -415,7 +425,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-t`  | `--trailing-space`    | Append a space after each transcript (default)  |
 | `-T`  | `--no-trailing-space` | Don't append a space after each transcript      |
 | `-S`  | `--silence-threshold FLOAT` | Skip transcribe when audio RMS is below this floor (0 disables; default 0.005) |
-| `-A`  | `--auto-stop-seconds FLOAT` | Auto-stop after this many seconds of silence while the key is held (0 disables; default 0.8). Trailing silence is also trimmed from the buffer before transcribe. See [Auto-stop on silence](#auto-stop-on-silence) |
+| `-A`  | `--auto-stop-seconds FLOAT` | Auto-stop after this many seconds of silence while the key is held (0 disables; default 0 — release the key yourself). Trailing silence is also trimmed from the buffer before transcribe. See [Auto-stop on silence](#auto-stop-on-silence) |
 | `-P`  | `--initial-prompt TEXT` | Override the **primary** profile's `initial_prompt` for this run (default: embedded-software-engineer bias; see [Initial prompt](#initial-prompt-vocabulary-biasing)) |
 | `-v`  | `--verbose`           | Enable debug logging from python logging        |
 
@@ -487,10 +497,18 @@ sample_rate = 16000        # whisper expects 16 kHz; do not change
 silence_threshold = 0.005  # RMS floor used by the silence gate and the
                            # auto-stop watchdog. Audio below this counts
                            # as silence. 0 disables both.
-auto_stop_seconds = 0.8    # auto-stop after this many seconds of
+auto_stop_seconds = 0      # auto-stop after this many seconds of
                            # continuous silence while the key is held.
                            # Trailing silence is also trimmed from the
-                           # buffer before transcribe. 0 disables.
+                           # buffer before transcribe. 0 disables (you
+                           # release the key yourself).
+prev_clip_window_seconds = 60  # Reuse the most recent transcription as
+                               # an `initial_prompt` hint for the next
+                               # press, when the gap between presses is
+                               # under this window. The within-press
+                               # chunk (across auto-stop chunks) is
+                               # always used regardless of this window.
+                               # 0 disables the across-press hint.
 
 [inject]
 restore_clipboard_ms = 50  # how long to wait before restoring the prior clipboard contents

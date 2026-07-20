@@ -175,6 +175,40 @@ class App:
         # every chunked re-arm so a stale watchdog is never running.
         self._watchdog: SilenceWatchdog | None = None
         self.listeners: dict[str, HotkeyListener] = {}
+        # Layered continuity hints fed into whisper's initial_prompt.
+        #
+        # `_last_clip_text` + `_last_clip_at`: the text + monotonic
+        # timestamp of the most recent successful transcription. Lives
+        # across presses. Updated at the END of every non-empty
+        # transcribe. Used as a "picking up where I left off" hint for
+        # the NEXT press when the gap is under
+        # `audio.prev_clip_window_seconds`.
+        #
+        # `_press_start_clip_text`: a snapshot of `_last_clip_text`
+        # taken at the start of each press. This is what the current
+        # press's transcribes see as their "across-press" hint — it's
+        # frozen at press-start so updating `_last_clip_text` mid-press
+        # (e.g. after the first chunk) doesn't change the across-press
+        # hint for the second chunk of the SAME press. The semantic is:
+        # the across-press hint is "the last thing I said BEFORE I
+        # pressed the key this time", not "the last thing I said
+        # 200ms ago in this very press".
+        #
+        # `_last_chunk_text`: the text of the previous auto-stopped
+        # chunk WITHIN the current press. Reset on press, updated on
+        # each chunk. Used as a within-press continuity hint that is
+        # always passed (not gated by the across-press window). The
+        # assumption is: if you paused mid-sentence to let a chunk
+        # type out, the next sentence is part of the same thought.
+        #
+        # All three fields are guarded by `_prompt_lock` because the
+        # chunked watchdog body and the final release body can touch
+        # them from different threads.
+        self._last_clip_text: str = ""
+        self._last_clip_at: float = 0.0
+        self._press_start_clip_text: str = ""
+        self._last_chunk_text: str = ""
+        self._prompt_lock = threading.Lock()
 
     @property
     def active_profile(self) -> Profile | None:
@@ -191,6 +225,14 @@ class App:
         self._active_profile = profile
         self._manual_release_pending = False
         self._press_started_at = time.monotonic()
+        # Reset the within-press chunk text and snapshot the across-press
+        # hint. The snapshot is what this press's chunks will see as
+        # their "previous press" hint — freezing it at press-start means
+        # a chunk's own transcribe doesn't immediately become its own
+        # across-press prompt for the NEXT chunk of the same press.
+        with self._prompt_lock:
+            self._last_chunk_text = ""
+            self._press_start_clip_text = self._last_clip_text
         _dbg(self.debug, f"key press start ({profile.key})")
         try:
             self.recorder.start()
@@ -391,8 +433,22 @@ class App:
         except KeyError:
             log.exception("no transcriber wired for key %r", profile.key)
             return
+        # Build the layered initial_prompt. Three sources, in priority
+        # order — whisper treats the prompt as a single bias blob, but
+        # ordering matters: vocabulary names (the configured prompt)
+        # set the lexical stage, the across-press topic sets the
+        # subject, and the within-press chunk is the most-recent
+        # sentence and gives the decoder direct continuity.
+        prompt = self._build_initial_prompt(profile)
+        if self.debug and prompt:
+            _dbg(
+                self.debug,
+                f"initial_prompt: {prompt!r} (len={len(prompt)} chars)",
+            )
         try:
-            text = transcriber.transcribe(audio, self.config.audio.sample_rate)
+            text = transcriber.transcribe(
+                audio, self.config.audio.sample_rate, initial_prompt=prompt or None
+            )
         except Exception:
             log.exception("transcription failed")
             return
@@ -401,6 +457,7 @@ class App:
         if self.debug:
             print(f"[debug] transcript: {text!r}", file=sys.stderr, flush=True)
         if text:
+            self._record_transcript(text)
             if self.dry_run:
                 print(text, file=sys.stderr, flush=True)
             else:
@@ -408,6 +465,85 @@ class App:
                     self.injector.inject(text)
                 except Exception:
                     log.exception("injection failed")
+
+    # Whisper's initial_prompt has a 224-token cap (the n_text_ctx of
+    # tiny/base/small). Long prompts either get truncated or confuse the
+    # decoder for unrelated speech. We cap each component independently
+    # so a single very long previous clip doesn't crowd out the others.
+    _PROMPT_COMPONENT_CHARS = 200
+    # Hard cap on the assembled prompt — well under whisper's 224-token
+    # limit even for BPE-heavy text. If everything is present and the
+    # sum exceeds this, we drop the most expendable component
+    # (within-press chunk) first, then the across-press hint, before
+    # touching the static lexical bias.
+    _PROMPT_TOTAL_CHARS = 400
+    # The components are joined with this separator. The total length
+    # budget must account for `len(_PROMPT_SEP) * (n - 1)` extra chars
+    # so a 3-component join can't sneak past the cap.
+    _PROMPT_SEP = ", "
+    _PROMPT_SEP_LEN = len(_PROMPT_SEP)
+
+    def _build_initial_prompt(self, profile: Profile) -> str:
+        """Assemble the layered `initial_prompt` for the next transcribe.
+
+        Order: configured lexical bias → across-press hint (if recent) →
+        within-press chunk (always, when present). Empty components are
+        dropped. The result is hard-capped at `_PROMPT_TOTAL_CHARS` to
+        stay well under whisper's 224-token prompt limit; components are
+        dropped from least-important to most-important to fit.
+
+        Thread-safety: reads the cross-press and within-press state
+        under `_prompt_lock`. The watchdog body (different thread) and
+        the release path can both call this concurrently.
+        """
+        static = (profile.initial_prompt or "").strip()
+        with self._prompt_lock:
+            prev_clip = self._press_start_clip_text
+            prev_clip_age = (
+                time.monotonic() - self._last_clip_at if self._last_clip_at else float("inf")
+            )
+            prev_chunk = self._last_chunk_text
+        # Drop the across-press hint if it's missing or too old. The
+        # `prev_clip_age` here is the age of the press-start snapshot,
+        # which is the same as the age of `_last_clip_text` at the
+        # moment the press started (the snapshot is taken then).
+        if (
+            not prev_clip
+            or prev_clip_age > self.config.audio.prev_clip_window_seconds
+            or self.config.audio.prev_clip_window_seconds <= 0
+        ):
+            prev_clip = ""
+        components = [c for c in (static, prev_clip, prev_chunk) if c]
+        if not components:
+            return ""
+        # Each component is independently capped; the assembled string
+        # is then capped to `_PROMPT_TOTAL_CHARS` by dropping the
+        # least-important component first.
+        capped = [c[-self._PROMPT_COMPONENT_CHARS:] for c in components]
+        sep_budget = self._PROMPT_SEP_LEN * (len(capped) - 1)
+        while (
+            sum(len(c) for c in capped) + sep_budget > self._PROMPT_TOTAL_CHARS
+            and len(capped) > 1
+        ):
+            # Drop the within-press chunk first (least important for
+            # topic-level bias), then the across-press hint.
+            capped.pop(-1)
+            sep_budget = self._PROMPT_SEP_LEN * (len(capped) - 1)
+        return self._PROMPT_SEP.join(capped)
+
+    def _record_transcript(self, text: str) -> None:
+        """Update continuity state after a successful non-empty transcribe.
+
+        Sets both the within-press chunk text (used by the next chunk
+        in the same press) and the across-press clip text + timestamp
+        (used by the next press). Guarded by `_prompt_lock` because
+        the chunked watchdog body and the release path can land on
+        the same `_last_clip_text` update.
+        """
+        with self._prompt_lock:
+            self._last_chunk_text = text
+            self._last_clip_text = text
+            self._last_clip_at = time.monotonic()
 
     def _make_press_cb(self, profile: Profile):
         def cb() -> None:
@@ -489,6 +625,8 @@ class App:
         threshold_str = "off" if threshold == 0 else f"{threshold:g}"
         auto_stop = cfg.audio.auto_stop_seconds
         auto_stop_str = "off" if auto_stop == 0 else f"{auto_stop:g}s"
+        prev_window = cfg.audio.prev_clip_window_seconds
+        prev_window_str = "off" if prev_window == 0 else f"{prev_window:g}s"
         if self.config_source is not None:
             source_str = str(self.config_source)
         else:
@@ -517,6 +655,7 @@ class App:
             f"models   : loaded {distinct} into memory{dedupe_str}",
             f"sample   : {cfg.audio.sample_rate} Hz, device={device}",
             f"silence  : rms<{threshold_str} -> skip; auto-stop after {auto_stop_str}",
+            f"continuity: across-press hint within {prev_window_str} (within-press always on)",
             f"inject   : {inject_mode}, trailing_space={cfg.inject.trailing_space}",
             f"transcribe: {_gpu_summary(cfg.transcribe.use_gpu, cfg.transcribe.gpu_device)}",
         ]
