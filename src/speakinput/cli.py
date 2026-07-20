@@ -45,6 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "base",
             "small",
             "medium",
+            "large-v3",
         ),
         default=None,
         help="Override the primary profile's whisper model (default: small)",

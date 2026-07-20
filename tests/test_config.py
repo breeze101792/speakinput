@@ -372,8 +372,15 @@ def test_default_model_is_multilingual():
 
 
 def test_validation_accepts_multilingual_models():
-    for m in ("tiny", "base", "small", "medium"):
+    for m in ("tiny", "base", "small", "medium", "large-v3"):
         Config(primary=Profile(model=m, language="zh")).validate()
+
+
+def test_validation_accepts_large_v3_with_zh():
+    """large-v3 is multilingual, must validate with any language."""
+    Config(primary=Profile(model="large-v3", language="zh")).validate()
+    Config(primary=Profile(model="large-v3", language="en")).validate()
+    Config(primary=Profile(model="large-v3", language="auto")).validate()
 
 
 def test_validation_accepts_auto_language():

@@ -26,9 +26,12 @@ from platformdirs import user_config_dir
 APP_NAME = "speakinput"
 
 # Curated models exposed by default. The `.en` variants are English-only and
-# faster; the multilingual variants (`tiny`, `base`, `small`, `medium`) are
-# slower per call but support Chinese and auto-detection. Any absolute path
-# to a .bin file is also accepted at the CLI/ensure_model layer.
+# faster; the multilingual variants (`tiny`, `base`, `small`, `medium`,
+# `large-v3`) are slower per call but support Chinese and auto-detection.
+# `large-v3` is whisper's best accuracy model (~3.1 GB) — recommended when
+# you have the RAM to spare and the latency budget to absorb a slower
+# decode. Any absolute path to a .bin file is also accepted at the
+# CLI/ensure_model layer.
 VALID_MODELS = (
     "tiny.en",
     "base.en",
@@ -37,6 +40,7 @@ VALID_MODELS = (
     "base",
     "small",
     "medium",
+    "large-v3",
 )
 # Languages that are always supported. `auto` translates to pywhispercpp's
 # `language=None`, which triggers per-utterance language identification.
