@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -73,6 +74,28 @@ class AudioRecorder:
         with self._rms_lock:
             return self._last_rms
 
+    def _device_is_present(self, device: int | None) -> bool:
+        """Return True if the configured device can be opened.
+
+        A `query_devices()` call is sub-millisecond — it just reads
+        PortAudio's cached device table. We use it on the press path
+        to detect the 'user unplugged their USB mic mid-session' case
+        before we try to open the stream (which would raise a less
+        helpful exception).
+
+        For `device=None` (system default), the answer is always True:
+        PortAudio re-resolves the default on every `InputStream()` call,
+        so a newly-plugged mic or a macOS Sound control panel switch
+        is picked up automatically. We don't try to second-guess it.
+        """
+        if device is None:
+            return True
+        try:
+            sd.query_devices(device)
+        except Exception:
+            return False
+        return True
+
     def start(self) -> None:
         if self._recording:
             return
@@ -80,14 +103,46 @@ class AudioRecorder:
         self._chunks = []
         with self._rms_lock:
             self._last_rms = 0.0
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype="float32",
-            device=self.device,
-            callback=self._on_audio,
-        )
-        self._stream.start()
+        # Fall back to system default if the pinned device disappeared
+        # since the last press (USB unplug, Bluetooth headset
+        # disconnected, etc.). The check is sub-ms; the stream-open
+        # that follows is the real cost (~30-100ms on macOS). When
+        # `device is None` the system default is used and re-resolved
+        # by PortAudio on every call, so the fallback is unnecessary.
+        device = self.device
+        if device is not None and not self._device_is_present(device):
+            print(
+                f"[warn] configured audio device {device} is not available; "
+                f"falling back to system default microphone",
+                file=sys.stderr,
+                flush=True,
+            )
+            device = None
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="float32",
+                device=device,
+                callback=self._on_audio,
+            )
+            self._stream.start()
+        except Exception as exc:
+            # No microphone at all (system default also gone), or the
+            # OS denied us access. Surface a clear message instead of
+            # letting the press fail silently. The user needs to know
+            # WHY their key did nothing.
+            print(
+                f"[error] could not open audio input stream: {exc}. "
+                f"Check that a microphone is connected and that speakinput "
+                f"has Microphone permission in System Settings → Privacy "
+                f"& Security → Microphone.",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._stream = None
+            self._recording = False
+            raise AudioError(f"audio stream open failed: {exc}") from exc
         self._recording = True
 
     def _on_audio(self, indata, frames, time, status) -> None:  # noqa: ANN001 (sounddevice API)

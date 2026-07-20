@@ -236,3 +236,103 @@ def test_recorder_stop_equivalent_to_drain_then_close(fake_sd):
     out = r.stop()
     assert not r.is_recording()
     assert out.size == 1600
+
+
+# --- mic-presence preflight (device pinned in config) ----------------------
+
+
+def test_default_device_skips_preflight_check(fake_sd):
+    """When `device` is None (system default), we must NOT call
+    query_devices on every press — PortAudio re-resolves the default
+    on every InputStream(), so the check is unnecessary AND adds
+    ~1ms of work to every press for no benefit."""
+    from speakinput.audio import AudioRecorder
+
+    r = AudioRecorder()  # default device=None
+    r.start()
+    fake_sd.query_devices.assert_not_called()
+
+
+def test_pinned_device_present_uses_it(fake_sd, capsys):
+    """When the pinned device IS present, use it as-is. The preflight
+    call is the only `query_devices` interaction — no warning, no
+    fallback."""
+    from speakinput.audio import AudioRecorder
+
+    fake_sd.query_devices.return_value = {"name": "USB Mic"}  # no exception
+    r = AudioRecorder(device=2)
+    r.start()
+    fake_sd.query_devices.assert_called_once_with(2)
+    # The stream must be opened with the requested device, not the default.
+    kwargs = fake_sd.InputStream.call_args.kwargs
+    assert kwargs["device"] == 2
+    captured = capsys.readouterr()
+    assert "falling back" not in captured.err
+
+
+def test_pinned_device_gone_falls_back_to_default(fake_sd, capsys):
+    """If the pinned device disappeared (USB unplug, Bluetooth off,
+    etc.), fall back to system default with a one-line warning.
+    Without this, the stream open would raise and the press would
+    silently fail."""
+    from speakinput.audio import AudioRecorder
+
+    fake_sd.query_devices.side_effect = Exception("device 2 not found")
+    r = AudioRecorder(device=2)
+    r.start()
+    # The InputStream was opened with `device=None` (system default).
+    kwargs = fake_sd.InputStream.call_args.kwargs
+    assert kwargs["device"] is None
+    captured = capsys.readouterr()
+    assert "device 2 is not available" in captured.err
+    assert "falling back" in captured.err
+
+
+def test_no_mic_at_all_raises_with_clear_message(fake_sd, capsys):
+    """If even the system default is gone (no mic plugged in, or
+    Microphone permission revoked), InputStream raises. The recorder
+    must re-raise as AudioError with a message that tells the user
+    what to do — connect a mic, check System Settings → Microphone."""
+    from speakinput.audio import AudioError, AudioRecorder
+
+    fake_sd.query_devices.return_value = []  # no devices at all
+    fake_sd.InputStream.side_effect = OSError("no input device")
+    r = AudioRecorder()
+    with pytest.raises(AudioError, match="audio stream open failed"):
+        r.start()
+    captured = capsys.readouterr()
+    assert "could not open audio input stream" in captured.err
+    assert "Microphone permission" in captured.err
+    # Recorder must NOT be left in a half-started state — the next
+    # press should be able to retry cleanly.
+    assert not r.is_recording()
+
+
+def test_recorder_surfaces_stream_error_on_press(capsys, monkeypatch):
+    """App.on_hotkey_press must surface a clear signal when the
+    recorder can't open a stream. Currently the press just logs and
+    returns; the user has no idea why their key did nothing. This
+    test pins the behavior: feedback goes back to 'idle' so the
+    menu-bar indicator doesn't get stuck on 'listening'."""
+    from speakinput.app import App
+    from speakinput.audio import AudioError
+    from speakinput.config import AudioConfig, Config
+    from unittest.mock import MagicMock
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    recorder = MagicMock()
+    recorder.start.side_effect = AudioError("no mic")
+    feedback = MagicMock()
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=feedback,
+    )
+    app.on_hotkey_press(app.config.primary)
+    # The press was registered, the recorder failed, feedback returned
+    # to idle. The user is no longer holding a stale 'listening' state.
+    feedback.set_state.assert_any_call("idle")
+    # And the busy lock is released so a fresh press is accepted.
+    assert not app._busy.locked()

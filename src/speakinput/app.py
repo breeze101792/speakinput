@@ -334,7 +334,18 @@ class App:
         try:
             self.recorder.start()
         except Exception:
+            # The recorder already printed a clear stderr message
+            # explaining what went wrong (mic gone, permission denied,
+            # etc.). Surface a brief feedback state so the menu-bar /
+            # stderr feedback shows the user that the press was
+            # registered but couldn't capture audio. The release path
+            # will see `is_recording() == False` and become a no-op,
+            # so we don't have to do anything else here.
             log.exception("failed to start recorder")
+            try:
+                self.feedback.set_state("idle")
+            except Exception:
+                pass
             self._busy.release()
             self._press_started_at = None
             self._active_profile = None
