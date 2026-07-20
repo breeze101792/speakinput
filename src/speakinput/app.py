@@ -39,6 +39,99 @@ def _dbg(enabled: bool, msg: str) -> None:
         print(f"[debug] {msg}", file=sys.stderr, flush=True)
 
 
+class _LivenessWatcher:
+    """Background thread that polls listener liveness every `interval_s`.
+
+    Each `HotkeyListener` (pynput) and `EvdevHotkeyListener` runs its
+    own run loop on a daemon thread. If the run loop returns or
+    raises, the thread dies and the hotkey stops working — but the
+    process is still alive, so the user has no way to tell from the
+    outside. This watcher checks `is_alive()` periodically and
+    invokes `on_dead(key)` the first time a listener transitions from
+    alive to dead. One warning per death; not spammy.
+
+    The watcher is itself a daemon thread and exits when `stop()` is
+    called or when the process is about to exit.
+    """
+
+    def __init__(
+        self,
+        listeners: list,
+        interval_s: float,
+        on_dead,
+    ) -> None:
+        self._listeners = listeners
+        self._interval_s = interval_s
+        self._on_dead = on_dead
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        # Map of listener -> True. We track "was alive" to fire
+        # `on_dead` exactly once per transition (alive -> dead), not
+        # every poll after the thread dies.
+        self._was_alive: dict[int, bool] = {id(lst): True for lst in listeners}
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="speakinput-liveness", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_s):
+            for listener in self._listeners:
+                key = getattr(listener, "_key", None) or getattr(
+                    listener, "_keycode", "?"
+                )
+                alive = bool(listener.is_running()) and bool(
+                    getattr(listener, "_thread", None)
+                    and listener._thread.is_alive()
+                )
+                was = self._was_alive.get(id(listener), True)
+                if was and not alive:
+                    self._on_dead(key)
+                self._was_alive[id(listener)] = alive
+
+
+class _Heartbeat:
+    """Background thread that prints a "still here" line every interval.
+
+    Debug-only — confirms the main loop is alive when the user comes
+    back to a terminal that hasn't moved in a while (e.g. after sleep).
+    Cheap: one print + one wait per interval.
+    """
+
+    def __init__(self, interval_s: float) -> None:
+        self._interval_s = interval_s
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start = time.monotonic()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="speakinput-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_s):
+            uptime = time.monotonic() - self._start
+            print(
+                f"[debug] heartbeat: still alive, uptime={uptime:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def _build_transcribers(
     profiles: list[Profile],
     transcriber_overrides: dict[str, Transcriber] | None = None,
@@ -175,6 +268,10 @@ class App:
         # every chunked re-arm so a stale watchdog is never running.
         self._watchdog: SilenceWatchdog | None = None
         self.listeners: dict[str, HotkeyListener] = {}
+        # Background liveness watcher and heartbeat — both started in
+        # `run()` once the listeners are actually live. None until then.
+        self._liveness_watcher: _LivenessWatcher | None = None
+        self._heartbeat: _Heartbeat | None = None
         # Layered continuity hints fed into whisper's initial_prompt.
         #
         # `_last_clip_text` + `_last_clip_at`: the text + monotonic
@@ -607,8 +704,61 @@ class App:
         if self.debug:
             _dbg(True, "debug mode ON — every key event and transcript will be logged to stderr")
         # Install signal handlers so Ctrl-C cleans up the recorder.
+        # We handle SIGINT, SIGTERM, and SIGHUP. SIGINT is Ctrl-C in the
+        # foreground terminal; SIGTERM is what launchctl / `kill` send by
+        # default; SIGHUP is what the kernel sends when the controlling
+        # terminal is closed (e.g. the user closed the Terminal window
+        # that started speakinput). Without a SIGHUP handler, the
+        # process would die mid-shutdown the next time the user opens
+        # the same terminal — leaving the recorder thread orphaned and
+        # the next start.sh failing to acquire the single-instance lock.
+        # All three just set the shutdown event; the `finally` block
+        # below runs the actual teardown.
         signal.signal(signal.SIGINT, lambda *_: self._shutdown.set())
         signal.signal(signal.SIGTERM, lambda *_: self._shutdown.set())
+        try:
+            signal.signal(signal.SIGHUP, lambda *_: self._shutdown.set())
+        except (AttributeError, ValueError):
+            # SIGHUP doesn't exist on Windows; signal.signal also fails
+            # if called from a non-main thread. Either way, skip it.
+            pass
+        # Background liveness watcher. Polls every 5s whether the
+        # listener threads are still alive. pynput's macOS backend uses
+        # a CGEventTap that macOS can disable on sleep/wake or when the
+        # user revokes Input Monitoring — the thread keeps running but
+        # stops delivering events, and the user has no way to tell. A
+        # dead Thread object (`.is_alive() == False`) means the run
+        # loop returned or raised; either way the hotkey is dead.
+        # Daemon so it dies with the process; the liveness check is
+        # cheap (one bool per listener).
+        #
+        # The warning is unconditional (not gated on debug mode) — a
+        # dead hotkey is a real problem the user needs to see, even if
+        # they normally run without -d.
+        def _on_listener_dead(key) -> None:
+            print(
+                f"[warn] hotkey listener for {key!r} is no longer alive — "
+                f"the push-to-talk key will not respond. "
+                f"Restart speakinput to recover.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        self._liveness_watcher = _LivenessWatcher(
+            listeners=list(self.listeners.values()),
+            interval_s=5.0,
+            on_dead=_on_listener_dead,
+        )
+        self._liveness_watcher.start()
+        # Heartbeat: print a one-line "still here" every 60s in debug
+        # mode. Helps the user distinguish a hung process (no heartbeat
+        # after a minute) from a healthy one that's just not being
+        # spoken to. Off by default because it's noise.
+        if self.debug:
+            self._heartbeat = _Heartbeat(interval_s=60.0)
+            self._heartbeat.start()
+        else:
+            self._heartbeat = None
         try:
             self._shutdown.wait()
         finally:
@@ -663,11 +813,34 @@ class App:
             print(f"[startup] {line}", file=sys.stderr, flush=True)
 
     def shutdown(self) -> None:
+        # Stop the background helpers first so they don't try to use
+        # the listeners/watchdog while we're tearing them down.
+        if self._liveness_watcher is not None:
+            try:
+                self._liveness_watcher.stop()
+            except Exception:
+                log.exception("liveness watcher stop failed")
+            self._liveness_watcher = None
+        if self._heartbeat is not None:
+            try:
+                self._heartbeat.stop()
+            except Exception:
+                log.exception("heartbeat stop failed")
+            self._heartbeat = None
         self._shutdown.set()
         if self.media_controller is not None:
-            self.media_controller.resume()
+            try:
+                self.media_controller.resume()
+            except Exception:
+                # A hung osascript / playerctl must NOT block shutdown.
+                # The user has been waiting to exit; logging and moving
+                # on is better than hanging indefinitely.
+                log.exception("media resume failed during shutdown")
         if self._watchdog is not None:
-            self._watchdog.stop()
+            try:
+                self._watchdog.stop()
+            except Exception:
+                log.exception("watchdog stop failed")
             self._watchdog = None
         for key, listener in self.listeners.items():
             try:

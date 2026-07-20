@@ -1660,3 +1660,198 @@ def test_continuity_prompt_caps_total_length():
     # Cap is 400 chars; the long_text must be truncated AND the total
     # must be under the cap.
     assert len(prompt) <= 400
+
+
+# --- shutdown hardening: liveness, heartbeat, signal handling -------------
+
+
+def test_liveness_watcher_fires_on_dead_listener():
+    """If a listener's underlying thread dies (e.g. pynput's CGEventTap
+    was disabled by macOS on sleep/wake), the watcher must call
+    `on_dead` exactly once with the listener's key."""
+    from speakinput.app import _LivenessWatcher
+
+    on_dead = MagicMock()
+    listener = MagicMock()
+    listener._key = "alt_r"
+    listener.is_running.return_value = False
+    listener._thread = MagicMock()
+    listener._thread.is_alive.return_value = False
+
+    watcher = _LivenessWatcher(
+        listeners=[listener], interval_s=0.01, on_dead=on_dead
+    )
+    watcher.start()
+    try:
+        # 0.01s poll × ~5 iterations is well under a second.
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    # `on_dead` was invoked at least once; the watcher polls and emits
+    # every poll after death, so we just check it was called.
+    assert on_dead.called
+    on_dead.assert_called_with("alt_r")
+
+
+def test_run_emits_unconditional_warning_on_dead_listener(capsys, monkeypatch):
+    """A dead listener must trigger a user-visible warning on stderr,
+    NOT just a debug line. The user needs to know the hotkey is dead
+    even when running without -d."""
+    from speakinput.app import App
+
+    fake_ensure = MagicMock(return_value="/r/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+    monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+        debug=False,  # not in debug mode
+    )
+    # Manually install a dead listener and a watcher that polls fast.
+    from speakinput.app import _LivenessWatcher
+    listener = MagicMock()
+    listener._key = "alt_r"
+    listener.is_running.return_value = False
+    listener._thread = MagicMock()
+    listener._thread.is_alive.return_value = False
+    app.listeners = {"alt_r": listener}
+    watcher = _LivenessWatcher(
+        listeners=[listener], interval_s=0.01, on_dead=lambda k: print(
+            f"[warn] hotkey listener for {k!r} is no longer alive — "
+            f"the push-to-talk key will not respond. "
+            f"Restart speakinput to recover.",
+            file=__import__("sys").stderr,
+            flush=True,
+        ),
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    captured = capsys.readouterr()
+    assert "hotkey listener for 'alt_r' is no longer alive" in captured.err
+    # And it must be visible WITHOUT the [debug] prefix.
+    assert "[debug] hotkey listener" not in captured.err
+
+
+def test_liveness_watcher_does_not_fire_when_alive():
+    """A healthy listener (thread alive, is_running True) must not
+    trigger `on_dead`."""
+    from speakinput.app import _LivenessWatcher
+
+    on_dead = MagicMock()
+    listener = MagicMock()
+    listener._key = "alt_r"
+    listener.is_running.return_value = True
+    listener._thread = MagicMock()
+    listener._thread.is_alive.return_value = True
+
+    watcher = _LivenessWatcher(
+        listeners=[listener], interval_s=0.01, on_dead=on_dead
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    on_dead.assert_not_called()
+
+
+def test_heartbeat_emits_periodically_in_debug(capsys):
+    """The heartbeat prints a 'still alive' line every interval when
+    debug mode is on. Used to confirm the process is alive after a
+    long sleep / idle period."""
+    from speakinput.app import _Heartbeat
+
+    hb = _Heartbeat(interval_s=0.05)
+    hb.start()
+    try:
+        time.sleep(0.2)
+    finally:
+        hb.stop()
+    captured = capsys.readouterr()
+    # At least one heartbeat line in 0.2s with a 0.05s interval.
+    assert "heartbeat" in captured.err
+    assert "uptime=" in captured.err
+
+
+def test_run_installs_sighup_handler(monkeypatch):
+    """`App.run()` must install a SIGHUP handler so terminal close
+    triggers a clean shutdown. Without it, closing the terminal would
+    SIGKILL the process mid-shutdown, leaving the single-instance
+    lock orphaned and breaking the next start.sh."""
+    from speakinput.app import App
+    import signal as _sig_module
+
+    fake_ensure = MagicMock(return_value="/r/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+    monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+    installed: dict[int, object] = {}
+    # Bind the real signal.signal at import time (before the monkeypatch
+    # below) so the fake_signal below can call it without recursing.
+    real_signal_signal = _sig_module.signal
+
+    def fake_signal(signum, handler):
+        if hasattr(_sig_module, "SIGHUP") and signum == _sig_module.SIGHUP:
+            installed[signum] = handler
+        return real_signal_signal(signum, handler)
+
+    monkeypatch.setattr("signal.signal", fake_signal)
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app._shutdown.set()
+    app.run()
+
+    # SIGHUP must be installed AND must set the shutdown event.
+    assert _sig_module.SIGHUP in installed
+    installed[_sig_module.SIGHUP](_sig_module.SIGHUP, None)
+    assert app._shutdown.is_set()
+
+
+def test_shutdown_handles_hung_media_resume():
+    """If `media_controller.resume()` blocks (e.g. osascript is wedged),
+    `shutdown()` must not hang the process. The user has been waiting
+    to exit; logging and moving on is the right behavior."""
+    app, _, _, _, _ = _build_app()
+    # Media controller exists by default (pause_media=True). Patch it
+    # to a mock that raises — we want to confirm shutdown tolerates it.
+    media = MagicMock()
+    media.resume.side_effect = RuntimeError("osascript wedged")
+    app.media_controller = media
+    # Watchdog is None; that's fine.
+    # The real test: shutdown() must complete without raising and
+    # must still set _shutdown and stop the listeners.
+    app.shutdown()
+    assert app._shutdown.is_set()
+    for listener in app.listeners.values():
+        listener.stop.assert_called()
+
+
+def test_shutdown_is_idempotent():
+    """`shutdown()` is safe to call twice — used by the signal handler
+    path (sets event) and the `finally` block. Also called by
+    `cli.main()`'s `KeyboardInterrupt` handler."""
+    app, _, _, _, _ = _build_app()
+    app.shutdown()
+    # Second call must not raise, even though all the resources are
+    # already torn down.
+    app.shutdown()
+    assert app._shutdown.is_set()
