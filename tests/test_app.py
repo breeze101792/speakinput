@@ -636,10 +636,13 @@ def test_run_uses_evdev_listener_on_wayland(monkeypatch, capsys):
     assert not appmod.HotkeyListener.called
 
 
-def test_run_uses_pynput_listener_on_x11(monkeypatch, capsys):
-    """Counterpart to the Wayland test: when XDG_SESSION_TYPE is unset
-    or x11, pynput's HotkeyListener is used and the banner doesn't
-    mention evdev."""
+def test_run_falls_back_to_pynput_when_evdev_cant_find_keyboard(monkeypatch, capsys):
+    """On Linux, evdev is preferred because it works on both Wayland
+    and X11. If `probe_evdev_available()` reports no accessible keyboard
+    in /dev/input (no permission, no /dev/input, no keyboard attached),
+    the app falls back to pynput's X11 backend so the user still gets
+    a working (or at least a clearly-failing) listener instead of
+    silent no-ops."""
     from speakinput.app import App
     from speakinput.config import Profile
 
@@ -648,6 +651,8 @@ def test_run_uses_pynput_listener_on_x11(monkeypatch, capsys):
     monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
     monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+    # Force the evdev probe to fail so we exercise the fallback path.
+    monkeypatch.setattr("speakinput.app.probe_evdev_available", lambda: False)
 
     config = Config(primary=Profile(key="alt_r"))
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
@@ -655,10 +660,44 @@ def test_run_uses_pynput_listener_on_x11(monkeypatch, capsys):
     app.run()
 
     captured = capsys.readouterr()
-    assert "evdev" not in captured.err
+    # The banner explains WHY evdev was skipped so the user can debug
+    # the fallback. Both the pynput line and the probe-failed diagnostic
+    # mention evdev by name.
+    assert "pynput" in captured.err
+    assert "evdev probe failed" in captured.err
     import speakinput.app as appmod
     assert appmod.HotkeyListener.called
     assert not appmod.EvdevHotkeyListener.called
+
+
+def test_run_prefers_evdev_on_linux_x11(monkeypatch, capsys):
+    """On Linux, evdev is preferred over pynput because it works on both
+    Wayland and X11 (it reads /dev/input directly, no X server needed).
+    Previously the app gated evdev on `XDG_SESSION_TYPE=wayland`, which
+    silently fell through to pynput on X11 sessions — and to a broken
+    pynput on Wayland sessions where the env var wasn't propagated
+    (tmux, SSH, containers). The new probe makes the decision based on
+    actual evdev availability, not the session type."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    fake_ensure = MagicMock(return_value="/resolved/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+    # Simulate an X11 Linux session — evdev is still the right choice.
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
+
+    config = Config(primary=Profile(key="alt_r"))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert "evdev" in captured.err
+    import speakinput.app as appmod
+    assert appmod.EvdevHotkeyListener.called
+    assert not appmod.HotkeyListener.called
 
 
 def test_app_uses_wtype_injector_on_wayland(monkeypatch):
@@ -1763,6 +1802,61 @@ def test_liveness_watcher_does_not_fire_when_alive():
     finally:
         watcher.stop()
     on_dead.assert_not_called()
+
+
+def test_liveness_watcher_works_for_pynput_listener_without_thread_attr():
+    """Regression test: the watcher previously did
+    `is_running() and listener._thread.is_alive()`, which always
+    evaluated to False for the pynput-backed `HotkeyListener` (it has
+    no `_thread` attribute — pynput uses `_listener`). On macOS this
+    caused a false-positive "listener is no longer alive" warning 5s
+    after every start, even when the listener was perfectly healthy.
+
+    The fix is to use `is_running()` alone — both backends implement
+    it correctly. This test simulates a pynput listener (no `_thread`,
+    `is_running()` returns True) and asserts the watcher stays quiet.
+    """
+    from speakinput.app import _LivenessWatcher
+
+    on_dead = MagicMock()
+    listener = MagicMock(spec=["_key", "is_running"])  # no _thread
+    listener._key = "alt_r"
+    listener.is_running.return_value = True
+
+    watcher = _LivenessWatcher(
+        listeners=[listener], interval_s=0.01, on_dead=on_dead
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    on_dead.assert_not_called()
+
+
+def test_liveness_watcher_fires_for_pynput_listener_when_dead():
+    """Counterpart to the previous test: when the pynput listener's
+    `is_running()` returns False (e.g. pynput's CGEventTap was
+    disabled by macOS on sleep/wake), the watcher must still call
+    `on_dead`. Catches the case where the liveness check is
+    accidentally gated on `_thread` and never reports pynput deaths.
+    """
+    from speakinput.app import _LivenessWatcher
+
+    on_dead = MagicMock()
+    listener = MagicMock(spec=["_key", "is_running"])
+    listener._key = "alt_r"
+    listener.is_running.return_value = False
+
+    watcher = _LivenessWatcher(
+        listeners=[listener], interval_s=0.01, on_dead=on_dead
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    on_dead.assert_called_with("alt_r")
 
 
 def test_heartbeat_emits_periodically_in_debug(capsys):

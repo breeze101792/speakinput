@@ -357,9 +357,9 @@ macOS sometimes resets these permissions after a macOS update, after major Pytho
 
 ## Linux / Wayland
 
-Speak Input auto-detects Wayland sessions (`XDG_SESSION_TYPE=wayland`) and uses a second hotkey listener that reads the Linux kernel input subsystem directly via `python-evdev`, bypassing pynput's X11-only backend. On X11 Linux (or any Linux session where pynput can reach a display) it uses pynput as before.
+Speak Input uses a second hotkey listener on Linux that reads the kernel input subsystem directly via `python-evdev`, bypassing pynput's X11-only backend. evdev works on **both** Wayland and X11 (it talks to `/dev/input/eventN`, not the display server), so it's the right choice for every Linux session — no need to inspect `XDG_SESSION_TYPE`. If evdev can't find an accessible keyboard (no `/dev/input` access, not in the `input` group, no keyboard attached), the app falls back to pynput.
 
-No configuration is required to enable this — it's a runtime decision based on the session type. The startup banner line `[startup] hotkey   : evdev (Linux Wayland session — pynput bypassed)` confirms the evdev backend is active.
+No configuration is required to enable this — it's a runtime decision based on actual evdev availability. The startup banner line `[startup] hotkey   : evdev (Linux — reads /dev/input directly)` confirms the evdev backend is active.
 
 ### Permissions
 

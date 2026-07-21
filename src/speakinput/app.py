@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import sys
 import threading
@@ -16,6 +15,7 @@ from speakinput.feedback import Feedback, NullFeedback
 from speakinput.hotkey import (
     EvdevHotkeyListener,
     HotkeyListener,
+    probe_evdev_available,
     resolve_evdev_key,
     resolve_key,
 )
@@ -37,6 +37,40 @@ def _dbg(enabled: bool, msg: str) -> None:
     """Print a debug line to stderr only when debug mode is on."""
     if enabled:
         print(f"[debug] {msg}", file=sys.stderr, flush=True)
+
+
+def _probe_evdev_or_diag() -> tuple[bool, str | None]:
+    """Run the evdev availability probe and return both the result AND
+    the error message if it failed.
+
+    `probe_evdev_available()` in `speakinput.hotkey` only returns a bool,
+    which silently discards the `HotkeyError` reason. The user then sees
+    a missing/quiet pynput-fallback banner and has no way to know why
+    evdev wasn't picked. We re-implement the probe here so we can keep
+    the diagnostic string and surface it in the startup banner.
+
+    The second call to `find_keyboard_device()` exists only to capture
+    the `HotkeyError` reason; if it returns a device (race condition
+    where a keyboard appeared between the probe and this call), we
+    close the device before discarding it so we don't leak an fd.
+    """
+    from speakinput.hotkey import find_keyboard_device
+
+    if probe_evdev_available():
+        return True, None
+    try:
+        dev = find_keyboard_device()
+    except Exception as exc:  # HotkeyError or anything else
+        return False, str(exc)
+    # find_keyboard_device returned — close the device to avoid leaking
+    # an fd. This branch is only hit on a race condition (the probe
+    # failed but a device appeared moments later); on a healthy system
+    # the probe and this call agree.
+    try:
+        dev.close()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return False, "evdev probe inconsistency: probe failed but find_keyboard_device succeeded"
 
 
 class _LivenessWatcher:
@@ -87,10 +121,17 @@ class _LivenessWatcher:
                 key = getattr(listener, "_key", None) or getattr(
                     listener, "_keycode", "?"
                 )
-                alive = bool(listener.is_running()) and bool(
-                    getattr(listener, "_thread", None)
-                    and listener._thread.is_alive()
-                )
+                # `is_running()` is the authoritative liveness check for
+                # both backends: `HotkeyListener` wraps pynput's listener
+                # (which exposes `is_alive()` on the underlying thread)
+                # and `EvdevHotkeyListener` wraps a `threading.Thread`.
+                # Both check the actual thread liveness, so the extra
+                # `_thread.is_alive()` lookup below is redundant and
+                # broken for the pynput backend (which has no `_thread`
+                # attribute — that name belongs to the evdev listener
+                # only). Using `is_running()` alone fixes a false-positive
+                # "listener is dead" warning on macOS.
+                alive = bool(listener.is_running())
                 was = self._was_alive.get(id(listener), True)
                 if was and not alive:
                     self._on_dead(key)
@@ -683,18 +724,51 @@ class App:
                 raise SystemExit(2) from exc
         self._print_banner()
         self.feedback.start()
-        use_evdev = (
-            sys.platform == "linux"
-            and os.environ.get("XDG_SESSION_TYPE") == "wayland"
-        )
-        # Print the chosen hotkey backend so the user can verify which
-        # code path is active (helpful for permission issues on Wayland).
+        # Backend selection on Linux: prefer evdev (reads /dev/input
+        # directly, works on Wayland AND X11 AND headless), fall back to
+        # pynput only if evdev can't find a keyboard. The previous
+        # `XDG_SESSION_TYPE == "wayland"` gate was too narrow — many
+        # real Wayland sessions (tmux, SSH, containers) don't propagate
+        # the env var, so speakinput would silently fall through to the
+        # X11-only pynput backend and stop detecting key presses.
+        use_evdev = False
+        evdev_probe_error: str | None = None
+        if sys.platform == "linux":
+            use_evdev, evdev_probe_error = _probe_evdev_or_diag()
+        # Always print the hotkey backend so the user can verify which
+        # code path is active — a missing or wrong banner has been a
+        # recurring source of "hotkey does nothing" reports that turn
+        # out to be the wrong backend being picked silently.
         if use_evdev:
             print(
-                "[startup] hotkey   : evdev (Linux Wayland session — pynput bypassed)",
+                "[startup] hotkey   : evdev (Linux — reads /dev/input directly)",
                 file=sys.stderr,
                 flush=True,
             )
+        else:
+            platform_tag = (
+                "Linux (evdev unavailable — pynput fallback)"
+                if sys.platform == "linux"
+                else "macOS / Windows (pynput)"
+            )
+            print(
+                f"[startup] hotkey   : pynput ({platform_tag})",
+                file=sys.stderr,
+                flush=True,
+            )
+            if evdev_probe_error:
+                # Surface the underlying reason so the user can fix
+                # permissions / attach a keyboard / etc. without
+                # grepping through Python source. The pynput backend
+                # on Linux+X11 will silently fail to grab global keys
+                # without a reachable X server, so this hint is the
+                # difference between "hotkey is broken" and "here's
+                # exactly why and what to do".
+                print(
+                    f"[startup] hotkey   : evdev probe failed: {evdev_probe_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         for profile in self._profiles:
             if use_evdev:
                 listener = EvdevHotkeyListener(
