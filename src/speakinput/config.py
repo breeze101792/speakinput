@@ -146,6 +146,7 @@ class Profile:
     language: str = "auto"
     beam_size: int = 1
     initial_prompt: str = _EMBEDDED_PROMPT
+    zh_conversion: bool = True
 
 
 def primary_profile() -> Profile:
@@ -269,6 +270,7 @@ class Config:
             language=primary_raw.get("language", "auto"),
             beam_size=primary_raw.get("beam_size", 1),
             initial_prompt=primary_raw.get("initial_prompt", _EMBEDDED_PROMPT),
+            zh_conversion=primary_raw.get("zh_conversion", True),
         )
         secondary_raw = profiles_raw.get("secondary")
         if secondary_raw is None:
@@ -280,6 +282,7 @@ class Config:
                 language=secondary_raw.get("language", "zh"),
                 beam_size=secondary_raw.get("beam_size", 1),
                 initial_prompt=secondary_raw.get("initial_prompt", _EMBEDDED_PROMPT),
+                zh_conversion=secondary_raw.get("zh_conversion", True),
             )
         audio_raw = dict(data.get("audio", {}))
         # `device` is intentionally optional in the TOML file (it has no null
@@ -341,6 +344,11 @@ class Config:
                 raise ValueError(
                     f"profile.{label}.beam_size must be in [1, 10], "
                     f"got {profile.beam_size}"
+                )
+            if not isinstance(profile.zh_conversion, bool):
+                raise ValueError(
+                    f"profile.{label}.zh_conversion must be a boolean, "
+                    f"got {profile.zh_conversion!r}"
                 )
         if (
             self.secondary is not None

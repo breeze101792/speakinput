@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from speakinput.audio import AudioRecorder
 from speakinput.config import Config, Profile
@@ -31,6 +32,40 @@ from speakinput.silence import SilenceWatchdog, trim_trailing_silence
 from speakinput.transcriber import Transcriber, WhisperCppTranscriber, _gpu_summary
 
 log = logging.getLogger("speakinput")
+
+# Lazy-initialised OpenCC simplified-to-traditional converter.
+# We use the pure-Python reimplementation to avoid native build deps.
+_OPENCC_S2T: Any = None
+
+
+def _opencc_s2t() -> Any:
+    global _OPENCC_S2T
+    if _OPENCC_S2T is None:
+        try:
+            from opencc import OpenCC
+            _OPENCC_S2T = OpenCC("s2t")
+        except Exception:
+            log.warning("opencc not available; zh_conversion disabled")
+            _OPENCC_S2T = False
+    return _OPENCC_S2T if _OPENCC_S2T is not False else None
+
+
+def _contains_chinese(text: str) -> bool:
+    for ch in text:
+        if '\u4e00' <= ch <= '\u9fff':
+            return True
+    return False
+
+
+def _convert_to_traditional(text: str) -> str:
+    cc = _opencc_s2t()
+    if cc is None:
+        return text
+    try:
+        return cc.convert(text)
+    except Exception:
+        log.exception("opencc conversion failed")
+        return text
 
 
 def _dbg(enabled: bool, msg: str) -> None:
@@ -601,6 +636,16 @@ class App:
         except Exception:
             log.exception("transcription failed")
             return
+        zh_conversion = profile.zh_conversion if profile else True
+        if text and zh_conversion and _contains_chinese(text):
+            original = text
+            text = _convert_to_traditional(text)
+            if self.debug and text != original:
+                print(
+                    f"[debug] zh_conversion: {original!r} -> {text!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         # Always print the transcript in debug mode, even when empty, so the
         # user can tell the difference between "silence" and "stuck".
         if self.debug:
@@ -873,9 +918,10 @@ class App:
         profile_lines = []
         for i, p in enumerate(self._profiles, start=1):
             prompt = "off" if not p.initial_prompt else "set"
+            zh_conv = "on" if p.zh_conversion else "off"
             profile_lines.append(
                 f"profile {i} : key={p.key} model={p.model} "
-                f"language={p.language} prompt={prompt}"
+                f"language={p.language} prompt={prompt} zh_conversion={zh_conv}"
             )
         distinct = len({id(t) for t in self.transcribers.values()})
         total = len(self.transcribers)

@@ -44,6 +44,11 @@ language = "auto"           # auto | en | zh
                             # 'auto' lets whisper detect; pin 'en' to skip
                             # the language-ID pass (faster).
 beam_size = 1               # 1 = greedy (fastest); 2..10 = beam search
+# zh_conversion = true      # Convert Chinese output to Traditional Chinese.
+                            # When the recognized text contains Chinese
+                            # characters, it is converted via OpenCC (s2t).
+                            # Set false to disable (output as-is from the
+                            # model). On by default.
 # initial_prompt = "C, C++, Rust, RTOS, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, scheduler, mutex, GDB, OpenOCD, JTAG, ..."
                             # bias the decoder toward specific vocabulary;
                             # see README "Initial prompt" section. The default
@@ -63,6 +68,7 @@ beam_size = 1               # 1 = greedy (fastest); 2..10 = beam search
 # model = "small"
 # language = "zh"           # explicit language — skips the auto-detect pass
 # beam_size = 1
+# # zh_conversion = true    # same as primary (default on)
 # # initial_prompt = "C, C++, Rust, RTOS, FreeRTOS, GPIO, UART, SPI, I2C, DMA, ISR, scheduler, mutex, GDB, OpenOCD, JTAG, ..."
                             # per-profile lexical bias; same vocabulary bank
                             # as primary by default.
