@@ -33,21 +33,32 @@ from speakinput.transcriber import Transcriber, WhisperCppTranscriber, _gpu_summ
 
 log = logging.getLogger("speakinput")
 
-# Lazy-initialised OpenCC simplified-to-traditional converter.
+# Lazy-initialised OpenCC converters.
 # We use the pure-Python reimplementation to avoid native build deps.
 _OPENCC_S2T: Any = None
+_OPENCC_T2S: Any = None
 
 
-def _opencc_s2t() -> Any:
-    global _OPENCC_S2T
-    if _OPENCC_S2T is None:
-        try:
-            from opencc import OpenCC
-            _OPENCC_S2T = OpenCC("s2t")
-        except Exception:
-            log.warning("opencc not available; zh_conversion disabled")
+def _opencc(direction: str) -> Any | None:
+    global _OPENCC_S2T, _OPENCC_T2S
+    cache = _OPENCC_S2T if direction == "s2t" else _OPENCC_T2S
+    if cache is not None:
+        return cache if cache is not False else None
+    try:
+        from opencc import OpenCC
+        cc = OpenCC(direction)
+        if direction == "s2t":
+            _OPENCC_S2T = cc
+        else:
+            _OPENCC_T2S = cc
+        return cc
+    except Exception:
+        log.warning("opencc not available; zh_conversion disabled")
+        if direction == "s2t":
             _OPENCC_S2T = False
-    return _OPENCC_S2T if _OPENCC_S2T is not False else None
+        else:
+            _OPENCC_T2S = False
+        return None
 
 
 def _contains_chinese(text: str) -> bool:
@@ -57,8 +68,10 @@ def _contains_chinese(text: str) -> bool:
     return False
 
 
-def _convert_to_traditional(text: str) -> str:
-    cc = _opencc_s2t()
+def _convert_text(text: str, direction: str) -> str:
+    if direction == "off":
+        return text
+    cc = _opencc("s2t" if direction == "traditional" else "t2s")
     if cc is None:
         return text
     try:
@@ -636,10 +649,10 @@ class App:
         except Exception:
             log.exception("transcription failed")
             return
-        zh_conversion = profile.zh_conversion if profile else True
-        if text and zh_conversion and _contains_chinese(text):
+        zh_conversion = profile.zh_conversion if profile else "traditional"
+        if text and zh_conversion != "off" and _contains_chinese(text):
             original = text
-            text = _convert_to_traditional(text)
+            text = _convert_text(text, zh_conversion)
             if self.debug and text != original:
                 print(
                     f"[debug] zh_conversion: {original!r} -> {text!r}",
@@ -918,10 +931,9 @@ class App:
         profile_lines = []
         for i, p in enumerate(self._profiles, start=1):
             prompt = "off" if not p.initial_prompt else "set"
-            zh_conv = "on" if p.zh_conversion else "off"
             profile_lines.append(
                 f"profile {i} : key={p.key} model={p.model} "
-                f"language={p.language} prompt={prompt} zh_conversion={zh_conv}"
+                f"language={p.language} prompt={prompt} zh_conversion={p.zh_conversion}"
             )
         distinct = len({id(t) for t in self.transcribers.values()})
         total = len(self.transcribers)

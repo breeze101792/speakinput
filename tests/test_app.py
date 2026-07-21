@@ -325,7 +325,7 @@ def test_inject_error_does_not_crash(capsys):
 
 
 def test_zh_conversion_converts_simplified_to_traditional():
-    """When zh_conversion=True and the transcript contains Chinese
+    """When zh_conversion="traditional" and the transcript contains Chinese
     characters, the text must be converted to Traditional Chinese
     before injection."""
     from speakinput.app import App
@@ -333,7 +333,7 @@ def test_zh_conversion_converts_simplified_to_traditional():
 
     config = Config(
         audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0),
-        primary=Profile(key="alt_r", language="zh", zh_conversion=True),
+        primary=Profile(key="alt_r", language="zh", zh_conversion="traditional"),
     )
     recorder = MagicMock()
     recorder.is_recording.return_value = True
@@ -354,23 +354,52 @@ def test_zh_conversion_converts_simplified_to_traditional():
     app.on_hotkey_press(config.primary)
     app.on_hotkey_release(config.primary)
     transcriber.transcribe.assert_called_once()
-    # The injected text should be traditional:
     injected = injector.inject.call_args[0][0]
-    assert "簡" in injected
-    assert "化" in injected
-    assert "字" in injected
     assert injected == "簡化字"
 
 
-def test_zh_conversion_skipped_when_disabled():
-    """When zh_conversion=False, Chinese text must be injected as-is
+def test_zh_conversion_converts_traditional_to_simplified():
+    """When zh_conversion="simplified", Traditional Chinese text must be
+    converted to Simplified Chinese before injection."""
+    from speakinput.app import App
+    from speakinput.config import Profile
+
+    config = Config(
+        audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0),
+        primary=Profile(key="alt_r", language="zh", zh_conversion="simplified"),
+    )
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(16000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    transcriber.transcribe.return_value = "簡化字"
+    transcribers = {config.primary.key: transcriber}
+    injector = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=injector,
+        feedback=MagicMock(),
+    )
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+    transcriber.transcribe.assert_called_once()
+    injected = injector.inject.call_args[0][0]
+    assert injected == "简化字"
+
+
+def test_zh_conversion_skipped_when_off():
+    """When zh_conversion="off", Chinese text must be injected as-is
     without conversion."""
     from speakinput.app import App
     from speakinput.config import Profile
 
     config = Config(
         audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0),
-        primary=Profile(key="alt_r", language="zh", zh_conversion=False),
+        primary=Profile(key="alt_r", language="zh", zh_conversion="off"),
     )
     recorder = MagicMock()
     recorder.is_recording.return_value = True
@@ -402,7 +431,7 @@ def test_zh_conversion_does_not_affect_english():
 
     config = Config(
         audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0),
-        primary=Profile(zh_conversion=True),
+        primary=Profile(zh_conversion="traditional"),
     )
     recorder = MagicMock()
     recorder.is_recording.return_value = True
@@ -426,13 +455,13 @@ def test_zh_conversion_does_not_affect_english():
     assert injected == "hello world"
 
 
-def test_zh_conversion_default_is_on_in_profile():
-    """The default Profile should have zh_conversion=True."""
-    assert Profile().zh_conversion is True
+def test_zh_conversion_default_is_traditional():
+    """The default Profile should have zh_conversion="traditional"."""
+    assert Profile().zh_conversion == "traditional"
 
 
 def test_zh_conversion_shown_in_startup_banner(monkeypatch, capsys):
-    """The startup banner must show zh_conversion=on/off per profile."""
+    """The startup banner must show zh_conversion value per profile."""
     from speakinput.app import App
     from speakinput.config import Profile
 
@@ -442,15 +471,15 @@ def test_zh_conversion_shown_in_startup_banner(monkeypatch, capsys):
     monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
 
     config = Config(
-        primary=Profile(key="alt_r", zh_conversion=True),
-        secondary=Profile(key="cmd_r", language="zh", zh_conversion=False),
+        primary=Profile(key="alt_r", zh_conversion="traditional"),
+        secondary=Profile(key="cmd_r", language="zh", zh_conversion="off"),
     )
     app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
     app._shutdown.set()
     app.run()
 
     captured = capsys.readouterr()
-    assert "zh_conversion=on" in captured.err
+    assert "zh_conversion=traditional" in captured.err
     assert "zh_conversion=off" in captured.err
 
 
@@ -952,8 +981,8 @@ def test_run_prints_startup_banner(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert "[startup] config   : (defaults — no config.toml found)" in captured.err
-    assert "[startup] profile 1 : key=alt_r model=small language=auto prompt=set zh_conversion=on" in captured.err
-    assert "[startup] profile 2 : key=cmd_r model=small language=zh prompt=set zh_conversion=on" in captured.err
+    assert "[startup] profile 1 : key=alt_r model=small language=auto prompt=set zh_conversion=traditional" in captured.err
+    assert "[startup] profile 2 : key=cmd_r model=small language=zh prompt=set zh_conversion=traditional" in captured.err
     # Both profiles share the same model file -> dedupe message shown.
     assert "[startup] models   : loaded 1 into memory (shared: 1 transcriber, 2 profiles)" in captured.err
     assert "[startup] sample   :" in captured.err
