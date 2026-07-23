@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -33,6 +36,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=f"Path to config.toml (default: {default_config_path()})",
+    )
+    parser.add_argument(
+        "-C",
+        "--edit-config",
+        action="store_true",
+        help=(
+            f"Open the config file in $VISUAL (else $EDITOR, else vi) and exit. "
+            f"Uses --config if given, otherwise {default_config_path()}. "
+            f"Seeds the file from config.example.toml if it doesn't exist yet."
+        ),
     )
     parser.add_argument(
         "-m",
@@ -213,6 +226,87 @@ def _list_models() -> int:
     return 0
 
 
+def _example_config_path() -> Path | None:
+    """Locate the bundled config.example.toml.
+
+    Resolves in this order:
+      1. Relative to the installed `speakinput` package (editable install
+         puts the example at the repo root, two levels above `__init__.py`).
+      2. CWD-relative — useful for `python -m speakinput` runs from the
+         repo checkout.
+
+    Returns None if neither exists; the caller surfaces a clear error.
+    """
+    try:
+        import speakinput
+
+        pkg = Path(speakinput.__file__).resolve().parent
+        candidates = [pkg.parent.parent / "config.example.toml", pkg / "config.example.toml"]
+    except Exception:
+        candidates = []
+    candidates.append(Path.cwd() / "config.example.toml")
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def _resolve_config_target(arg: Path | None) -> Path:
+    """Pick which config file `-C` should open.
+
+    Honors an explicit `--config` if given; otherwise uses
+    `default_config_path()`. The directory is created on demand so the
+    first run of `-C` doesn't fail with "No such file or directory".
+    """
+    target = arg if arg is not None else default_config_path()
+    target = target.expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _seed_example(target: Path) -> None:
+    """Copy the bundled example config to `target` if it's missing.
+
+    Mirrors what start.sh does on first run, so `-C` "just works" the
+    first time a user wants to customize. Skips silently if the
+    example can't be located (pip installs without package data), so
+    `-C` on a missing config still tries to open a blank file.
+    """
+    if target.exists():
+        return
+    example = _example_config_path()
+    if example is None:
+        # No example bundled — fall through; the editor will open an
+        # empty file. Better than hard-failing for a missing data file.
+        return
+    shutil.copyfile(example, target)
+
+
+def _edit_config(target: Path | None) -> int:
+    """Open the resolved config in the user's editor and return 0/non-zero.
+
+    Editor selection matches the Unix convention: `$VISUAL` (GUI editor
+    like VS Code / Sublime) → `$EDITOR` (terminal editor) → `vi` as a
+    last resort. We launch via subprocess.run(check=True) so an editor
+    that can't be found (ENOENT) or returns non-zero bubbles up as a
+    proper exit code rather than masquerading as success.
+    """
+    path = _resolve_config_target(target)
+    _seed_example(path)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    print(f"opening {path} in {editor}", file=sys.stderr, flush=True)
+    try:
+        result = subprocess.run([editor, str(path)], check=False)
+    except FileNotFoundError:
+        print(
+            f"error: editor {editor!r} not found on PATH "
+            f"(set $VISUAL or $EDITOR to your editor of choice)",
+            file=sys.stderr,
+        )
+        return 1
+    return result.returncode
+
+
 def _diagnose(config: Config) -> int:
     import time
 
@@ -272,6 +366,12 @@ def main(argv: list[str] | None = None) -> int:
         return _list_devices()
     if args.list_models:
         return _list_models()
+    # `-C` is an independent action — it must NOT acquire the single-
+    # instance lock (we're not running the app) and must NOT load the
+    # config (we're about to open it in an editor, not parse it).
+    # Short-circuit ahead of both.
+    if args.edit_config:
+        return _edit_config(args.config)
 
     # Acquire the single-instance lock before any heavy work. If another
     # speakinput is already running, this exits 3 immediately. The fd is
