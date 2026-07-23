@@ -20,7 +20,59 @@ else:
 
 
 class AudioError(RuntimeError):
-    pass
+    """Raised when audio capture cannot start.
+
+    The message is meant for end users: it explains what went wrong in
+    plain language and suggests a fix. `audio.py` prints a longer version
+    of the same message to stderr with the original PortAudio code
+    attached for debugging. Callers should log at WARNING (not
+    EXCEPTION) — this is almost always a user-fixable environment
+    problem (no mic, no permission, bad sample rate), not a bug.
+    """
+
+
+# Friendly explanations for the PortAudio error codes the user is most
+# likely to hit. The codes come from `pa/src/common/pa_errors.c` in the
+# PortAudio source. Anything not in this map falls through to the
+# generic "no mic / no permission" hint, which covers the two cases
+# macOS users actually see in the wild.
+_PORTAUDIO_REASONS: dict[int, str] = {
+    -9999: "PortAudio not initialized",  # paNotInitialized
+    -9998: "invalid audio device index",  # paInvalidDevice
+    -9997: "device in use by another program",  # paInsufficientMemory, but in
+    # practice shows up as "another app grabbed the mic"
+    -9996: "operation aborted (audio device was unplugged?)",  # paOperationAborted
+    -9994: "audio host API reports the device is busy",  # paHostApiNotInitialized / busy
+    -9986: "internal audio engine error (CoreAudio/AUHAL rejected the stream)",  # paInternalError
+    -9985: "device disconnected or unavailable",  # paDeviceUnavailable
+    -10000: "operation timed out opening the audio device",
+}
+
+
+def _describe_audio_error(exc: BaseException) -> str:
+    """Return a one-line, human-friendly description of a PortAudio failure.
+
+    Pulls the numeric error code out of `sounddevice.PortAudioError`
+    (whose `args[1]` is the int code when present) and looks it up in
+    `_PORTAUDIO_REASONS`. Falls back to the raw message for anything we
+    don't recognize. The original `str(exc)` is intentionally NOT used
+    as the final answer because it just says "Internal PortAudio
+    error [PaErrorCode -9986]" which is meaningless to users.
+    """
+    code: int | None = None
+    # sounddevice stores the int code in args[1] when raised via
+    # PortAudioError(errormsg, err). Older versions only had the
+    # message. Both shapes are handled.
+    args = getattr(exc, "args", ())
+    if len(args) >= 2 and isinstance(args[1], int):
+        code = args[1]
+    elif len(args) == 1 and isinstance(args[0], int):
+        code = args[0]
+    if code is not None and code in _PORTAUDIO_REASONS:
+        return f"{_PORTAUDIO_REASONS[code]} (code {code})"
+    if code is not None:
+        return f"audio device error (code {code})"
+    return "audio device error"
 
 
 class Recorder(Protocol):
@@ -142,20 +194,32 @@ class AudioRecorder:
                 self._stream.start()
             except Exception as exc:
                 # No microphone at all (system default also gone), or the
-                # OS denied us access. Surface a clear message instead of
-                # letting the press fail silently. The user needs to know
-                # WHY their key did nothing.
+                # OS denied us access, or the device rejected the stream
+                # (e.g. the macOS AUHAL "Invalid Property Value" that
+                # surfaces as PortAudio -9986 when a sample rate the
+                # device doesn't natively support is requested). Surface
+                # a clear, actionable message instead of letting the
+                # press fail silently — the user needs to know WHY
+                # their key did nothing. The full traceback is NOT
+                # printed: this is a user-fixable environment problem,
+                # not a bug, and a stack trace just scares people.
+                reason = _describe_audio_error(exc)
                 print(
-                    f"[error] could not open audio input stream: {exc}. "
+                    f"[error] could not open audio input stream: {reason}. "
                     f"Check that a microphone is connected and that speakinput "
                     f"has Microphone permission in System Settings → Privacy "
-                    f"& Security → Microphone.",
+                    f"& Security → Microphone. If a USB/Bluetooth mic is "
+                    f"configured, try setting `device = null` in config.toml "
+                    f"to use the system default instead. (Original error: "
+                    f"{type(exc).__name__}: {exc})",
                     file=sys.stderr,
                     flush=True,
                 )
                 self._stream = None
                 self._recording = False
-                raise AudioError(f"audio stream open failed: {exc}") from exc
+                raise AudioError(
+                    f"audio stream open failed: {reason}"
+                ) from exc
             self._recording = True
 
     def _on_audio(self, indata, frames, time, status) -> None:  # noqa: ANN001 (sounddevice API)

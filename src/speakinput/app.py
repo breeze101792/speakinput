@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from speakinput.audio import AudioRecorder
+from speakinput.audio import AudioError, AudioRecorder
 from speakinput.config import Config, Profile
 from speakinput.feedback import Feedback, NullFeedback
 from speakinput.hotkey import (
@@ -510,17 +510,40 @@ class App:
         _dbg(self.debug, f"key press start ({profile.key})")
         try:
             self.recorder.start()
-        except Exception:
+        except AudioError as exc:
             # The recorder already printed a clear stderr message
             # explaining what went wrong (mic gone, permission denied,
-            # etc.). Surface a brief feedback state so the menu-bar /
-            # stderr feedback shows the user that the press was
-            # registered but couldn't capture audio. The release path
-            # will see `is_recording() == False` and become a no-op,
-            # so we don't have to do anything else here.
+            # bad sample rate, CoreAudio rejecting the stream, etc.).
+            # AudioError is a *user-facing* condition — almost always a
+            # fixable environment problem, not a bug — so log at
+            # WARNING without a stack trace. A full traceback here
+            # (the old `log.exception` behavior) made users think the
+            # app had crashed when really their mic just wasn't
+            # available. Switch the menu-bar / stderr feedback to the
+            # 'error' state so the user gets an unmistakable signal
+            # that the press was registered but capture failed. The
+            # release path will see `is_recording() == False` and
+            # become a no-op, so we don't have to do anything else
+            # here. Busy lock is released so the next press is
+            # accepted normally.
+            log.warning("could not start recording: %s", exc)
+            try:
+                self.feedback.set_state("error")
+            except Exception:
+                pass
+            self._busy.release()
+            self._press_started_at = None
+            self._active_profile = None
+            return
+        except Exception:
+            # Anything else (a genuine bug, not an AudioError) is
+            # worth a stack trace — it's a developer-visible failure,
+            # not a user-fixable environment problem. Still recover
+            # gracefully so the app keeps running and the user can
+            # try again.
             log.exception("failed to start recorder")
             try:
-                self.feedback.set_state("idle")
+                self.feedback.set_state("error")
             except Exception:
                 pass
             self._busy.release()
@@ -610,7 +633,16 @@ class App:
         accumulated during the transcribe.
         """
         if not self.recorder.is_recording():
-            # Press callback failed; nothing to do.
+            # Press callback failed (mic missing, permission denied, etc.)
+            # and the error handler already showed 'error' feedback.
+            # Reset to 'idle' on release so the menu-bar icon doesn't
+            # get stuck on the error glyph after the user lets go.
+            # The busy lock was released in on_hotkey_press's error
+            # branch, so nothing else needs cleaning up here.
+            try:
+                self.feedback.set_state("idle")
+            except Exception:
+                pass
             return
         # Tell the chunked body (if any) to bail on re-arming.
         self._manual_release_pending = True

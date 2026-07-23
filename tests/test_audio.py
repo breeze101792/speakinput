@@ -342,12 +342,14 @@ def test_no_mic_at_all_raises_with_clear_message(fake_sd, capsys):
     assert not r.is_recording()
 
 
-def test_recorder_surfaces_stream_error_on_press(capsys, monkeypatch):
+def test_recorder_surfaces_stream_error_on_press():
     """App.on_hotkey_press must surface a clear signal when the
-    recorder can't open a stream. Currently the press just logs and
-    returns; the user has no idea why their key did nothing. This
-    test pins the behavior: feedback goes back to 'idle' so the
-    menu-bar indicator doesn't get stuck on 'listening'."""
+    recorder can't open a stream. The press logs a WARNING (not a
+    full stack trace — this is a user-fixable environment problem,
+    not a bug) and the feedback state goes to 'error' so the
+    menu-bar indicator shows the user the press was registered but
+    couldn't capture audio. On release, the feedback returns to
+    'idle' so the error glyph doesn't get stuck."""
     from speakinput.app import App
     from speakinput.audio import AudioError
     from speakinput.config import AudioConfig, Config
@@ -356,6 +358,41 @@ def test_recorder_surfaces_stream_error_on_press(capsys, monkeypatch):
     config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
     recorder = MagicMock()
     recorder.start.side_effect = AudioError("no mic")
+    recorder.is_recording.return_value = False
+    feedback = MagicMock()
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=feedback,
+    )
+    profile = app.config.primary
+    app.on_hotkey_press(profile)
+    # After a failed press, feedback shows the distinct 'error' state —
+    # not 'idle' (which would look like nothing happened) and not
+    # 'listening' (which would lie about whether capture is running).
+    feedback.set_state.assert_any_call("error")
+    # The busy lock is released so a fresh press is accepted.
+    assert not app._busy.locked()
+    # And on release, feedback resets to 'idle' so the error glyph
+    # doesn't get stuck after the user lets go.
+    app.on_hotkey_release(profile)
+    feedback.set_state.assert_any_call("idle")
+
+
+def test_recorder_unexpected_error_still_logs_traceback(capsys):
+    """    Non-AudioError exceptions from recorder.start() are genuine
+    bugs (not user-fixable environment problems), so they keep
+    getting the full traceback via log.exception. Only the
+    AudioError path was demoted to WARNING."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig, Config
+    from unittest.mock import MagicMock
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    recorder = MagicMock()
+    recorder.start.side_effect = RuntimeError("unexpected")
     feedback = MagicMock()
     app = App(
         config=config,
@@ -365,8 +402,59 @@ def test_recorder_surfaces_stream_error_on_press(capsys, monkeypatch):
         feedback=feedback,
     )
     app.on_hotkey_press(app.config.primary)
-    # The press was registered, the recorder failed, feedback returned
-    # to idle. The user is no longer holding a stale 'listening' state.
-    feedback.set_state.assert_any_call("idle")
-    # And the busy lock is released so a fresh press is accepted.
+    # Same recovery: feedback shows 'error', busy lock released.
+    feedback.set_state.assert_any_call("error")
     assert not app._busy.locked()
+    # Sanity: we're not crashing the app on a non-AudioError either.
+    # (The traceback goes to logging, not the user.)
+
+
+def test_portaudio_error_code_translates_to_friendly_message(fake_sd, capsys):
+    """The -9986 / 'Invalid Property Value' AUHAL failure that
+    motivated this fix must come out as a useful message, not the
+    raw 'Internal PortAudio error [PaErrorCode -9986]' string."""
+    from speakinput.audio import AudioError, AudioRecorder, _describe_audio_error
+
+    class FakePortAudioError(Exception):
+        # Mimic sounddevice.PortAudioError: args = (msg, code)
+        def __init__(self, msg: str, code: int) -> None:
+            super().__init__(msg, code)
+
+    msg, code = "Error opening InputStream: Internal PortAudio error [PaErrorCode -9986]", -9986
+    exc = FakePortAudioError(msg, code)
+    r = AudioRecorder()
+    fake_sd.InputStream.side_effect = exc
+    with pytest.raises(AudioError) as ei:
+        r.start()
+    # The AudioError message should NOT just be the raw PortAudio
+    # message — that was the bug. It should mention code -9986 in
+    # a human-readable form.
+    assert "-9986" in str(ei.value)
+    assert "audio stream open failed" in str(ei.value)
+    # And the helper itself returns something actionable.
+    assert "CoreAudio" in _describe_audio_error(exc) or "engine" in _describe_audio_error(exc)
+
+
+def test_describe_audio_error_handles_unknown_codes():
+    """Unknown PortAudio codes still produce a usable message
+    rather than the raw 'Internal PortAudio error' string."""
+    from speakinput.audio import _describe_audio_error
+
+    class FakePAError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__("Error opening InputStream: Internal PortAudio error", code)
+
+    desc = _describe_audio_error(FakePAError(-12345))
+    assert "code -12345" in desc
+    # Plain exceptions (no int code) don't crash.
+    assert "audio device error" in _describe_audio_error(RuntimeError("boom"))
+
+
+def test_feedback_supports_error_state():
+    """The 'error' state must be accepted by the headless feedback
+    implementation so the press-failure path doesn't crash the app
+    when rumps isn't available."""
+    from speakinput.feedback import StderrFeedback
+
+    fb = StderrFeedback()
+    fb.set_state("error")  # would raise ValueError before this fix

@@ -17,7 +17,7 @@ class Feedback(Protocol):
     def stop(self) -> None: ...
 
 
-_STATES = ("idle", "listening", "processing")
+_STATES = ("idle", "listening", "processing", "error")
 
 
 class NullFeedback:
