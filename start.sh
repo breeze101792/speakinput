@@ -91,5 +91,128 @@ if [[ -n "$user_cfg_dir" && ! -f "$user_cfg_dir/config.toml" && -f config.exampl
     fi
 fi
 
-# 5. Forward to the CLI.
+# 5. Detect an existing speakinput instance. The single-instance guard holds
+#    an exclusive `flock` on a lockfile under the user's runtime dir. We
+#    probe the same lock with LOCK_NB; if the lock is held, another instance
+#    is alive. We do this from inside the venv so `platformdirs` is on the
+#    import path (it's a runtime dep installed in step 3). Using bash+flock
+#    instead would be simpler, but `flock` isn't shipped on macOS.
+#
+#    stdout contract: prints either "free" or "held:<pid>" (pid may be
+#    "unknown" if the lockfile contents couldn't be read).
+probe_instance_lock() {
+"$VENV_DIR/bin/python" <<'PY' || true
+import os, sys, fcntl
+from pathlib import Path
+try:
+    from platformdirs import user_runtime_dir
+except Exception:
+    print("no-platformdirs")
+    sys.exit(0)
+runtime = Path(user_runtime_dir("speakinput", appauthor=False))
+runtime.mkdir(parents=True, exist_ok=True)
+lock = runtime / "speakinput.lock"
+fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (BlockingIOError, OSError):
+    pid = "unknown"
+    try:
+        os.lseek(fd, 0, 0)
+        data = os.read(fd, 64).decode("utf-8", "replace").strip()
+        if data:
+            pid = data
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    print(f"held:{pid}")
+    sys.exit(0)
+try:
+    os.close(fd)
+except OSError:
+    pass
+print("free")
+PY
+}
+
+instance_status=$(probe_instance_lock)
+if [[ "$instance_status" == held:* ]]; then
+    existing_pid=${instance_status#held:}
+
+    if [[ ! -t 0 ]]; then
+        # Non-interactive (CI, pipe, double-click in Finder, etc.) — don't
+        # kill anything without explicit consent.
+        err "another speakinput is already running (pid=$existing_pid)."
+        err "stop it with: kill $existing_pid"
+        err "(or re-run start.sh interactively to be prompted)"
+        exit 1
+    fi
+
+    if [[ -z "$existing_pid" || "$existing_pid" == "unknown" ]]; then
+        err "another speakinput is running but its pid could not be read."
+        err "stop it with: pkill -f speakinput"
+        exit 1
+    fi
+
+    # Re-verify the pid is still alive before we ask. If it just exited,
+    # the lock is presumably about to be released and we can re-probe.
+    if ! kill -0 "$existing_pid" 2>/dev/null; then
+        log "lock was held by pid=$existing_pid, but that process is gone; re-probing"
+        instance_status=$(probe_instance_lock)
+        if [[ "$instance_status" == free ]]; then
+            :
+        else
+            other=${instance_status#held:}
+            err "lock re-acquired by another pid=$other before we could start; aborting"
+            exit 1
+        fi
+    else
+        printf '\033[1;33m[start.sh]\033[0m another speakinput is running (pid=%s). Kill it and continue? [y/N] ' "$existing_pid"
+        if ! read -r -n 1 answer; then
+            printf '\n'
+            answer=""
+        else
+            printf '\n'
+        fi
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            err "aborted. the other speakinput (pid=$existing_pid) is still running."
+            err "stop it with: kill $existing_pid"
+            exit 1
+        fi
+
+        log "killing existing instance (pid=$existing_pid)"
+        # Graceful first, then escalate. Both kill(1) and kill -0 are POSIX
+        # and behave the same on macOS and Linux.
+        kill -TERM "$existing_pid" 2>/dev/null || true
+        for _ in {1..30}; do
+            if ! kill -0 "$existing_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            warn "pid=$existing_pid did not exit on SIGTERM; sending SIGKILL"
+            kill -KILL "$existing_pid" 2>/dev/null || true
+            sleep 0.2
+        fi
+
+        # Re-probe the lock. The kernel releases the flock when the last
+        # fd holding it is closed (i.e. when the killed process actually
+        # exits), so a brief grace period before re-probing prevents a
+        # spurious "still held" when SIGKILL was needed.
+        sleep 0.2
+        instance_status=$(probe_instance_lock)
+        if [[ "$instance_status" == held:* ]]; then
+            other=${instance_status#held:}
+            err "lock is still held by pid=$other after kill; aborting"
+            err "if that's a different process, stop it manually first."
+            exit 1
+        fi
+    fi
+fi
+
+# 6. Forward to the CLI.
 exec "$VENV_DIR/bin/speakinput" "$@"
