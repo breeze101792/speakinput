@@ -47,6 +47,18 @@ class AudioRecorder:
     _stream: object | None = None
     _chunks: list[np.ndarray] | None = None
     _recording: bool = False
+    # Serializes stream open/stop/close. PortAudio/CoreAudio does NOT
+    # tolerate two threads stopping the same stream concurrently: both
+    # end up inside AudioOutputUnitStop contending on the HAL mutex
+    # while the CoreAudio IO thread waits for the GIL — a three-way
+    # deadlock observed in the wild (main thread in atexit's
+    # Pa_Terminate vs. the hotkey thread in recorder.close()). Holding
+    # this lock across the whole open/stop/close guarantees at most one
+    # thread is inside CoreAudio per recorder; the second caller either
+    # waits or no-ops on `_stream is None`.
+    # The audio callback (`_on_audio`) never takes this lock — it must
+    # never block.
+    _stream_lock: threading.Lock = field(default_factory=threading.Lock)
     # The most recent chunk's RMS, updated from the audio callback and
     # read by the auto-stop watchdog. Guarded by `_rms_lock` because the
     # callback and the watchdog run on different threads.
@@ -100,50 +112,51 @@ class AudioRecorder:
         if self._recording:
             return
         self._require_sounddevice()
-        self._chunks = []
-        with self._rms_lock:
-            self._last_rms = 0.0
-        # Fall back to system default if the pinned device disappeared
-        # since the last press (USB unplug, Bluetooth headset
-        # disconnected, etc.). The check is sub-ms; the stream-open
-        # that follows is the real cost (~30-100ms on macOS). When
-        # `device is None` the system default is used and re-resolved
-        # by PortAudio on every call, so the fallback is unnecessary.
-        device = self.device
-        if device is not None and not self._device_is_present(device):
-            print(
-                f"[warn] configured audio device {device} is not available; "
-                f"falling back to system default microphone",
-                file=sys.stderr,
-                flush=True,
-            )
-            device = None
-        try:
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype="float32",
-                device=device,
-                callback=self._on_audio,
-            )
-            self._stream.start()
-        except Exception as exc:
-            # No microphone at all (system default also gone), or the
-            # OS denied us access. Surface a clear message instead of
-            # letting the press fail silently. The user needs to know
-            # WHY their key did nothing.
-            print(
-                f"[error] could not open audio input stream: {exc}. "
-                f"Check that a microphone is connected and that speakinput "
-                f"has Microphone permission in System Settings → Privacy "
-                f"& Security → Microphone.",
-                file=sys.stderr,
-                flush=True,
-            )
-            self._stream = None
-            self._recording = False
-            raise AudioError(f"audio stream open failed: {exc}") from exc
-        self._recording = True
+        with self._stream_lock:
+            self._chunks = []
+            with self._rms_lock:
+                self._last_rms = 0.0
+            # Fall back to system default if the pinned device disappeared
+            # since the last press (USB unplug, Bluetooth headset
+            # disconnected, etc.). The check is sub-ms; the stream-open
+            # that follows is the real cost (~30-100ms on macOS). When
+            # `device is None` the system default is used and re-resolved
+            # by PortAudio on every call, so the fallback is unnecessary.
+            device = self.device
+            if device is not None and not self._device_is_present(device):
+                print(
+                    f"[warn] configured audio device {device} is not available; "
+                    f"falling back to system default microphone",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                device = None
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=self.channels,
+                    dtype="float32",
+                    device=device,
+                    callback=self._on_audio,
+                )
+                self._stream.start()
+            except Exception as exc:
+                # No microphone at all (system default also gone), or the
+                # OS denied us access. Surface a clear message instead of
+                # letting the press fail silently. The user needs to know
+                # WHY their key did nothing.
+                print(
+                    f"[error] could not open audio input stream: {exc}. "
+                    f"Check that a microphone is connected and that speakinput "
+                    f"has Microphone permission in System Settings → Privacy "
+                    f"& Security → Microphone.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._stream = None
+                self._recording = False
+                raise AudioError(f"audio stream open failed: {exc}") from exc
+            self._recording = True
 
     def _on_audio(self, indata, frames, time, status) -> None:  # noqa: ANN001 (sounddevice API)
         # status flags (overflow/underflow) are non-fatal; keep the audio and
@@ -198,19 +211,24 @@ class AudioRecorder:
         be `start()`-ed again to capture more audio. Any in-flight
         audio callbacks from PortAudio that arrive after close are
         silently dropped (the `_chunks` list is None).
+
+        Serialized via `_stream_lock`: two threads must never be inside
+        PortAudio's stop/close for the same stream at once (CoreAudio
+        deadlocks on the HAL mutex otherwise).
         """
-        if self._stream is None:
-            return
-        try:
-            self._stream.stop()
-        except Exception:
-            pass
-        try:
-            self._stream.close()
-        except Exception:
-            pass
-        self._stream = None
-        self._recording = False
+        with self._stream_lock:
+            if self._stream is None:
+                return
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+            self._recording = False
         # Don't drop _chunks here — `drain()` may still want to read
         # what was buffered before close. _on_audio appends are still
         # safe because the list object isn't replaced.

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import logging
+import os
+import queue
 import signal
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from speakinput.audio import AudioRecorder
 from speakinput.config import Config, Profile
@@ -132,6 +136,15 @@ class _LivenessWatcher:
     invokes `on_dead(key)` the first time a listener transitions from
     alive to dead. One warning per death; not spammy.
 
+    It also detects system sleep. macOS (and most laptops on lid-close)
+    can suspend the process for an unbounded time; on wake,
+    `time.monotonic()` has barely advanced (it freezes while suspended)
+    but the wall clock has jumped. When the skew between the two
+    exceeds `sleep_threshold_s`, `on_sleep(skew_s)` is invoked — macOS
+    disables CGEventTaps across sleep, so the listeners must be
+    recreated even though their threads still look alive (which is why
+    the thread-liveness check alone never notices this case).
+
     The watcher is itself a daemon thread and exits when `stop()` is
     called or when the process is about to exit.
     """
@@ -141,16 +154,25 @@ class _LivenessWatcher:
         listeners: list,
         interval_s: float,
         on_dead,
+        on_sleep=None,
+        sleep_threshold_s: float = 15.0,
     ) -> None:
         self._listeners = listeners
         self._interval_s = interval_s
         self._on_dead = on_dead
+        self._on_sleep = on_sleep
+        self._sleep_threshold_s = sleep_threshold_s
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         # Map of listener -> True. We track "was alive" to fire
         # `on_dead` exactly once per transition (alive -> dead), not
         # every poll after the thread dies.
         self._was_alive: dict[int, bool] = {id(lst): True for lst in listeners}
+        # Clock samples for the sleep detector. `monotonic` freezes
+        # while the machine is suspended; `wall` keeps going. Both are
+        # re-sampled every poll tick.
+        self._last_mono: float | None = None
+        self._last_wall: float | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -163,27 +185,69 @@ class _LivenessWatcher:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def swap(self, old, new) -> None:
+        """Replace a listener that was just recreated (restart path).
+
+        Keeps the watcher's list and the alive-transition tracking in
+        sync with `App.listeners` after a dead/tap-disabled listener is
+        swapped for a fresh one. The new listener starts out "alive" so
+        a future death fires `on_dead` exactly once.
+        """
+        for i, lst in enumerate(self._listeners):
+            if lst is old:
+                self._listeners[i] = new
+                break
+        else:
+            self._listeners.append(new)
+        self._was_alive.pop(id(old), None)
+        self._was_alive[id(new)] = True
+
+    def _check_sleep(self) -> None:
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        last_mono, last_wall = self._last_mono, self._last_wall
+        self._last_mono, self._last_wall = now_mono, now_wall
+        if last_mono is None or last_wall is None or self._on_sleep is None:
+            return
+        skew = (now_wall - last_wall) - (now_mono - last_mono)
+        if skew > self._sleep_threshold_s:
+            try:
+                self._on_sleep(skew)
+            except Exception:
+                log.exception("on_sleep callback failed")
+
     def _run(self) -> None:
+        self._last_mono = time.monotonic()
+        self._last_wall = time.time()
         while not self._stop_event.wait(self._interval_s):
-            for listener in self._listeners:
-                key = getattr(listener, "_key", None) or getattr(
-                    listener, "_keycode", "?"
-                )
-                # `is_running()` is the authoritative liveness check for
-                # both backends: `HotkeyListener` wraps pynput's listener
-                # (which exposes `is_alive()` on the underlying thread)
-                # and `EvdevHotkeyListener` wraps a `threading.Thread`.
-                # Both check the actual thread liveness, so the extra
-                # `_thread.is_alive()` lookup below is redundant and
-                # broken for the pynput backend (which has no `_thread`
-                # attribute — that name belongs to the evdev listener
-                # only). Using `is_running()` alone fixes a false-positive
-                # "listener is dead" warning on macOS.
-                alive = bool(listener.is_running())
-                was = self._was_alive.get(id(listener), True)
-                if was and not alive:
-                    self._on_dead(key)
-                self._was_alive[id(listener)] = alive
+            try:
+                self._check_sleep()
+                for listener in self._listeners:
+                    key = getattr(listener, "_key", None) or getattr(
+                        listener, "_keycode", "?"
+                    )
+                    # `is_running()` is the authoritative liveness check for
+                    # both backends: `HotkeyListener` wraps pynput's listener
+                    # (which exposes `is_alive()` on the underlying thread)
+                    # and `EvdevHotkeyListener` wraps a `threading.Thread`.
+                    # Both check the actual thread liveness, so the extra
+                    # `_thread.is_alive()` lookup below is redundant and
+                    # broken for the pynput backend (which has no `_thread`
+                    # attribute — that name belongs to the evdev listener
+                    # only). Using `is_running()` alone fixes a false-positive
+                    # "listener is dead" warning on macOS.
+                    alive = bool(listener.is_running())
+                    was = self._was_alive.get(id(listener), True)
+                    if was and not alive:
+                        try:
+                            self._on_dead(key)
+                        except Exception:
+                            log.exception("on_dead callback failed (key=%r)", key)
+                    self._was_alive[id(listener)] = alive
+            except Exception:
+                # A watcher that dies silently is worse than any single
+                # bad poll — keep looping so the next tick gets a shot.
+                log.exception("liveness poll failed")
 
 
 class _Heartbeat:
@@ -361,6 +425,30 @@ class App:
         # `run()` once the listeners are actually live. None until then.
         self._liveness_watcher: _LivenessWatcher | None = None
         self._heartbeat: _Heartbeat | None = None
+        # Which hotkey backend `run()` picked. Remembered so a dead or
+        # sleep-disabled listener can be recreated with the same backend
+        # (`_restart_listener`). Defaults to pynput.
+        self._use_evdev = False
+        # Per-key monotonic timestamp of the last listener restart. If a
+        # restarted listener dies again almost immediately (e.g. Input
+        # Monitoring / Accessibility permission was revoked — the tap
+        # can NEVER come up), restarting on every death would flap
+        # forever: die → restart → die 5s later → restart → ... The
+        # backoff makes the second death inside the window warn instead
+        # of restart, which is the signal the user actually needs.
+        self._listener_restart_at: dict[str, float] = {}
+        # Single-consumer FIFO that serializes hotkey press/release
+        # bodies on a dedicated worker thread. The pynput CGEventTap
+        # callback only enqueues and returns immediately: macOS disables
+        # event taps whose callback runs too long, and a release body
+        # here can take SECONDS (drain → close stream → whisper
+        # transcribe → inject). Running that on the tap thread got the
+        # tap killed mid-session, which presented as "the hotkey
+        # randomly stops working until restart". The queue is created
+        # eagerly so callbacks can enqueue before `run()` starts the
+        # worker (it starts it before any listener can fire).
+        self._work_q: queue.Queue = queue.Queue()
+        self._worker_thread: threading.Thread | None = None
         # Layered continuity hints fed into whisper's initial_prompt.
         #
         # `_last_clip_text` + `_last_clip_at`: the text + monotonic
@@ -591,8 +679,6 @@ class App:
         if profile is None:
             log.warning("no active profile; skipping inject")
             return
-        import numpy as np  # local import keeps the hot path lean
-
         duration = audio.size / max(self.config.audio.sample_rate, 1)
         # Trim trailing silence BEFORE computing the silence-gate RMS,
         # so a long silent tail doesn't fool the gate into thinking the
@@ -752,14 +838,276 @@ class App:
             self._last_clip_text = text
             self._last_clip_at = time.monotonic()
 
+    # --- event worker: keep heavy work off the hotkey callback thread ------
+
+    def _start_event_worker(self) -> None:
+        """Start the thread that runs press/release bodies. Idempotent."""
+        if self._worker_thread is not None:
+            return
+        self._worker_thread = threading.Thread(
+            target=self._event_worker_main, name="speakinput-events", daemon=True
+        )
+        self._worker_thread.start()
+
+    def _stop_event_worker(self, timeout_s: float = 2.0) -> None:
+        """Ask the worker to drain and exit; wait at most `timeout_s`.
+
+        The sentinel is queued behind any in-flight job, so a transcribe
+        that is already running gets to finish (bounded by `timeout_s`).
+        The thread is a daemon, so a job that outlives the timeout can't
+        block process exit.
+        """
+        self._work_q.put(None)
+        if self._worker_thread is not None:
+            try:
+                self._worker_thread.join(timeout=timeout_s)
+            except RuntimeError:
+                # join() on a thread that was never started.
+                pass
+        self._worker_thread = None
+
+    def _enqueue_event(self, fn, *args) -> None:
+        """Run `fn(*args)` on the event worker, in FIFO order.
+
+        Called from the hotkey listener's callback thread. Keeps the
+        callback O(µs) so macOS never disables the event tap for being
+        slow, and serializes press/release bodies so the lock discipline
+        matches the old everything-on-the-listener-thread behavior.
+        """
+        self._work_q.put((fn, args))
+
+    def _event_worker_main(self) -> None:
+        while True:
+            item = self._work_q.get()
+            if item is None:
+                return
+            fn, args = item
+            try:
+                fn(*args)
+            except Exception:
+                # The worker MUST NOT die: a dead worker with live
+                # listeners is the same "hotkey silently does nothing"
+                # failure this thread exists to prevent.
+                log.exception(
+                    "hotkey event handler failed: %s",
+                    getattr(fn, "__name__", repr(fn)),
+                )
+
+    def _abort_press(self, reason: str = "") -> None:
+        """Cancel an in-flight press whose release event will never arrive.
+
+        Runs on the event worker (serialized with press/release
+        callbacks). Triggered when the hotkey listener died or the
+        machine slept while a key was held: the release is gone for
+        good, so without this the busy lock would be held forever, the
+        recorder would keep buffering audio (~230 MB/hour), and every
+        later press would be ignored as "already busy".
+
+        The buffered audio is DISCARDED, not transcribed: it can
+        contain arbitrarily long ambient audio (the recorder ran the
+        whole time the hotkey was dead), and transcribing it would
+        stall the worker for minutes.
+
+        No-op when no press is active, when a release is already being
+        finalized (the finalize path owns the lock then), or during
+        shutdown.
+        """
+        if self._shutdown.is_set():
+            return
+        if not self._busy.locked() or self._manual_release_pending:
+            return
+        print(
+            f"[warn] abandoned a stuck push-to-talk press"
+            f"{f' ({reason})' if reason else ''}; "
+            f"the buffered audio was discarded",
+            file=sys.stderr,
+            flush=True,
+        )
+        if self._watchdog is not None:
+            try:
+                self._watchdog.stop()
+            except Exception:
+                pass
+            self._watchdog = None
+        try:
+            self.recorder.drain()
+        except Exception:
+            pass
+        try:
+            self.recorder.close()
+        except Exception:
+            pass
+        if self.media_controller is not None:
+            try:
+                self.media_controller.resume()
+            except Exception:
+                log.exception("media resume failed during press abort")
+        self._press_started_at = None
+        self._active_profile = None
+        self._manual_release_pending = False
+        try:
+            self.feedback.set_state("idle")
+        except Exception:
+            pass
+        try:
+            self._busy.release()
+        except RuntimeError:
+            # Lost a race with a concurrent finalize that already
+            # released the lock — nothing left to do.
+            pass
+
+    # --- listener restart: recover from dead threads and sleep-disabled taps ---
+
+    def _restart_listener(self, key: str) -> bool:
+        """Recreate the hotkey listener for `key`. Returns True on success.
+
+        Used when a listener's run loop died (crash, tap invalidation)
+        and after system sleep (macOS disables CGEventTaps across
+        sleep/wake without killing the thread, so the liveness check
+        alone can't see it). On failure the old listener stays in the
+        registry so the liveness watcher's next tick retries.
+        """
+        profile = next((p for p in self._profiles if p.key == key), None)
+        old = self.listeners.get(key)
+        if profile is None or old is None:
+            return False
+        try:
+            if self._use_evdev:
+                new_listener = EvdevHotkeyListener(
+                    keycode=resolve_evdev_key(key),
+                    on_press=self._make_press_cb(profile),
+                    on_release=self._make_release_cb(profile),
+                )
+            else:
+                new_listener = HotkeyListener(
+                    key=resolve_key(key),
+                    on_press=self._make_press_cb(profile),
+                    on_release=self._make_release_cb(profile),
+                )
+            new_listener.start()
+        except Exception:
+            log.exception("failed to restart hotkey listener for %r", key)
+            return False
+        try:
+            old.stop()
+        except Exception:
+            pass
+        self.listeners[key] = new_listener
+        self._listener_restart_at[key] = time.monotonic()
+        if self._liveness_watcher is not None:
+            self._liveness_watcher.swap(old, new_listener)
+        return True
+
+    # A restarted listener that dies again within this many seconds is
+    # considered unrecoverable by restarting (permission revoked, HID
+    # subsystem wedged, ...) — warn the user instead of flapping.
+    _LISTENER_RESTART_MIN_INTERVAL_S = 60.0
+
+    def _on_listener_dead(self, key: str) -> None:
+        """Liveness callback: a hotkey listener's run loop died.
+
+        Tries to restart the listener in place. Only if the restart
+        fails (or the listener is flapping — died again right after a
+        restart) does the user get the "restart speakinput" warning — a
+        successful restart is a self-healing event worth one info line.
+        Either way, any press that was active when the listener died is
+        aborted: its release event died with the listener.
+        """
+        if self._shutdown.is_set():
+            return
+        last_restart = self._listener_restart_at.get(key, 0.0)
+        flapping = (time.monotonic() - last_restart) < self._LISTENER_RESTART_MIN_INTERVAL_S
+        restarted = False
+        if not flapping:
+            restarted = self._restart_listener(key)
+        if restarted:
+            print(
+                f"[info] hotkey listener for {key!r} died and was restarted",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"[warn] hotkey listener for {key!r} is no longer alive and "
+                f"could not be restarted — the push-to-talk key will not "
+                f"respond. Restart speakinput to recover.",
+                file=sys.stderr,
+                flush=True,
+            )
+        self._enqueue_event(self._abort_press, f"hotkey listener for {key!r} died")
+
+    def _on_system_sleep(self, slept_s: float) -> None:
+        """Sleep callback: the wall clock jumped while monotonic froze.
+
+        macOS disables CGEventTaps across sleep/wake; the listener
+        threads survive and pass the liveness check, but no key event
+        is ever delivered again. Restart every listener proactively and
+        abort any press that was active when the machine went to sleep
+        (its release event was lost while suspended).
+        """
+        if self._shutdown.is_set():
+            return
+        print(
+            f"[warn] system slept for ~{slept_s:.0f}s — restarting hotkey "
+            f"listeners (the OS may have disabled the event tap)",
+            file=sys.stderr,
+            flush=True,
+        )
+        for key in list(self.listeners):
+            if self._restart_listener(key):
+                print(
+                    f"[info] hotkey listener for {key!r} restarted after wake",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[warn] hotkey listener for {key!r} failed to restart "
+                    f"after wake — the push-to-talk key may not respond. "
+                    f"Restart speakinput to recover.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        self._enqueue_event(self._abort_press, "system wake")
+
+    def _resume_media_bounded(self, timeout_s: float) -> None:
+        """Resume paused media without letting a wedged backend block shutdown.
+
+        On macOS the media backend shells out to osascript, which talks
+        to System Events / Spotify over AppleEvents. After sleep/wake
+        those services can wedge, and even `subprocess.run(timeout=...)`
+        can then block waiting on an uninterruptible child. Run the
+        resume on a daemon thread and bound the wait: if it doesn't
+        finish in `timeout_s`, log and move on. The daemon dies with
+        the process.
+        """
+        def _do_resume() -> None:
+            try:
+                self.media_controller.resume()
+            except Exception:
+                log.exception("media resume failed during shutdown")
+
+        t = threading.Thread(
+            target=_do_resume, name="speakinput-media-resume", daemon=True
+        )
+        t.start()
+        t.join(timeout_s)
+        if t.is_alive():
+            print(
+                f"[warn] media resume did not finish in {timeout_s:.0f}s — "
+                f"continuing shutdown without it",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def _make_press_cb(self, profile: Profile):
         def cb() -> None:
-            self.on_hotkey_press(profile)
+            self._enqueue_event(self.on_hotkey_press, profile)
         return cb
 
     def _make_release_cb(self, profile: Profile):
         def cb() -> None:
-            self.on_hotkey_release(profile)
+            self._enqueue_event(self.on_hotkey_release, profile)
         return cb
 
     def run(self) -> None:
@@ -793,6 +1141,7 @@ class App:
         evdev_probe_error: str | None = None
         if sys.platform == "linux":
             use_evdev, evdev_probe_error = _probe_evdev_or_diag()
+        self._use_evdev = use_evdev
         # Always print the hotkey backend so the user can verify which
         # code path is active — a missing or wrong banner has been a
         # recurring source of "hotkey does nothing" reports that turn
@@ -827,6 +1176,10 @@ class App:
                     file=sys.stderr,
                     flush=True,
                 )
+        # Start the event worker BEFORE any listener can fire, so every
+        # press/release callback lands on the queue instead of running
+        # inside the OS event-tap callback (macOS disables slow taps).
+        self._start_event_worker()
         for profile in self._profiles:
             if use_evdev:
                 listener = EvdevHotkeyListener(
@@ -855,9 +1208,42 @@ class App:
         # process would die mid-shutdown the next time the user opens
         # the same terminal — leaving the recorder thread orphaned and
         # the next start.sh failing to acquire the single-instance lock.
-        # All three just set the shutdown event; the `finally` block
-        # below runs the actual teardown.
-        signal.signal(signal.SIGINT, lambda *_: self._shutdown.set())
+        #
+        # SIGINT escalates: the FIRST Ctrl-C sets the shutdown event and
+        # the `finally` block below runs the teardown. If teardown hangs
+        # (wedged osascript after sleep, a stuck native call, ...), a
+        # plain "set the event again" handler would make every further
+        # Ctrl-C a silent no-op — the user then has to `kill -9` with no
+        # idea why. So the SECOND Ctrl-C dumps every thread's stack (so
+        # the hang is diagnosable from the terminal scrollback) and
+        # force-exits via os._exit, which the kernel handles regardless
+        # of what any thread is blocked in. SIGTERM/SIGHUP stay
+        # single-shot; start.sh already escalates TERM -> KILL itself.
+        def _on_sigint(*_) -> None:
+            if not self._shutdown.is_set():
+                print(
+                    "[shutdown] Ctrl-C received — cleaning up "
+                    "(press Ctrl-C again to force quit)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._shutdown.set()
+                return
+            print(
+                "[shutdown] second Ctrl-C — forcing immediate exit. "
+                "Thread stacks follow (include them in any bug report):",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                import faulthandler
+
+                faulthandler.dump_traceback(file=sys.stderr)
+            except Exception:
+                pass
+            os._exit(2)
+
+        signal.signal(signal.SIGINT, _on_sigint)
         signal.signal(signal.SIGTERM, lambda *_: self._shutdown.set())
         try:
             signal.signal(signal.SIGHUP, lambda *_: self._shutdown.set())
@@ -866,31 +1252,22 @@ class App:
             # if called from a non-main thread. Either way, skip it.
             pass
         # Background liveness watcher. Polls every 5s whether the
-        # listener threads are still alive. pynput's macOS backend uses
-        # a CGEventTap that macOS can disable on sleep/wake or when the
-        # user revokes Input Monitoring — the thread keeps running but
-        # stops delivering events, and the user has no way to tell. A
-        # dead Thread object (`.is_alive() == False`) means the run
-        # loop returned or raised; either way the hotkey is dead.
-        # Daemon so it dies with the process; the liveness check is
-        # cheap (one bool per listener).
-        #
-        # The warning is unconditional (not gated on debug mode) — a
-        # dead hotkey is a real problem the user needs to see, even if
-        # they normally run without -d.
-        def _on_listener_dead(key) -> None:
-            print(
-                f"[warn] hotkey listener for {key!r} is no longer alive — "
-                f"the push-to-talk key will not respond. "
-                f"Restart speakinput to recover.",
-                file=sys.stderr,
-                flush=True,
-            )
-
+        # listener threads are still alive, and watches for system sleep
+        # (wall/monotonic clock skew). pynput's macOS backend uses a
+        # CGEventTap that macOS disables on sleep/wake or when the user
+        # revokes Input Monitoring — the thread keeps running but stops
+        # delivering events, and the user has no way to tell. A dead
+        # Thread object (`.is_alive() == False`) means the run loop
+        # returned or raised; either way the hotkey is dead. Both cases
+        # trigger a listener restart (`_on_listener_dead` /
+        # `_on_system_sleep`); only a failed restart warns the user to
+        # restart the app. Daemon so it dies with the process; the
+        # checks are cheap (one bool per listener, two clock reads).
         self._liveness_watcher = _LivenessWatcher(
             listeners=list(self.listeners.values()),
             interval_s=5.0,
-            on_dead=_on_listener_dead,
+            on_dead=self._on_listener_dead,
+            on_sleep=self._on_system_sleep,
         )
         self._liveness_watcher.start()
         # Heartbeat: print a one-line "still here" every 60s in debug
@@ -972,13 +1349,12 @@ class App:
             self._heartbeat = None
         self._shutdown.set()
         if self.media_controller is not None:
-            try:
-                self.media_controller.resume()
-            except Exception:
-                # A hung osascript / playerctl must NOT block shutdown.
-                # The user has been waiting to exit; logging and moving
-                # on is better than hanging indefinitely.
-                log.exception("media resume failed during shutdown")
+            # A hung osascript / playerctl must NOT block shutdown. The
+            # subprocess timeout normally bounds it, but after sleep/wake
+            # the AppleEvent services can wedge hard enough that even the
+            # timeout-kill blocks — so the whole resume runs on a helper
+            # thread with a bounded join.
+            self._resume_media_bounded(timeout_s=3.0)
         if self._watchdog is not None:
             try:
                 self._watchdog.stop()
@@ -993,6 +1369,27 @@ class App:
         # Keep the listeners dict around so post-shutdown tests can
         # verify which keys were wired. pynput's Listener objects are
         # safe to leave stopped but referenced.
+        #
+        # Stop the event worker after the listeners so no new events can
+        # be enqueued behind the sentinel. The sentinel lets an
+        # in-flight transcribe+inject finish (bounded); the daemon
+        # thread dies with the process if it outlives the timeout.
+        self._stop_event_worker(timeout_s=2.0)
+        # Close the audio stream HERE, on the main thread, before the
+        # interpreter starts finalizing. sounddevice registers an atexit
+        # handler that stops+closes any still-open stream; if the stream
+        # is left open, that handler runs inside _Py_Finalize (GIL held)
+        # while another thread may be mid-stop of the same stream —
+        # CoreAudio's HAL mutex + the IO thread's wait for the GIL then
+        # form a three-way deadlock that even SIGINT can't escape
+        # (observed via `sample` on a stuck instance). Closing here is
+        # serialized with any in-flight worker close via the recorder's
+        # stream lock, so at most one thread is ever inside CoreAudio,
+        # and atexit finds nothing left to close.
+        try:
+            self.recorder.close()
+        except Exception:
+            log.exception("recorder close failed during shutdown")
         try:
             self.feedback.stop()
         except Exception:

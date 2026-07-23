@@ -225,6 +225,40 @@ def test_recorder_close_is_idempotent(fake_sd):
     assert not r.is_recording()
 
 
+def test_recorder_close_is_serialized_across_threads(fake_sd):
+    """Two threads racing close() must not both enter PortAudio's
+    stop/close. CoreAudio deadlocks on the HAL mutex when two threads
+    stop the same stream concurrently (observed in production: main
+    thread in atexit's Pa_Terminate vs. hotkey thread in
+    recorder.close()). The stream lock serializes them: the loser sees
+    `_stream is None` and no-ops."""
+    import threading
+    import time
+
+    from speakinput.audio import AudioRecorder
+
+    stream = MagicMock()
+    # Make stop() slow so the race window is wide open; the second
+    # thread MUST wait for the first to finish instead of piling in.
+    stream.stop.side_effect = lambda: time.sleep(0.2)
+    fake_sd.InputStream.side_effect = lambda **kw: stream
+
+    r = AudioRecorder()
+    r.start()
+    assert r.is_recording()
+
+    t = threading.Thread(target=r.close)
+    t.start()
+    time.sleep(0.05)  # let t get inside close() first
+    r.close()  # main thread races in
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    # Despite the race, PortAudio saw exactly one stop + one close.
+    stream.stop.assert_called_once()
+    stream.close.assert_called_once()
+    assert not r.is_recording()
+
+
 def test_recorder_stop_equivalent_to_drain_then_close(fake_sd):
     """stop() should still return the full buffer and tear down the
     stream, preserving the existing single-chunk release behavior."""

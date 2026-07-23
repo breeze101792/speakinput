@@ -355,6 +355,16 @@ Run `./start.sh --debug` and look for the line that says either `This process is
 
 macOS sometimes resets these permissions after a macOS update, after major Python upgrades (e.g. 3.13 → 3.14), or after the `.venv` is rebuilt. The venv python path changes, and the old permission entry no longer matches. Re-run steps 3–5 and the issue goes away.
 
+### Sleep, a stuck hotkey, and Ctrl-C
+
+macOS disables the hotkey event tap (CGEventTap) when the machine sleeps, and can also kill it if the tap's callback runs too long. Speak Input defends itself on all three fronts:
+
+- **Tap callbacks are instant.** Recording, transcription, and typing run on a separate worker thread; the OS tap callback just enqueues and returns, so macOS never times the tap out mid-transcribe.
+- **Sleep is detected and healed.** A background watcher notices the wall/monotonic clock skew after wake and restarts the hotkey listeners automatically (a dead listener thread is restarted too). If a key was held when the machine slept, the orphaned press is cancelled and its audio discarded — you'd otherwise see every later press ignored as "already busy".
+- **Ctrl-C always works.** The first Ctrl-C shuts down cleanly (and closes the audio stream on the main thread, which avoids a CoreAudio deadlock during interpreter exit that used to wedge the process on macOS). If anything ever hangs mid-shutdown, press **Ctrl-C a second time**: it dumps every thread's stack to the terminal and force-exits immediately — include that dump in any bug report.
+
+If the listeners can't be restarted (e.g. the Input Monitoring permission was revoked), you get one clear warning telling you to restart the app — not a silent dead hotkey.
+
 ## Linux / Wayland
 
 Speak Input uses a second hotkey listener on Linux that reads the kernel input subsystem directly via `python-evdev`, bypassing pynput's X11-only backend. evdev works on **both** Wayland and X11 (it talks to `/dev/input/eventN`, not the display server), so it's the right choice for every Linux session — no need to inspect `XDG_SESSION_TYPE`. If evdev can't find an accessible keyboard (no `/dev/input` access, not in the `input` group, no keyboard attached), the app falls back to pynput.

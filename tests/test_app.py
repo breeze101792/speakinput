@@ -2111,3 +2111,437 @@ def test_shutdown_is_idempotent():
     # already torn down.
     app.shutdown()
     assert app._shutdown.is_set()
+
+
+# --- event worker: hotkey bodies run off the OS event-tap thread ----------
+
+
+def test_hotkey_callbacks_run_on_worker_thread_not_caller():
+    """The press callback handed to the listener must NOT run the press
+    body on the calling (event-tap) thread. macOS disables CGEventTaps
+    whose callback runs too long, and a release body takes seconds
+    (drain → transcribe → inject). The callback must enqueue and return;
+    the body runs on the app's worker thread."""
+    import threading
+
+    app, recorder, _, _, _ = _build_app()
+    seen: dict[str, int] = {}
+
+    real_press = app.on_hotkey_press
+
+    def _recording_press(profile):
+        seen["ident"] = threading.get_ident()
+        return real_press(profile)
+
+    app.on_hotkey_press = _recording_press  # type: ignore[method-assign]
+    app._start_event_worker()
+    try:
+        cb = app._make_press_cb(app.config.primary)
+        main_ident = threading.get_ident()
+        cb()  # must return immediately; body runs on the worker
+        deadline = time.monotonic() + 2.0
+        while "ident" not in seen and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "ident" in seen, "press body never ran"
+        assert seen["ident"] != main_ident
+        # The body really ran: the recorder was started.
+        recorder.start.assert_called_once()
+    finally:
+        app._stop_event_worker()
+
+
+def test_event_worker_survives_handler_exception():
+    """A raising handler must not kill the worker thread — a dead worker
+    with live listeners would be the same silent 'hotkey does nothing'
+    failure the worker exists to prevent."""
+    app, _, _, _, _ = _build_app()
+    ran = []
+
+    def _boom():
+        raise RuntimeError("handler bug")
+
+    app._start_event_worker()
+    try:
+        app._enqueue_event(_boom)
+        app._enqueue_event(lambda: ran.append("second"))
+        deadline = time.monotonic() + 2.0
+        while not ran and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ran == ["second"]
+    finally:
+        app._stop_event_worker()
+
+
+def test_press_release_order_preserved_through_queue():
+    """Press then release enqueued back-to-back must execute in order:
+    release sees a recording session and finalizes it."""
+    app, recorder, transcribers, injector, _ = _build_app()
+    app._start_event_worker()
+    try:
+        app._make_press_cb(app.config.primary)()
+        app._make_release_cb(app.config.primary)()
+        # Generous deadline: the press path shells out to the media
+        # backend (osascript on macOS), which can take >1s on a cold
+        # start. The queue ordering is what we assert, not speed.
+        deadline = time.monotonic() + 5.0
+        while injector.inject.call_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        injector.inject.assert_called_once_with("hello world")
+        transcribers[app.config.primary.key].transcribe.assert_called_once()
+        # Lock released at the end of finalize; a new press is accepted.
+        assert not app._busy.locked()
+    finally:
+        app._stop_event_worker()
+
+
+# --- escalating SIGINT -----------------------------------------------------
+
+
+def test_sigint_escalates_on_second_press(monkeypatch, capsys):
+    """First Ctrl-C: graceful shutdown (set the event). Second Ctrl-C:
+    dump thread stacks and force-exit. This is the escape hatch for a
+    wedged teardown — without it, further Ctrl-Cs are silent no-ops and
+    the user has to kill -9."""
+    import signal as _sig_module
+
+    from speakinput.app import App
+
+    fake_ensure = MagicMock(return_value="/r/small.bin")
+    fake_model_cls = MagicMock()
+    monkeypatch.setattr("speakinput.app.ensure_model", fake_ensure)
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", fake_model_cls)
+    monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+    installed: dict[int, object] = {}
+    real_signal_signal = _sig_module.signal
+
+    def fake_signal(signum, handler):
+        if signum == _sig_module.SIGINT:
+            installed[signum] = handler
+            return None
+        return real_signal_signal(signum, handler)
+
+    monkeypatch.setattr("signal.signal", fake_signal)
+    fake_exit = MagicMock()
+    monkeypatch.setattr("os._exit", fake_exit)
+    import faulthandler
+
+    fake_dump = MagicMock()
+    monkeypatch.setattr(faulthandler, "dump_traceback", fake_dump)
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app._shutdown.set()
+    app.run()
+
+    handler = installed[_sig_module.SIGINT]
+    # First press on an already-set event? Reset to simulate a fresh run.
+    app._shutdown.clear()
+    handler(_sig_module.SIGINT, None)
+    assert app._shutdown.is_set()
+    fake_exit.assert_not_called()
+    # Second press: force exit with a stack dump.
+    handler(_sig_module.SIGINT, None)
+    fake_dump.assert_called_once()
+    fake_exit.assert_called_once_with(2)
+    captured = capsys.readouterr()
+    assert "Ctrl-C" in captured.err
+
+
+# --- liveness watcher: sleep detection + swap ------------------------------
+
+
+def test_liveness_watcher_detects_sleep_via_clock_skew(monkeypatch):
+    """After a suspend, time.monotonic has barely moved but the wall
+    clock has jumped. The watcher must call on_sleep with the skew."""
+    from speakinput.app import _LivenessWatcher
+
+    state = {"mono": 1000.0, "wall": 5000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: state["mono"])
+    monkeypatch.setattr(time, "time", lambda: state["wall"])
+
+    on_sleep = MagicMock()
+    watcher = _LivenessWatcher(
+        listeners=[], interval_s=60.0, on_dead=MagicMock(), on_sleep=on_sleep
+    )
+    # First call just initializes the baseline.
+    watcher._check_sleep()
+    # Normal tick: both clocks advance together — no sleep.
+    state["mono"] += 5.0
+    state["wall"] += 5.0
+    watcher._check_sleep()
+    on_sleep.assert_not_called()
+    # Machine slept for ~100s: monotonic advanced one tick, wall jumped.
+    state["mono"] += 5.0
+    state["wall"] += 105.0
+    watcher._check_sleep()
+    on_sleep.assert_called_once()
+    slept = on_sleep.call_args[0][0]
+    assert 99.0 < slept <= 100.0
+
+
+def test_liveness_watcher_no_sleep_when_clocks_track(monkeypatch):
+    from speakinput.app import _LivenessWatcher
+
+    state = {"mono": 0.0, "wall": 100.0}
+    monkeypatch.setattr(time, "monotonic", lambda: state["mono"])
+    monkeypatch.setattr(time, "time", lambda: state["wall"])
+
+    on_sleep = MagicMock()
+    watcher = _LivenessWatcher(
+        listeners=[], interval_s=60.0, on_dead=MagicMock(), on_sleep=on_sleep
+    )
+    watcher._check_sleep()
+    for _ in range(5):
+        state["mono"] += 5.0
+        state["wall"] += 5.0
+        watcher._check_sleep()
+    on_sleep.assert_not_called()
+
+
+def test_liveness_watcher_swap_replaces_and_resets_tracking():
+    """swap() must put the new listener into the polled set and mark it
+    alive, so its future death fires on_dead exactly once."""
+    from speakinput.app import _LivenessWatcher
+
+    on_dead = MagicMock()
+    old = MagicMock(spec=["_key", "is_running"])
+    old._key = "alt_r"
+    old.is_running.return_value = False
+    new = MagicMock(spec=["_key", "is_running"])
+    new._key = "alt_r"
+    new.is_running.return_value = True
+
+    watcher = _LivenessWatcher(
+        listeners=[old], interval_s=0.01, on_dead=on_dead
+    )
+    watcher.swap(old, new)
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    # The dead `old` listener must NOT fire on_dead after the swap —
+    # the watcher now polls the healthy replacement.
+    on_dead.assert_not_called()
+    assert watcher._listeners == [new]
+
+
+# --- listener restart + stranded-press abort --------------------------------
+
+
+def test_restart_listener_replaces_dead_listener():
+    """A successful restart swaps the registry entry, stops the old
+    listener, and informs the watcher (so it polls the new one)."""
+    app, _, _, _, _ = _build_app()
+    app._use_evdev = False
+    old = MagicMock()
+    app.listeners["alt_r"] = old
+    watcher = MagicMock()
+    app._liveness_watcher = watcher
+
+    assert app._restart_listener("alt_r") is True
+    new = app.listeners["alt_r"]
+    assert new is not old
+    new.start.assert_called_once()
+    old.stop.assert_called_once()
+    watcher.swap.assert_called_once_with(old, new)
+
+
+def test_restart_listener_failure_keeps_old(monkeypatch):
+    """If construction/start raises, the old listener stays registered
+    so the liveness watcher's next tick retries the restart."""
+    app, _, _, _, _ = _build_app()
+    app._use_evdev = False
+    old = MagicMock()
+    app.listeners["alt_r"] = old
+    monkeypatch.setattr(
+        "speakinput.app.HotkeyListener",
+        MagicMock(side_effect=RuntimeError("HIToolbox wedged")),
+    )
+    assert app._restart_listener("alt_r") is False
+    assert app.listeners["alt_r"] is old
+    old.stop.assert_not_called()
+
+
+def test_on_listener_dead_restarts_and_enqueues_abort(capsys):
+    """Dead listener → restart attempt + a stranded-press abort on the
+    event queue (the release event died with the listener)."""
+    app, _, _, _, _ = _build_app()
+    app._use_evdev = False
+    old = MagicMock()
+    app.listeners["alt_r"] = old
+
+    app._on_listener_dead("alt_r")
+    assert app.listeners["alt_r"] is not old
+    fn, args = app._work_q.get_nowait()
+    assert fn == app._abort_press
+    assert "alt_r" in args[0]
+    captured = capsys.readouterr()
+    assert "restarted" in captured.err
+
+
+def test_on_listener_dead_warns_when_restart_fails(monkeypatch, capsys):
+    """If the restart fails, the user must still get the old-style
+    'restart speakinput' warning — that's the only way they learn the
+    hotkey is dead."""
+    app, _, _, _, _ = _build_app()
+    app._use_evdev = False
+    app.listeners["alt_r"] = MagicMock()
+    monkeypatch.setattr(
+        "speakinput.app.HotkeyListener",
+        MagicMock(side_effect=RuntimeError("boom")),
+    )
+    app._on_listener_dead("alt_r")
+    captured = capsys.readouterr()
+    assert "no longer alive" in captured.err
+    assert "Restart speakinput" in captured.err
+
+
+def test_on_listener_dead_backs_off_when_flapping(capsys):
+    """A listener that dies again right after a restart (e.g. Input
+    Monitoring permission revoked — the tap can never come up) must NOT
+    be restarted a second time within the backoff window: that would
+    flap die→restart→die forever and bury the one message the user
+    needs ('fix your permissions, then restart speakinput')."""
+    app, _, _, _, _ = _build_app()
+    app._use_evdev = False
+    old = MagicMock()
+    app.listeners["alt_r"] = old
+    # Simulate a restart moments ago.
+    app._listener_restart_at["alt_r"] = time.monotonic()
+
+    app._on_listener_dead("alt_r")
+    # No restart: the registry still holds the dead listener...
+    assert app.listeners["alt_r"] is old
+    # ...the user got the warning...
+    captured = capsys.readouterr()
+    assert "no longer alive" in captured.err
+    # ...and the stranded-press abort still ran through the queue.
+    fn, _ = app._work_q.get_nowait()
+    assert fn == app._abort_press
+
+
+def test_on_system_sleep_restarts_all_listeners_and_aborts(capsys):
+    """Wake detection restarts every listener (macOS disables event
+    taps across sleep even though the threads stay alive) and enqueues
+    a stranded-press abort."""
+    from speakinput.config import Profile
+
+    config = Config(
+        primary=Profile(key="alt_r"),
+        secondary=Profile(key="cmd_r"),
+        audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0),
+    )
+    t = MagicMock()
+    t.transcribe.return_value = "x"
+    app, _, _, _, _ = _build_app(
+        config=config, transcribers={"alt_r": t, "cmd_r": t}
+    )
+    old_primary = MagicMock()
+    old_secondary = MagicMock()
+    app.listeners = {"alt_r": old_primary, "cmd_r": old_secondary}
+
+    app._on_system_sleep(120.0)
+    assert app.listeners["alt_r"] is not old_primary
+    assert app.listeners["cmd_r"] is not old_secondary
+    fn, args = app._work_q.get_nowait()
+    assert fn == app._abort_press
+    assert "wake" in args[0]
+    captured = capsys.readouterr()
+    assert "system slept" in captured.err
+
+
+def test_abort_press_releases_busy_and_discards_audio():
+    """A stranded press (release lost) must be torn down: busy lock
+    released, recorder closed, buffer discarded — NOT transcribed."""
+    app, recorder, transcribers, injector, feedback = _build_app()
+    app.on_hotkey_press(app.config.primary)
+    assert app._busy.locked()
+
+    app._abort_press("test reason")
+    assert not app._busy.locked()
+    recorder.drain.assert_called()
+    recorder.close.assert_called()
+    # No transcribe/inject for the discarded buffer.
+    transcribers[app.config.primary.key].transcribe.assert_not_called()
+    injector.inject.assert_not_called()
+    assert app._active_profile is None
+    feedback.set_state.assert_called_with("idle")
+
+
+def test_abort_press_noop_when_no_press_active():
+    """Aborting with no active press must be a silent no-op (the wake
+    path fires it unconditionally)."""
+    app, recorder, _, _, _ = _build_app()
+    app._abort_press("no press")
+    recorder.close.assert_not_called()
+    assert not app._busy.locked()
+
+
+def test_abort_press_noop_when_release_in_progress():
+    """While on_hotkey_release is finalizing (_manual_release_pending),
+    the abort must not touch the session — the finalize path owns the
+    lock and a double release would corrupt state."""
+    app, recorder, _, _, _ = _build_app()
+    app.on_hotkey_press(app.config.primary)
+    app._manual_release_pending = True  # simulate finalize in flight
+    app._abort_press("wake during finalize")
+    assert app._busy.locked()  # still held — abort backed off
+    # Cleanup: run the real finalize so the lock is released.
+    app._manual_release_pending = False
+    app._finalize(app.config.primary)
+    assert not app._busy.locked()
+
+
+# --- bounded media resume on shutdown ---------------------------------------
+
+
+def test_shutdown_completes_when_media_resume_hangs():
+    """A media backend that never returns (wedged osascript after
+    sleep) must not hang shutdown: the bounded helper thread is joined
+    with a timeout and shutdown moves on. Regression test for
+    'Ctrl-C does not work, have to kill -9'."""
+    import threading
+
+    app, _, _, _, _ = _build_app()
+    never = threading.Event()
+
+    def _hung_resume():
+        never.wait()  # blocks forever; daemon thread dies at exit
+
+    media = MagicMock()
+    media.resume.side_effect = _hung_resume
+    app.media_controller = media
+
+    start = time.monotonic()
+    app.shutdown()
+    elapsed = time.monotonic() - start
+    assert app._shutdown.is_set()
+    # 3s bounded join + slack. Without the bound this test would hang.
+    assert elapsed < 10.0
+    for listener in app.listeners.values():
+        listener.stop.assert_called()
+
+
+def test_shutdown_closes_recorder_stream():
+    """shutdown() must close the recorder's PortAudio stream itself.
+
+    sounddevice's atexit handler stops+closes any still-open stream
+    during interpreter finalization (GIL held). If another thread is
+    concurrently stopping the same stream, CoreAudio deadlocks on the
+    HAL mutex while its IO thread waits for the GIL — the exact
+    three-way deadlock sampled from a stuck production instance
+    (main thread in Py_Finalize → Pa_CloseStream; hotkey thread in
+    AudioOutputUnitStop; IO thread in startStopCallback). Closing in
+    shutdown (serialized via the recorder's stream lock) means atexit
+    finds nothing to close."""
+    app, recorder, _, _, _ = _build_app()
+    app.shutdown()
+    recorder.close.assert_called()
