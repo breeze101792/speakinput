@@ -458,3 +458,69 @@ def test_feedback_supports_error_state():
 
     fb = StderrFeedback()
     fb.set_state("error")  # would raise ValueError before this fix
+
+
+# --- stability: PortAudio callback survivability, stream-leak prevention ---
+
+
+def test_on_audio_callback_survives_numpy_failure(fake_sd):
+    """The PortAudio callback must NEVER raise — if it does, the
+    audio thread dies and either the process is killed or no more
+    audio ever arrives. We inject a numpy failure (the indata.copy()
+    raising) and verify the callback drops the chunk silently
+    rather than letting the exception escape."""
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    # Build a fake indata whose .copy() raises.
+    class BadIndata:
+        def copy(self):
+            raise MemoryError("simulated OOM in numpy")
+
+    # No exception should escape the callback.
+    cb(BadIndata(), 160, None, None)
+    # The recorder is still alive and can be re-armed.
+    assert r.is_recording()
+
+
+def test_start_failure_closes_partial_stream(fake_sd):
+    """If `sd.InputStream.start()` raises after construction, the
+    partially-constructed native stream is closed here (not leaked
+    until sounddevice's atexit). The fixture's `InputStream` returns
+    a MagicMock that records `.close()` calls.
+    """
+    from speakinput.audio import AudioError, AudioRecorder
+
+    class LeakedStream:
+        closed = False
+        def start(self):
+            raise RuntimeError("AUHAL rejected the stream")
+        def close(self):
+            self.closed = True
+
+    fake_sd.query_devices.return_value = []
+    fake_sd.InputStream.return_value = LeakedStream()
+    r = AudioRecorder()
+    with pytest.raises(AudioError):
+        r.start()
+    # The leaked stream must have been closed, not orphaned.
+    assert fake_sd.InputStream.return_value.closed is True
+    # And the recorder is in a clean state for the next press.
+    assert not r.is_recording()
+    assert r._stream is None
+
+
+def test_close_sets_chunks_to_none(fake_sd):
+    """After close(), any audio callback that fires must NOT
+    silently append to a stale chunks list. The fix sets
+    `_chunks = None` in close() so the callback's guard skips
+    the append and the next `start()` gets a fresh list."""
+    import numpy as np
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    r.close()
+    # After close, _chunks must be None (not []). This is the
+    # contract the audio callback's `if self._chunks is not None`
+    # guard relies on.
+    assert r._chunks is None
+    # Drive a callback with a real numpy array — should not crash
+    # and should not raise.
+    cb(np.zeros((1, 160), dtype="float32"), 160, None, None)
+    assert r._chunks is None  # callback dropped the chunk

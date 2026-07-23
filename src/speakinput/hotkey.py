@@ -416,6 +416,20 @@ class EvdevHotkeyListener:
         self._devices: list = []
         self._threads: list[threading.Thread] = []
         self._pressed = False
+        # evdev can fire the same key event from two devices in
+        # parallel (a USB keyboard and a laptop built-in, say). The
+        # latch check+set is not atomic against another device
+        # thread without a lock — both threads can see
+        # `self._pressed is False`, both pass the guard, both call
+        # on_press. The user then gets two parallel push-to-talk
+        # sessions: the second press acquires the busy lock only
+        # after the first releases (at finalize), so the first
+        # press's release is delivered to a now-orphaned on_release
+        # call. Symptoms: every other press looks like it "ate"
+        # the next one. Lock the latch check+set so only one
+        # device thread can win the press and only one can win the
+        # release.
+        self._latch_lock = threading.Lock()
 
     def _open_devices(self) -> list:
         if self._device_arg is not None:
@@ -434,15 +448,21 @@ class EvdevHotkeyListener:
             return
         if event.code != self._keycode:
             return
+        # The latch is the only piece of state shared between per-
+        # device read threads, so it gets a dedicated lock (separate
+        # from anything the user's callback might take). Cheap —
+        # just a `compare-and-set` of a bool.
         if event.value == 1:  # press
-            if self._pressed:
-                return  # key-repeat OR another device already fired
-            self._pressed = True
+            with self._latch_lock:
+                if self._pressed:
+                    return  # key-repeat OR another device already fired
+                self._pressed = True
             self._on_press()
         elif event.value == 0:  # release
-            if not self._pressed:
-                return  # release without prior press; noop
-            self._pressed = False
+            with self._latch_lock:
+                if not self._pressed:
+                    return  # release without prior press; noop
+                self._pressed = False
             self._on_release()
         # value == 2 (repeat) is intentionally ignored.
 
@@ -497,7 +517,11 @@ class EvdevHotkeyListener:
                 pass
         self._devices = []
         self._threads = []
-        self._pressed = False
+        # Reset under the latch lock so an in-flight device thread
+        # that lost the race to close() doesn't see stale state on
+        # the next start().
+        with self._latch_lock:
+            self._pressed = False
 
     def join(self) -> None:
         for t in self._threads:

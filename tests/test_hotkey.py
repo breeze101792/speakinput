@@ -805,6 +805,66 @@ def test_evdev_listener_latch_suppresses_repeat(fake_evdev_keyboard):
     assert presses == [1]
 
 
+def test_evdev_listener_latch_serializes_concurrent_devices(monkeypatch):
+    """Two devices firing the same keycode in parallel must NOT
+    both deliver on_press. The latch is now guarded by a lock so
+    the second device's check-and-set doesn't slip through after
+    the first. This is the multi-device hotkey race that bit
+    users with a USB keyboard plugged in alongside a laptop
+    built-in.
+    """
+    from speakinput import hotkey as hk
+    from speakinput.hotkey import EvdevHotkeyListener
+
+    # Stand in for a missing evdev module so the constructor
+    # accepts the call (the real module isn't always installed
+    # in CI / dev venvs).
+    fake_evdev = MagicMock()
+    fake_ecodes = MagicMock()
+    fake_ecodes.EV_KEY = 1
+    monkeypatch.setattr(hk, "evdev", fake_evdev, raising=False)
+    monkeypatch.setattr(hk, "_ecodes", fake_ecodes, raising=False)
+
+    # Drive the listener's `_handle_event` directly from two
+    # threads and verify only one on_press fires.
+    presses: list[int] = []
+    releases: list[int] = []
+    h = EvdevHotkeyListener(
+        keycode=99,  # arbitrary
+        on_press=lambda: presses.append(1),
+        on_release=lambda: releases.append(1),
+    )
+
+    class FakeEvent:
+        def __init__(self, code, value):
+            self.type = 1  # EV_KEY
+            self.code = code
+            self.value = value
+
+    import threading
+    # Two threads, each firing a press event for the same keycode
+    # at the same time. Without the latch lock, both would observe
+    # `_pressed is False` and both would call on_press. With the
+    # lock, exactly one wins.
+    barrier = threading.Barrier(2)
+    def fire_press():
+        barrier.wait()
+        h._handle_event(FakeEvent(99, 1))
+    t1 = threading.Thread(target=fire_press)
+    t2 = threading.Thread(target=fire_press)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert len(presses) == 1, f"expected exactly one press, got {presses}"
+    # And the release side is similarly serialized.
+    barrier = threading.Barrier(2)
+    def fire_release():
+        barrier.wait()
+        h._handle_event(FakeEvent(99, 0))
+    t1 = threading.Thread(target=fire_release)
+    t2 = threading.Thread(target=fire_release)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert len(releases) == 1, f"expected exactly one release, got {releases}"
+
+
 def test_evdev_listener_ignores_other_keys(fake_evdev_keyboard):
     from speakinput.hotkey import EvdevHotkeyListener
 

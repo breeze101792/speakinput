@@ -41,28 +41,36 @@ log = logging.getLogger("speakinput")
 # We use the pure-Python reimplementation to avoid native build deps.
 _OPENCC_S2T: Any = None
 _OPENCC_T2S: Any = None
+# Guards the OpenCC cache against a double-build race: the worker
+# thread and a watchdog chunk body can both call `_opencc("s2t")`
+# in parallel and each construct a fresh OpenCC object before either
+# stores it. The winner is fine, the loser's converter is GC'd, but
+# the wasted model load is ~50ms and shows up as a one-shot
+# latency spike on the first Chinese-text press. Cheap to lock.
+_OPENCC_LOCK = threading.Lock()
 
 
 def _opencc(direction: str) -> Any | None:
     global _OPENCC_S2T, _OPENCC_T2S
-    cache = _OPENCC_S2T if direction == "s2t" else _OPENCC_T2S
-    if cache is not None:
-        return cache if cache is not False else None
-    try:
-        from opencc import OpenCC
-        cc = OpenCC(direction)
-        if direction == "s2t":
-            _OPENCC_S2T = cc
-        else:
-            _OPENCC_T2S = cc
-        return cc
-    except Exception:
-        log.warning("opencc not available; zh_conversion disabled")
-        if direction == "s2t":
-            _OPENCC_S2T = False
-        else:
-            _OPENCC_T2S = False
-        return None
+    with _OPENCC_LOCK:
+        cache = _OPENCC_S2T if direction == "s2t" else _OPENCC_T2S
+        if cache is not None:
+            return cache if cache is not False else None
+        try:
+            from opencc import OpenCC
+            cc = OpenCC(direction)
+            if direction == "s2t":
+                _OPENCC_S2T = cc
+            else:
+                _OPENCC_T2S = cc
+            return cc
+        except Exception:
+            log.warning("opencc not available; zh_conversion disabled")
+            if direction == "s2t":
+                _OPENCC_S2T = False
+            else:
+                _OPENCC_T2S = False
+            return None
 
 
 def _contains_chinese(text: str) -> bool:
@@ -265,7 +273,15 @@ class _Heartbeat:
         self._start = time.monotonic()
 
     def start(self) -> None:
-        if self._thread is not None:
+        # Re-startable: if stop() was called and the thread exited,
+        # a follow-up start() should bring it back. The old
+        # `if self._thread is not None` check treated a stopped
+        # thread (reference still set, but is_alive() == False) as
+        # "already running" and silently no-op'd. `_LivenessWatcher`
+        # does the right thing by always creating a new
+        # `_LivenessWatcher` instance, so this only matters for the
+        # heartbeat and watchdog.
+        if self._thread is not None and self._thread.is_alive():
             return
         self._thread = threading.Thread(
             target=self._run, name="speakinput-heartbeat", daemon=True
@@ -405,6 +421,20 @@ class App:
         # recording the user's next sentence while the previous one is
         # being typed out).
         self._body_lock = threading.Lock()
+        # Serializes the *injection* of typed text. The body lock above
+        # only covers the brief drain→re-arm window; transcribe+inject
+        # runs OUTSIDE it. Two threads (a chunked body that just
+        # finished its drain and the manual-release finalizer that
+        # fired in parallel) can both be inside `injector.inject`
+        # simultaneously, which on the Unicode/clipboard path means
+        # two concurrent paste-and-restore sequences whose Ctrl-V and
+        # restore interleave. The lock makes the second inject wait
+        # for the first to finish; injects are seconds, not minutes,
+        # so the worst-case wait is bounded by the time the first
+        # pbcopy + pynput.pressed(Ctrl) + pynput.tap(V) takes.
+        # Acquired outside the injector so we can never deadlock with
+        # the injector's own internal unicode-path lock.
+        self._inject_lock = threading.Lock()
         self._press_started_at: float | None = None
         # The profile that's currently being recorded. Set on press,
         # consumed on release, cleared at the end. None outside of a
@@ -787,7 +817,26 @@ class App:
                 print(text, file=sys.stderr, flush=True)
             else:
                 try:
-                    self.injector.inject(text)
+                    # Serialize inject calls across the chunked body
+                    # and the finalizer. Without this, a watchdog
+                    # fire that races a manual release (or the
+                    # abort→resume shutdown path on top of a finalizing
+                    # inject) can have two threads inside
+                    # `injector.inject(text)` at the same time. For
+                    # the Unicode/clipboard path, that means two
+                    # concurrent `_pbcopy` + Ctrl-V sequences whose
+                    # paste and restore interleave — the user sees
+                    # half of one sentence, then half of the other.
+                    # For the ASCII path on wtype/ydotool, two
+                    # concurrent `wtype -- foo` and `wtype -- bar`
+                    # shell-outs interleave keystrokes. The lock
+                    # makes the second inject wait for the first to
+                    # finish; cheap because injects are seconds, not
+                    # minutes. Acquired OUTSIDE the injector's own
+                    # internal lock so we never deadlock with the
+                    # injector's clip-restore scheduling path.
+                    with self._inject_lock:
+                        self.injector.inject(text)
                 except Exception:
                     log.exception("injection failed")
 
@@ -961,14 +1010,31 @@ class App:
             except Exception:
                 pass
             self._watchdog = None
+        # Acquire the body lock around the drain so a chunked
+        # watchdog body (which is the only other thread that touches
+        # the recorder's chunks list besides the worker) can't
+        # simultaneously call drain() and have us both end up
+        # returning a half-drained buffer. `_process_and_inject` runs
+        # OUTSIDE the body lock; the abort's `_process_and_inject`
+        # is not called (we're discarding the audio) so releasing
+        # the lock right after drain is fine. The close() inside
+        # recorder uses the recorder's own stream lock and is safe
+        # regardless.
         try:
-            self.recorder.drain()
+            with self._body_lock:
+                try:
+                    self.recorder.drain()
+                except Exception:
+                    pass
+                try:
+                    self.recorder.close()
+                except Exception:
+                    pass
         except Exception:
-            pass
-        try:
-            self.recorder.close()
-        except Exception:
-            pass
+            # Lock acquire shouldn't fail, but if it does (a chunk
+            # body is wedged), don't let it freeze shutdown — log
+            # and continue.
+            log.exception("body lock acquire failed during press abort")
         if self.media_controller is not None:
             try:
                 self.media_controller.resume()

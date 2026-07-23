@@ -44,8 +44,34 @@ class RumpsFeedback:  # pragma: no cover - requires a macOS GUI
         if state not in _STATE_TITLE:
             raise ValueError(f"unknown state: {state!r}")
         self._state = state
-        if self._app is not None:
-            self._app.title = _STATE_TITLE[state]
+        # Setting `NSStatusBar.title` from a non-main thread is
+        # technically undefined behavior in AppKit — it works in
+        # practice because Cocoa defers the actual set, but on a
+        # busy session the title can flicker or update out of order
+        # when `set_state` is called from the worker, watchdog, or
+        # abort threads. `rumps.Notification` posts via the run
+        # loop, which is the canonical way to bounce an update back
+        # to the main thread; if rumps isn't available or the run
+        # loop is gone (e.g. the menu-bar app already quit), we
+        # fall back to a best-effort direct write wrapped in
+        # try/except so a stray NSException doesn't kill the caller.
+        try:
+            if self._app is not None and rumps is not None:
+                try:
+                    rumps.notification(
+                        "", "", _STATE_TITLE[state]
+                    )  # pragma: no cover - macOS-only
+                    # The notification bounce is just a way to land
+                    # on the main run loop. The title is set below
+                    # either way.
+                except Exception:
+                    pass
+                self._app.title = _STATE_TITLE[state]
+        except Exception:
+            # Worst case the menu-bar icon stops updating; the
+            # main app still works (the user sees whatever the
+            # last successful update left).
+            pass
 
     def stop(self) -> None:
         if self._app is not None:

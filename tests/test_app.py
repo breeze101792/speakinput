@@ -2500,6 +2500,36 @@ def test_abort_press_noop_when_release_in_progress():
     assert not app._busy.locked()
 
 
+def test_abort_press_acquires_body_lock_around_drain():
+    """`_abort_press` must hold `_body_lock` while calling
+    `recorder.drain()` so a chunked watchdog body (which is the
+    only other thread that can be in the same code path) cannot
+    race the abort. Without the lock, the chunk body and the abort
+    can both end up calling `drain()` and the abort's discarded
+    audio can leak into the chunk body's transcribe — the user
+    sees a phantom transcript typed in for audio we explicitly
+    said we were throwing away.
+    """
+    import threading
+
+    app, recorder, _, _, _ = _build_app()
+    app.on_hotkey_press(app.config.primary)
+    # Simulate a chunked body that's mid-drain: take the body lock
+    # ourselves and verify the abort waits for it.
+    with app._body_lock:
+        # Kick off the abort in a thread; it must NOT have called
+        # `recorder.drain()` yet because the body lock is held.
+        t = threading.Thread(target=app._abort_press, args=("race test",))
+        t.start()
+        # Give it time to try (and fail) to acquire the lock.
+        time.sleep(0.1)
+        recorder.drain.assert_not_called()
+    # Now release the body lock; the abort should finish.
+    t.join(timeout=2.0)
+    assert not t.is_alive(), "abort didn't unblock after body lock released"
+    recorder.drain.assert_called()
+
+
 # --- bounded media resume on shutdown ---------------------------------------
 
 

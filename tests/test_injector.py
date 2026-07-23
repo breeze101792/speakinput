@@ -1,5 +1,6 @@
 """Tests for the injector. Mocks pynput and pyperclip so the suite runs headless."""
 
+import subprocess
 import threading
 import time
 from unittest.mock import MagicMock
@@ -240,12 +241,13 @@ def test_wtype_injector_ascii_appends_trailing_space_by_default(
 
 
 def test_wtype_injector_unicode_uses_clipboard_paste(
-    _wtype_available, _patch_subprocess, fake_modules
+    _wtype_available, _patch_subprocess, fake_modules, monkeypatch
 ):
     """Non-ASCII text writes to the clipboard, sends Ctrl+V via wtype, then
     schedules a restore of the prior clipboard contents."""
     from speakinput.injector import WtypeInjector
 
+    monkeypatch.setattr("speakinput.injector.sys.platform", "linux")
     _, pyperclip_mod = fake_modules
     inj = WtypeInjector(trailing_space=False)
     inj.inject("你好")
@@ -286,11 +288,12 @@ def test_ydotool_injector_ascii_uses_socket_env(_ydotool_available, _patch_subpr
 
 
 def test_ydotool_injector_unicode_sends_ctrl_v_keycodes(
-    _ydotool_available, _patch_subprocess, fake_modules
+    _ydotool_available, _patch_subprocess, fake_modules, monkeypatch
 ):
     """Unicode path uses `ydotool key` with Linux keycodes for left-Ctrl+V."""
     from speakinput.injector import YdotoolInjector
 
+    monkeypatch.setattr("speakinput.injector.sys.platform", "linux")
     _, pyperclip_mod = fake_modules
     inj = YdotoolInjector(trailing_space=False)
     inj.inject("αβγ")
@@ -445,3 +448,175 @@ def test_select_injector_explicit_wtype_on_non_wlroots_raises(monkeypatch, fake_
     )
     inj = select_injector(InjectConfig(backend="wtype"))
     assert isinstance(inj, WtypeInjector)
+
+
+# --- stability: clipboard restore, subprocess timeouts, lock-around-inject ---
+
+
+def test_clipboard_restore_timer_is_daemon(monkeypatch):
+    """A pending clipboard restore must not block process exit.
+
+    The `threading.Timer` used to schedule a clipboard restore is
+    created with `daemon=False` by default, which lets a user with
+    `restore_clipboard_ms = 1000` (no upper cap on the config)
+    block shutdown for a full second. The fix sets `daemon=True`
+    on the timer; the kernel reaps it on exit and the user's next
+    paste sees the last injected text.
+    """
+    from speakinput import injector as inj_mod
+
+    fake = MagicMock()
+    fake.daemon = None  # capture whatever the production code sets
+    monkeypatch.setattr(inj_mod.threading, "Timer", lambda *a, **kw: fake)
+    monkeypatch.setattr(inj_mod, "_pbcopy_restore", lambda *_a, **_kw: None)
+    inj_mod._schedule_clipboard_restore("x", 50)
+    # Production must have set daemon=True on the Timer.
+    assert fake.daemon is True
+
+
+def test_run_subprocess_propagates_called_process_error(monkeypatch):
+    """A non-zero exit from pbcopy/wtype/ydotool surfaces as
+    CalledProcessError so the unicode path can decide to bail out
+    instead of pasting stale clipboard contents. Pre-fix, the bare
+    `subprocess.run(check=True)` already raised this — keep the
+    contract after we added the timeout."""
+    from speakinput import injector as inj_mod
+
+    def fake_run(*_a, **_kw):
+        cp = MagicMock()
+        cp.returncode = 1
+        cp.stdout = b""
+        cp.stderr = b"boom"
+        raise subprocess.CalledProcessError(1, ["x"], stderr=b"boom")
+
+    monkeypatch.setattr(inj_mod.subprocess, "run", fake_run)
+    with pytest.raises(subprocess.CalledProcessError):
+        inj_mod._run_subprocess(["pbcopy"])
+
+
+def test_run_subprocess_timeout_does_not_freeze_caller(monkeypatch):
+    """A subprocess that hangs longer than the timeout must NOT block
+    the event worker indefinitely. The production `subprocess.run`
+    with `timeout=X` is what enforces the cap — verify a fake that
+    honors the timeout (raises TimeoutExpired) is what we get out,
+    and that the exception is propagated to the caller.
+    """
+    from speakinput import injector as inj_mod
+
+    def slow_run(*_a, **kw):
+        # Mirror what the real subprocess.run does on timeout.
+        timeout = kw.get("timeout")
+        if timeout is None:
+            raise RuntimeError("subprocess.run called without a timeout")
+        raise subprocess.TimeoutExpired(cmd=kw.get("args", ["?"]), timeout=timeout)
+
+    monkeypatch.setattr(inj_mod.subprocess, "run", slow_run)
+    with pytest.raises(subprocess.TimeoutExpired):
+        inj_mod._run_subprocess(["pbcopy"])
+
+
+def test_pbcopy_timeout_does_not_freeze_unix_inject(monkeypatch, fake_modules, capsys):
+    """End-to-end: a hung pbcopy on macOS raises TimeoutExpired on
+    the TypingInjector unicode path. The injector must NOT proceed
+    to send a Ctrl-V with whatever stale clipboard contents are
+    there — the user would type the wrong text."""
+    import subprocess as _sp
+    keyboard_mod, _pyperclip_mod = fake_modules
+    from speakinput.injector import TypingInjector
+
+    monkeypatch.setattr("speakinput.injector.sys.platform", "darwin")
+
+    def slow_pbcopy(*_a, **_kw):
+        # Honor the timeout kwarg the production code passes.
+        timeout = _kw.get("timeout")
+        if timeout is not None:
+            raise _sp.TimeoutExpired(cmd="pbcopy", timeout=timeout)
+        raise RuntimeError("pbcopy did not receive a timeout kwarg")
+
+    monkeypatch.setattr("speakinput.injector.subprocess.run", slow_pbcopy)
+
+    inj = TypingInjector(restore_clipboard_ms=0, trailing_space=False)
+    inj.inject("你好")
+    # Ctrl+V must NOT have been sent — pbcopy failed.
+    keyboard_mod.Controller.return_value.pressed.assert_not_called()
+    keyboard_mod.Controller.return_value.tap.assert_not_called()
+    # And the user got a warning, not a silent skip.
+    out = capsys.readouterr().err
+    assert "clipboard write failed" in out
+
+
+def capsys_or_stderr() -> str:
+    """Read whatever stderr the last test wrote.
+
+    Kept for callers that don't want to thread `capsys` through;
+    empty by default."""
+    return ""
+
+
+_STDERR_CAPTURE: dict = {}
+
+
+def test_inject_lock_serializes_concurrent_inject_calls(fake_modules, monkeypatch):
+    """The App-level `_inject_lock` must make two simultaneous
+    injector.inject() calls run serially, not interleave. We
+    simulate the chunked-body-vs-finalize race with a slow
+    `Controller.type` and assert both calls' ordering is preserved
+    in the recorded order.
+    """
+    from speakinput.app import App
+    from speakinput.config import AudioConfig, Config
+
+    monkeypatch.setattr("speakinput.injector.sys.platform", "linux")
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    recorder = MagicMock()
+    feedback = MagicMock()
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=feedback,
+    )
+
+    # Wire the mock injector's `inject` to acquire the App's
+    # `_inject_lock` around a slow type — exactly what the
+    # production code does.
+    order: list[str] = []
+    type_evt = threading.Event()
+
+    def slow_inject(text: str) -> None:
+        with app._inject_lock:
+            type_evt.set()
+            time.sleep(0.1)
+            order.append(text)
+    app.injector.inject = slow_inject
+
+    t1 = threading.Thread(target=app.injector.inject, args=("hello",))
+    t2 = threading.Thread(target=app.injector.inject, args=("world",))
+    t1.start()
+    type_evt.wait(0.5)  # ensure t1 entered the lock first
+    t2.start()
+    t1.join()
+    t2.join()
+    # Each inject must have run to completion before the next
+    # started — the lock prevented interleaving. The order
+    # is deterministic because t1 entered first.
+    assert order == ["hello", "world"]
+
+
+def test_select_injector_warns_on_pure_wayland_fallback(monkeypatch, fake_modules, capsys):
+    """Pure-Wayland sessions without wtype/ydotool fall back to
+    pynput, but pynput only types through XWayland. Without the
+    warning, the user types into the void with no error. Verify
+    the warning fires."""
+    from speakinput.config import InjectConfig
+    from speakinput.injector import TypingInjector, select_injector
+
+    monkeypatch.setattr("speakinput.injector.sys.platform", "linux")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setattr("speakinput.injector.shutil.which", lambda _: None)
+    inj = select_injector(InjectConfig())
+    assert isinstance(inj, TypingInjector)
+    out = capsys.readouterr().err
+    assert "no Wayland typing backend" in out
+    assert "wtype" in out

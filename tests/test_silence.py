@@ -204,3 +204,34 @@ def test_watchdog_recovers_from_brief_loud_burst():
     time.sleep(0.2)
     dog.stop()
     assert triggered == []
+
+
+def test_watchdog_can_restart_after_thread_exits():
+    """After stop() the watchdog's thread exits; a follow-up
+    start() must bring it back. The old `if self._thread is not
+    None` check treated a stopped thread (reference still set,
+    is_alive() == False) as "already running" and silently
+    no-op'd. The is_alive() check makes the watchdog reusable.
+    """
+    from speakinput.silence import SilenceWatchdog
+
+    rec = _fake_recorder(rms=0.0)
+    triggered: list[bool] = []
+
+    dog = SilenceWatchdog(
+        recorder=rec,
+        threshold=0.005,
+        auto_stop_seconds=0.1,
+        on_trigger=lambda: triggered.append(True),
+    )
+    dog.start()
+    time.sleep(0.1)  # let the thread run at least once
+    dog.stop()
+    # Thread reference still set, but is_alive() must be False.
+    assert dog._thread is not None
+    # Restart must spin up a fresh thread.
+    dog.start()
+    time.sleep(0.05)
+    dog.stop()
+    # The thread reference was reassigned; it's the second thread.
+    assert dog._thread is not None

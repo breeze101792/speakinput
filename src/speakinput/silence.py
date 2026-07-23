@@ -133,7 +133,16 @@ class SilenceWatchdog:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._thread is not None:
+        # Re-startable: if the previous run's thread exited
+        # (e.g. after the recorder was torn down on the abort
+        # path), a follow-up start() needs to spin up a fresh
+        # thread. The old `if self._thread is not None` check
+        # would treat a stopped thread (reference still set,
+        # is_alive() == False) as "already running" and
+        # silently no-op. Each press swaps a fresh
+        # SilenceWatchdog in via App._arm_watchdog, so this only
+        # matters for the rare reuse-after-stop case.
+        if self._thread is not None and self._thread.is_alive():
             return
         # Reset state in case start() is called twice (shouldn't be,
         # but the watchdog is cheap and reset is a no-op after the
@@ -141,6 +150,7 @@ class SilenceWatchdog:
         self._stop_event.clear()
         self._triggered.clear()
         self._silence_start = None
+        self._thread = None  # drop the stale reference before reassigning
         self._thread = threading.Thread(
             target=self._run, name="silence-watchdog", daemon=True
         )

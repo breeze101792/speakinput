@@ -53,6 +53,14 @@ from speakinput.config import InjectConfig
 
 _PRINTABLE_ASCII = set(string.printable) - set("\t\n\r\x0b\x0c")
 
+# Bounded wait for any subprocess we shell out to. pbcopy can hang
+# indefinitely if the macOS pasteboard server is unresponsive (observed
+# after long sleeps); wtype/ydotool can hang on a wedged Wayland
+# compositor or uinput subsystem. Without a timeout, a single hung
+# subprocess blocks the event worker indefinitely and the user's
+# hotkey silently stops working.
+_SUBPROCESS_TIMEOUT_S = 5.0
+
 
 class Injector(Protocol):
     def inject(self, text: str) -> None: ...
@@ -67,38 +75,99 @@ def is_ascii_safe(text: str) -> bool:
     return all(ch in _PRINTABLE_ASCII or ch in (" ", "\t") for ch in text)
 
 
-def _wl_copy(text: str) -> None:
-    """Write `text` to the Wayland clipboard via `wl-copy`.
+def _wl_paste() -> str | None:
+    """Snapshot the Wayland clipboard via `wl-paste -n`.
 
-    Used as a fallback when `pyperclip` isn't installed or doesn't
-    work on the current session (e.g. a pure Wayland box without
-    any X11 backend that pyperclip can find).
+    Bounded by `_SUBPROCESS_TIMEOUT_S` — a wedged wl-paste (clipboard
+    manager crashed, session in transition) must not freeze the
+    event worker.
     """
-    subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True)
+    try:
+        cp = subprocess.run(
+            ["wl-paste", "-n"],
+            capture_output=True,
+            check=True,
+            timeout=_SUBPROCESS_TIMEOUT_S,
+        )
+        return cp.stdout.decode("utf-8", errors="replace")
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+        return None
 
 
 def _pbcopy(text: str) -> None:
-    """Write text to the system clipboard. macOS→pbcopy, Linux→pyperclip."""
+    """Write text to the system clipboard. macOS→pbcopy, Linux→pyperclip → wl-copy."""
     if sys.platform == "darwin":
-        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+        # Use a hard timeout: a wedged pbcopy after sleep has been
+        # observed to block the event worker for the entire wait
+        # window. On macOS the kernel reaps the timed-out pbcopy
+        # when its parent process exits.
+        subprocess.run(
+            ["pbcopy"],
+            input=text.encode("utf-8"),
+            check=True,
+            timeout=_SUBPROCESS_TIMEOUT_S,
+        )
     elif pyperclip is not None:
-        pyperclip.copy(text)
+        try:
+            pyperclip.copy(text)
+        except Exception:
+            # pyperclip can raise on a wedged X11 selection owner
+            # (clipboard manager crashed). Fall through to wl-copy
+            # on Wayland, or re-raise on X11 — the unicode path will
+            # catch the failure and bail without typing garbage.
+            if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+                _wl_copy(text)
+            else:
+                raise
     else:
         # Last-resort Wayland fallback. Doesn't apply on macOS, where
         # pbcopy is always available.
         _wl_copy(text)
 
 
+def _wl_copy(text: str) -> None:
+    """Write `text` to the Wayland clipboard via `wl-copy`.
+
+    Used as a fallback when `pyperclip` isn't installed or doesn't
+    work on the current session (e.g. a pure Wayland box without
+    any X11 backend that pyperclip can find). Bounded by
+    `_SUBPROCESS_TIMEOUT_S` so a hung `wl-copy` doesn't freeze
+    the event worker.
+    """
+    subprocess.run(
+        ["wl-copy"],
+        input=text.encode("utf-8"),
+        check=True,
+        timeout=_SUBPROCESS_TIMEOUT_S,
+    )
+
+
 def _pbcopy_restore(text: str) -> None:
-    if sys.platform == "darwin":
-        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
-    elif pyperclip is not None:
-        pyperclip.copy(text)
-    else:
-        try:
+    """Best-effort restore of the prior clipboard contents.
+
+    Runs on a daemon timer thread (see `_schedule_clipboard_restore`).
+    Any failure is swallowed silently — the user's next paste will
+    see whatever the last inject wrote, which is the most common
+    expectation. Surface a single warning per failure for debugging,
+    bounded so a permanent failure (e.g. pbcopy missing) doesn't
+    spam the log on every press.
+    """
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["pbcopy"],
+                input=text.encode("utf-8"),
+                check=True,
+                timeout=_SUBPROCESS_TIMEOUT_S,
+            )
+        elif pyperclip is not None:
+            pyperclip.copy(text)
+        else:
             _wl_copy(text)
-        except Exception:
-            pass
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+        # Best-effort. The clipboard will keep the last injected
+        # text, which is usually what the user wants.
+        pass
 
 
 def _clipboard_read() -> str | None:
@@ -109,25 +178,41 @@ def _clipboard_read() -> str | None:
         except Exception:
             return None
     # No pyperclip — try wl-paste.
-    try:
-        result = subprocess.run(
-            ["wl-paste", "-n"], capture_output=True, check=True
-        )
-        return result.stdout.decode("utf-8", errors="replace")
-    except Exception:
-        return None
+    return _wl_paste()
 
 
 def _schedule_clipboard_restore(value: str, delay_ms: int) -> None:
-    """Restore the clipboard after `delay_ms` milliseconds."""
+    """Restore the clipboard after `delay_ms` milliseconds.
+
+    The restore thread is a *daemon* — the default
+    `threading.Timer(daemon=False)` (Timer inherits from Thread,
+    which is non-daemon by default) would let a pending restore
+    block process exit indefinitely. `restore_clipboard_ms` is
+    user-configurable with no upper cap, so a 60-second restore
+    would freeze shutdown for a minute. Daemon means: the kernel
+    reaps the timer on exit and the user's next paste sees
+    whatever the last inject wrote.
+    """
     if delay_ms <= 0:
         return
-    threading.Timer(delay_ms / 1000.0, _pbcopy_restore, args=(value,)).start()
+    t = threading.Timer(delay_ms / 1000.0, _pbcopy_restore, args=(value,))
+    t.daemon = True
+    t.start()
 
 
 def _run_subprocess(args: list[str], env: dict | None = None) -> None:
-    """Run a subprocess synchronously, raising on failure with stderr attached."""
-    subprocess.run(args, check=True, env=env)
+    """Run a subprocess synchronously, raising on failure with stderr attached.
+
+    Bounded by `_SUBPROCESS_TIMEOUT_S`: a hung `wtype` or `ydotool`
+    (Wayland compositor wedged, ydotoold stuck) would otherwise freeze
+    the event worker and the user's hotkey.
+    """
+    subprocess.run(
+        args,
+        check=True,
+        env=env,
+        timeout=_SUBPROCESS_TIMEOUT_S,
+    )
 
 
 class TypingInjector:
@@ -145,6 +230,11 @@ class TypingInjector:
         self._trailing_space = trailing_space
         # Used by the Unicode path. None means "no prior clipboard to restore".
         self._prior_clipboard: str | None = None
+        # Serializes both ASCII and Unicode inject calls so a chunked
+        # watchdog body and a finalize can't interleave their typing
+        # through pynput (which has its own internal lock — this one
+        # is for the unicode clipboard-paste path, where the lock
+        # also keeps the snapshot/restore/restore sequence atomic).
         self._lock = threading.Lock()
 
     def inject(self, text: str) -> None:
@@ -152,14 +242,28 @@ class TypingInjector:
             return
         payload = text + " " if self._trailing_space else text
         if is_ascii_safe(payload):
-            self._controller.type(payload)
+            with self._lock:
+                self._controller.type(payload)
             return
         self._inject_unicode(payload)
 
     def _inject_unicode(self, text: str) -> None:
         with self._lock:
             self._prior_clipboard = _clipboard_read()
-            _pbcopy(text)
+            try:
+                _pbcopy(text)
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+                # Clipboard write failed (wedged pbcopy after sleep,
+                # X11 selection owner dead, etc.). Don't paste
+                # whatever stale contents the clipboard still has —
+                # that would type the wrong text. Bail out and let
+                # the caller log the failure.
+                print(
+                    "[warn] clipboard write failed; skipping unicode inject",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
             # Hold Cmd (macOS) or Ctrl (everywhere else), press V, release.
             modifier = Key.cmd if sys.platform == "darwin" else Key.ctrl
             with self._controller.pressed(modifier):
@@ -199,30 +303,43 @@ class WtypeInjector:
         self._restore_ms = restore_clipboard_ms
         self._trailing_space = trailing_space
         self._prior_clipboard: str | None = None
+        # Serializes the whole `inject()` call. Two concurrent
+        # `wtype` processes (one from the chunked body, one from
+        # finalize) would interleave their keystrokes in the focused
+        # field; locking makes the second wait for the first to
+        # finish. Cheap — `wtype` returns in milliseconds.
         self._lock = threading.Lock()
 
     def inject(self, text: str) -> None:
         if not text:
             return
-        payload = text + " " if self._trailing_space else text
-        if is_ascii_safe(payload):
-            # `wtype -- <text>` types the text without interpreting
-            # the leading `--` as a flag. Newlines are typed as
-            # `Return` automatically by wtype.
-            _run_subprocess(["wtype", "--", payload])
-            return
-        self._inject_unicode(payload)
+        with self._lock:
+            payload = text + " " if self._trailing_space else text
+            if is_ascii_safe(payload):
+                # `wtype -- <text>` types the text without interpreting
+                # the leading `--` as a flag. Newlines are typed as
+                # `Return` automatically by wtype.
+                _run_subprocess(["wtype", "--", payload])
+                return
+            self._inject_unicode(payload)
 
     def _inject_unicode(self, text: str) -> None:
-        with self._lock:
-            self._prior_clipboard = _clipboard_read()
+        self._prior_clipboard = _clipboard_read()
+        try:
             _pbcopy(text)
-            # Send Ctrl+V: `-M ctrl` holds the modifier, `-k v` taps the key.
-            _run_subprocess(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"])
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+            print(
+                "[warn] clipboard write failed; skipping unicode inject",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        # Send Ctrl+V: `-M ctrl` holds the modifier, `-k v` taps the key.
+        _run_subprocess(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"])
 
-            if self._restore_ms > 0 and self._prior_clipboard is not None:
-                captured = self._prior_clipboard
-                _schedule_clipboard_restore(captured, self._restore_ms)
+        if self._restore_ms > 0 and self._prior_clipboard is not None:
+            captured = self._prior_clipboard
+            _schedule_clipboard_restore(captured, self._restore_ms)
 
 
 class YdotoolInjector:
@@ -259,32 +376,44 @@ class YdotoolInjector:
                 "ydotool) or set YDOTOOL_SOCKET to its socket path."
             )
         self._prior_clipboard: str | None = None
+        # Serializes the whole `inject()` call. Same rationale as
+        # WtypeInjector — ydotool doesn't synchronize its own
+        # concurrent invocations, and two simultaneous calls would
+        # interleave kernel keycodes.
         self._lock = threading.Lock()
 
     def inject(self, text: str) -> None:
         if not text:
             return
-        payload = text + " " if self._trailing_space else text
-        env = {"YDOTOOL_SOCKET": self._socket, **os.environ}
-        if is_ascii_safe(payload):
-            _run_subprocess(["ydotool", "type", "--", payload], env=env)
-            return
-        self._inject_unicode(payload, env=env)
+        with self._lock:
+            env = {"YDOTOOL_SOCKET": self._socket, **os.environ}
+            payload = text + " " if self._trailing_space else text
+            if is_ascii_safe(payload):
+                _run_subprocess(["ydotool", "type", "--", payload], env=env)
+                return
+            self._inject_unicode(payload, env=env)
 
     def _inject_unicode(self, text: str, env: dict) -> None:
-        with self._lock:
-            self._prior_clipboard = _clipboard_read()
+        self._prior_clipboard = _clipboard_read()
+        try:
             _pbcopy(text)
-            # Linux keycodes: KEY_LEFTCTRL = 29, KEY_V = 47.
-            # Send left-Ctrl down, V down, V up, left-Ctrl up.
-            _run_subprocess(
-                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-                env=env,
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+            print(
+                "[warn] clipboard write failed; skipping unicode inject",
+                file=sys.stderr,
+                flush=True,
             )
+            return
+        # Linux keycodes: KEY_LEFTCTRL = 29, KEY_V = 47.
+        # Send left-Ctrl down, V down, V up, left-Ctrl up.
+        _run_subprocess(
+            ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+            env=env,
+        )
 
-            if self._restore_ms > 0 and self._prior_clipboard is not None:
-                captured = self._prior_clipboard
-                _schedule_clipboard_restore(captured, self._restore_ms)
+        if self._restore_ms > 0 and self._prior_clipboard is not None:
+            captured = self._prior_clipboard
+            _schedule_clipboard_restore(captured, self._restore_ms)
 
 
 def _default_ydotool_socket() -> str | None:
@@ -348,20 +477,36 @@ def select_injector(config: InjectConfig) -> Injector:
         )
     # Linux
     if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        missing: list[str] = []
         for cls in (WtypeInjector, YdotoolInjector):
             try:
                 return cls(
                     restore_clipboard_ms=config.restore_clipboard_ms,
                     trailing_space=config.trailing_space,
                 )
-            except RuntimeError:
-                # Try the next backend. We don't warn here — the user
-                # picked auto, so falling through silently is the
-                # right behavior. The final pynput fallback will warn
-                # at injection time if it really doesn't work.
+            except RuntimeError as exc:
+                # Remember which backend was missing so we can warn
+                # the user below (the silent fall-through to pynput
+                # is the difference between "hotkey does nothing on
+                # pure-Wayland" and a useful "install wtype" hint).
+                missing.append(f"{cls.__name__}: {exc}")
                 continue
-        # Neither wtype nor ydotool. pynput is the last resort; it
-        # only works on XWayland, but that's better than nothing.
+        # Neither wtype nor ydotool is available. pynput is the last
+        # resort: it only works when XWayland is also running. On a
+        # pure-Wayland session without XWayland, pynput's synthetic
+        # events go nowhere and the user types into the void with
+        # no error. Tell them now, while we still have a stderr
+        # pointer, so the next press isn't mysterious.
+        if missing:
+            print(
+                "[warn] no Wayland typing backend found (wtype and ydotool "
+                "both missing). Falling back to pynput, which only types "
+                "when XWayland is available. On a pure Wayland session, "
+                "the typed text will go nowhere. Install wtype (preferred) "
+                "or ydotool for reliable typing.",
+                file=sys.stderr,
+                flush=True,
+            )
         return TypingInjector(
             restore_clipboard_ms=config.restore_clipboard_ms,
             trailing_space=config.trailing_space,

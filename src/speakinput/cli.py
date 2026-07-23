@@ -20,7 +20,6 @@ from speakinput.config import (
 from speakinput.models import (
     ModelDownloadError,
     ModelNotFoundError,
-    ensure_model,
 )
 from speakinput.singleinstance import acquire as acquire_instance_lock
 
@@ -415,10 +414,16 @@ def main(argv: list[str] | None = None) -> int:
         debug=args.debug,
         config_source=config_source,
     )
-    try:
-        app.run()
-    except KeyboardInterrupt:
-        app.shutdown()
+    # `app.run()` installs its own SIGINT handler that sets the
+    # shutdown event and lets the `finally` block in `run()` call
+    # `app.shutdown()`. Python's `signal.signal` replaces the
+    # default SIGINT handler that would have raised
+    # `KeyboardInterrupt`, so a plain `except KeyboardInterrupt`
+    # here would never fire — it just looked like a second layer
+    # of defense. The previous shape is replaced with a direct
+    # call so the program's behavior on Ctrl-C is documented in
+    # exactly one place (app.py:run()).
+    app.run()
     return 0
 
 

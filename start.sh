@@ -202,13 +202,21 @@ if [[ "$instance_status" == held:* ]]; then
         # Re-probe the lock. The kernel releases the flock when the last
         # fd holding it is closed (i.e. when the killed process actually
         # exits), so a brief grace period before re-probing prevents a
-        # spurious "still held" when SIGKILL was needed.
+        # spurious "still held" when SIGKILL was needed. We then verify
+        # the lockfile's pid matches what we just killed — a different
+        # pid means another speakinput has grabbed the lock in the
+        # window between our kill and our re-probe, and we should NOT
+        # silently take over its session.
         sleep 0.2
         instance_status=$(probe_instance_lock)
         if [[ "$instance_status" == held:* ]]; then
             other=${instance_status#held:}
-            err "lock is still held by pid=$other after kill; aborting"
-            err "if that's a different process, stop it manually first."
+            if [[ "$other" != "$existing_pid" ]]; then
+                err "lock is now held by a different process (pid=$other) after killing pid=$existing_pid; aborting"
+                err "if that's a different process, stop it manually first."
+                exit 1
+            fi
+            err "lock is still held by the same pid ($existing_pid) after kill; aborting"
             exit 1
         fi
     fi

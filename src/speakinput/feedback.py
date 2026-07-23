@@ -8,6 +8,7 @@ to stderr as a fallback.
 from __future__ import annotations
 
 import sys
+import threading
 from typing import Protocol
 
 
@@ -38,12 +39,22 @@ class StderrFeedback:
 
     def __init__(self) -> None:
         self._state = "idle"
+        # Multiple threads (worker, watchdog, abort) can call
+        # `set_state` concurrently. CPython's print is atomic
+        # under the GIL, but on free-threaded (PEP 703) Python
+        # the stderr write can be torn across two states. Cheap
+        # insurance — the lock also serializes the state read+write
+        # pair so a `set_state("error")` interleaved with a
+        # `set_state("idle")` from another thread never leaves a
+        # stale title on screen.
+        self._lock = threading.Lock()
 
     def set_state(self, state: str) -> None:
         if state not in _STATES:
             raise ValueError(f"unknown feedback state: {state!r}")
-        self._state = state
-        print(f"[speakinput] {state}", file=sys.stderr, flush=True)
+        with self._lock:
+            self._state = state
+            print(f"[speakinput] {state}", file=sys.stderr, flush=True)
 
     def start(self) -> None:
         return

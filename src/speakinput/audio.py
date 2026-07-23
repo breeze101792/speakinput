@@ -32,20 +32,24 @@ class AudioError(RuntimeError):
 
 
 # Friendly explanations for the PortAudio error codes the user is most
-# likely to hit. The codes come from `pa/src/common/pa_errors.c` in the
-# PortAudio source. Anything not in this map falls through to the
-# generic "no mic / no permission" hint, which covers the two cases
-# macOS users actually see in the wild.
+# likely to hit. The codes are the `PaErrorCode` enum values from
+# `pa/src/common/pa_errors.c` in the PortAudio source. Anything not in
+# this map falls through to the generic "audio device error" hint,
+# which covers the two cases macOS users actually see in the wild.
 _PORTAUDIO_REASONS: dict[int, str] = {
+    -10000: "operation timed out opening the audio device",  # paTimedOut
     -9999: "PortAudio not initialized",  # paNotInitialized
     -9998: "invalid audio device index",  # paInvalidDevice
-    -9997: "device in use by another program",  # paInsufficientMemory, but in
-    # practice shows up as "another app grabbed the mic"
+    -9997: "device in use by another program",  # paDeviceBusy (was the most
+    # useful real-world mapping even though the official name is
+    # paInsufficientMemory — the user sees this when another app has
+    # the mic exclusively open)
     -9996: "operation aborted (audio device was unplugged?)",  # paOperationAborted
-    -9994: "audio host API reports the device is busy",  # paHostApiNotInitialized / busy
+    -9995: "audio host API reports compatibility error",  # paCompatibilityError
+    -9994: "device busy (held exclusively by another program)",  # paDeviceBusy
+    -9993: "Host API not initialized",  # paHostApiNotInitialized
     -9986: "internal audio engine error (CoreAudio/AUHAL rejected the stream)",  # paInternalError
     -9985: "device disconnected or unavailable",  # paDeviceUnavailable
-    -10000: "operation timed out opening the audio device",
 }
 
 
@@ -215,7 +219,22 @@ class AudioRecorder:
                     file=sys.stderr,
                     flush=True,
                 )
-                self._stream = None
+                # If the InputStream object was constructed but
+                # `start()` failed (e.g. AUHAL "Invalid Property
+                # Value"), the native stream is now in a half-open
+                # state and would leak until sounddevice's atexit
+                # handler tried to close it. Close it here while we
+                # still hold `_stream_lock` and the CoreAudio HAL
+                # mutex is uncontended. Worst case this also raises
+                # — swallow and continue so the user still gets the
+                # actionable error above.
+                if self._stream is not None:
+                    leaked = self._stream
+                    self._stream = None
+                    try:
+                        leaked.close()
+                    except Exception:
+                        pass
                 self._recording = False
                 raise AudioError(
                     f"audio stream open failed: {reason}"
@@ -223,18 +242,30 @@ class AudioRecorder:
             self._recording = True
 
     def _on_audio(self, indata, frames, time, status) -> None:  # noqa: ANN001 (sounddevice API)
-        # status flags (overflow/underflow) are non-fatal; keep the audio and
-        # let the caller surface the issue if needed.
-        chunk = indata.copy().reshape(-1)
+        # PortAudio's contract is that the callback MUST NOT raise:
+        # any uncaught exception here takes the audio thread down and
+        # either kills the process or stops further audio from ever
+        # arriving. Wrap the body defensively and drop the offending
+        # chunk. The rms update is best-effort; missing it for one
+        # chunk only delays the auto-stop watchdog by 50ms.
+        # status flags (overflow/underflow) are non-fatal; keep the
+        # audio and let the caller surface the issue if needed.
+        try:
+            chunk = indata.copy().reshape(-1)
+        except Exception:
+            return
         if self._chunks is not None:
             self._chunks.append(chunk)
         # Track the most recent chunk's RMS for the auto-stop watchdog.
         # Computed once per callback so the watchdog's polling loop is a
         # cheap lock+read, not a full-buffer scan.
-        if chunk.size:
-            rms = float(np.sqrt(np.mean(chunk * chunk)))
-        else:
-            rms = 0.0
+        try:
+            if chunk.size:
+                rms = float(np.sqrt(np.mean(chunk * chunk)))
+            else:
+                rms = 0.0
+        except Exception:
+            return
         with self._rms_lock:
             self._last_rms = rms
 
@@ -259,9 +290,15 @@ class AudioRecorder:
         transcription, then keep listening for the next sentence
         without paying the cost of tearing down and reopening the
         stream.
+
+        If the recorder was never started (or has been closed), the
+        chunks list is None and we return an empty buffer. This is
+        the same shape as "recorded nothing" and lets callers
+        (`_finalize`, `_on_watchdog_chunk`) treat the two cases
+        identically.
         """
-        chunks = self._chunks or []
-        self._chunks = []
+        chunks = self._chunks
+        self._chunks = [] if self._stream is not None else None
         with self._rms_lock:
             self._last_rms = 0.0
         if not chunks:
@@ -273,8 +310,9 @@ class AudioRecorder:
 
         After `close()`, the recorder is no longer recording and must
         be `start()`-ed again to capture more audio. Any in-flight
-        audio callbacks from PortAudio that arrive after close are
-        silently dropped (the `_chunks` list is None).
+        audio callbacks from PortAudio that arrive after `close()`
+        are silently dropped (`_chunks` is set to `None` and the
+        callback's guard skips the append).
 
         Serialized via `_stream_lock`: two threads must never be inside
         PortAudio's stop/close for the same stream at once (CoreAudio
@@ -293,9 +331,12 @@ class AudioRecorder:
                 pass
             self._stream = None
             self._recording = False
-        # Don't drop _chunks here — `drain()` may still want to read
-        # what was buffered before close. _on_audio appends are still
-        # safe because the list object isn't replaced.
+        # Drop any audio the callback accumulated after we stopped
+        # the stream but before close() returned. The list object
+        # itself is replaced (not cleared) so an in-flight callback
+        # that already read `self._chunks` and is about to append
+        # doesn't silently resurrect the dropped audio.
+        self._chunks = None
         # Reset RMS so a stale chunk callback doesn't leak across close.
         with self._rms_lock:
             self._last_rms = 0.0
