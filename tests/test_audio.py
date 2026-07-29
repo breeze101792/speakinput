@@ -259,6 +259,47 @@ def test_recorder_close_is_serialized_across_threads(fake_sd):
     assert not r.is_recording()
 
 
+def test_recorder_close_does_not_block_when_portaudio_wedges(fake_sd, monkeypatch):
+    """On macOS, `stream.stop()` / `stream.close()` can wedge indefinitely
+    (CoreAudio HAL mutex contention, sleep/wake, USB/Bluetooth mic glitch).
+    `recorder.close()` MUST still return within a bounded budget so the
+    main thread's shutdown path doesn't get pinned on the recorder's
+    stream lock. Regression test for the hang where the user had to
+    SIGINT twice and force-quit the process.
+    """
+    import threading
+    import time
+
+    import speakinput.audio as audio_mod
+    from speakinput.audio import AudioRecorder
+
+    stream = MagicMock()
+    # Block stop() forever — the exact failure mode seen in the bug report.
+    blocker = threading.Event()
+    stream.stop.side_effect = lambda: blocker.wait()
+    stream.close.side_effect = lambda: blocker.wait()
+    fake_sd.InputStream.side_effect = lambda **kw: stream
+
+    # Shrink the timeout so the test stays fast even on a slow CI box.
+    monkeypatch.setattr(audio_mod, "_CLOSE_JOIN_TIMEOUT_S", 0.2)
+
+    r = AudioRecorder()
+    r.start()
+    t0 = time.monotonic()
+    r.close()  # must return, not hang
+    elapsed = time.monotonic() - t0
+    blocker.set()  # let the wedged helper thread exit
+
+    assert elapsed < 1.0, f"close() blocked for {elapsed:.2f}s; should have bounded to ~0.2s"
+    assert not r.is_recording()
+    # The recorder must consider itself closed even though the C call
+    # is still wedged: a subsequent start() must succeed and open a
+    # fresh stream (proves we nulled _stream before abandoning the helper).
+    r.start()
+    assert r.is_recording()
+    r.close()
+
+
 def test_recorder_stop_equivalent_to_drain_then_close(fake_sd):
     """stop() should still return the full buffer and tear down the
     stream, preserving the existing single-chunk release behavior."""

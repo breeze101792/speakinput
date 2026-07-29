@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from collections.abc import Iterator
@@ -9,6 +10,21 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
+
+log = logging.getLogger(__name__)
+
+# Upper bound for the PortAudio stop()+close() teardown. On macOS the
+# C call can wedge indefinitely (CoreAudio HAL mutex contention with
+# the audio IO thread, often after a sleep/wake or a USB/Bluetooth
+# mic glitch). If we let it pin `_stream_lock` the main thread's
+# shutdown-time `recorder.close()` deadlocks waiting for the same
+# lock, and even SIGINT can't escape (the audio IO thread is blocked
+# on a GIL the C extension never releases). 1.5s is long enough that
+# a healthy teardown always finishes — `stream.stop()` on a quiet
+# 16kHz mono stream is sub-10ms in practice — but short enough that
+# a wedged C call costs us at most 1.5s of shutdown latency, not
+# "force-quit the process".
+_CLOSE_JOIN_TIMEOUT_S = 1.5
 
 try:
     import sounddevice as sd
@@ -317,20 +333,48 @@ class AudioRecorder:
         Serialized via `_stream_lock`: two threads must never be inside
         PortAudio's stop/close for the same stream at once (CoreAudio
         deadlocks on the HAL mutex otherwise).
+
+        The actual `stream.stop()` + `stream.close()` run on a helper
+        thread with a bounded join. On macOS the C call can wedge
+        indefinitely (CoreAudio HAL mutex contention with the audio
+        IO thread, sometimes triggered by a Bluetooth/USB mic glitch
+        or a sleep/wake transition). If the helper doesn't return
+        within the budget we abandon it, drop our reference, and
+        let the process exit reclaim the native handle — `sounddevice`
+        registers an atexit handler that would otherwise run inside
+        `_Py_Finalize` (GIL held) while the IO thread is mid-callback,
+        which is a known three-way deadlock. The `close()` call
+        itself is what was hanging the process; bounding it is the
+        whole point.
         """
         with self._stream_lock:
-            if self._stream is None:
+            stream = self._stream
+            if stream is None:
                 return
-            try:
-                self._stream.stop()
-            except Exception:
-                pass
-            try:
-                self._stream.close()
-            except Exception:
-                pass
+            # Detach the handle from the recorder BEFORE the bounded
+            # teardown so any other thread that sees `_stream is None`
+            # knows the recorder is closed. `_chunks` is cleared
+            # outside the lock below, so the audio callback (which
+            # only takes `_rms_lock`) is safe to run concurrently
+            # with the teardown helper.
             self._stream = None
             self._recording = False
+
+        def _teardown() -> None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+        helper = threading.Thread(
+            target=_teardown, name="speakinput-audio-teardown", daemon=True
+        )
+        helper.start()
+        helper.join(timeout=_CLOSE_JOIN_TIMEOUT_S)
         # Drop any audio the callback accumulated after we stopped
         # the stream but before close() returned. The list object
         # itself is replaced (not cleared) so an in-flight callback
@@ -340,6 +384,19 @@ class AudioRecorder:
         # Reset RMS so a stale chunk callback doesn't leak across close.
         with self._rms_lock:
             self._last_rms = 0.0
+        if helper.is_alive():
+            # The C-level stop/close is wedged. The thread is a
+            # daemon, so it dies with the process; we've already
+            # nulled `_stream` so subsequent `start()` opens a fresh
+            # one. Logged at WARNING because it's a real, observed
+            # symptom (not just a theoretical race) that the user
+            # should be able to grep for in their log.
+            log.warning(
+                "PortAudio stream teardown did not finish within %.1fs; "
+                "abandoning the close and continuing. This usually "
+                "follows a sleep/wake or a USB/Bluetooth mic glitch.",
+                _CLOSE_JOIN_TIMEOUT_S,
+            )
 
     # --- v2 streaming seam: not consumed in v1, kept for the overlapped-stream upgrade.
     def chunk_generator(

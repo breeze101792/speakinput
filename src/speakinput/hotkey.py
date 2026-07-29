@@ -21,12 +21,20 @@ HID events and Linux evdev do.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Callable, Protocol
 
 try:
     from pynput import keyboard
 except ImportError:  # pragma: no cover - pynput is a hard dep at runtime
     keyboard = None  # type: ignore[assignment]
+
+# Install the self-healing macOS event-tap monkey patch (no-op on
+# other platforms and when pynput isn't installed). The patch must be
+# applied before any pynput Listener is constructed so the patched
+# `_run` is the one that runs in the listener thread. See
+# `_mac_tap_heal.py` for the rationale.
+from speakinput import _mac_tap_heal  # noqa: F401  (import side-effect)
 
 try:
     import evdev
@@ -289,6 +297,7 @@ class HotkeyListenerProtocol(Protocol):
     def stop(self) -> None: ...
     def join(self) -> None: ...
     def is_running(self) -> bool: ...
+    def last_event_at(self) -> float | None: ...
 
 
 class HotkeyListener:
@@ -314,6 +323,12 @@ class HotkeyListener:
         self._suppress = suppress
         self._pressed = False
         self._listener = None  # type: ignore[assignment]
+        # Event-arrival heartbeat. Set to None until the first event
+        # arrives, so the liveness watcher can distinguish "newly
+        # started, waiting for the first key" from "running but
+        # wedged". Reset to a timestamp on each start() so a freshly
+        # recreated listener isn't immediately flagged.
+        self._last_event_at: float | None = None
 
     def _matches(self, key) -> bool:  # noqa: ANN001 - pynput's Key | KeyCode | None
         if self._key is None or key is None:
@@ -321,6 +336,7 @@ class HotkeyListener:
         return key == self._key
 
     def _handle_press(self, key) -> None:  # noqa: ANN001
+        self._last_event_at = time.monotonic()
         if self._matches(key) and not self._pressed:
             self._pressed = True
             try:
@@ -330,6 +346,7 @@ class HotkeyListener:
                 raise
 
     def _handle_release(self, key) -> None:  # noqa: ANN001
+        self._last_event_at = time.monotonic()
         if self._matches(key) and self._pressed:
             self._pressed = False
             try:
@@ -342,6 +359,10 @@ class HotkeyListener:
             return
         if keyboard is None:
             raise RuntimeError("pynput is not installed")
+        # Reset the event heartbeat on start so a freshly-spawned
+        # listener isn't immediately flagged as "stale" by the liveness
+        # watcher before the user has had a chance to press anything.
+        self._last_event_at = time.monotonic()
         self._listener = keyboard.Listener(  # type: ignore[attr-defined]
             on_press=self._handle_press,
             on_release=self._handle_release,
@@ -362,6 +383,19 @@ class HotkeyListener:
 
     def is_running(self) -> bool:
         return self._listener is not None and self._listener.is_alive()
+
+    def last_event_at(self) -> float | None:
+        """Monotonic time of the last press or release delivered to the
+        user callbacks. None until the first event arrives (so the
+        liveness watcher can tell "newly started, waiting for first
+        key" from "running but wedged").
+
+        Used by the liveness watcher to detect the macOS CGEventTap
+        being disabled by the OS: thread is alive, callbacks stop
+        firing, hotkey is dead. Without this signal the watcher
+        wouldn't notice until the user manually noticed too.
+        """
+        return self._last_event_at
 
 
 class EvdevHotkeyListener:
@@ -416,6 +450,11 @@ class EvdevHotkeyListener:
         self._devices: list = []
         self._threads: list[threading.Thread] = []
         self._pressed = False
+        # Event-arrival heartbeat for the liveness watcher's
+        # "thread alive but no events" check. Set to None until the
+        # first event arrives so a freshly-spawned listener isn't
+        # immediately flagged as wedged.
+        self._last_event_at: float | None = None
         # evdev can fire the same key event from two devices in
         # parallel (a USB keyboard and a laptop built-in, say). The
         # latch check+set is not atomic against another device
@@ -448,6 +487,12 @@ class EvdevHotkeyListener:
             return
         if event.code != self._keycode:
             return
+        # Heartbeat for the liveness watcher. We stamp on every
+        # matching event (even repeats) so a hot key that fires
+        # constantly keeps the heartbeat fresh; an idle listener
+        # times out and triggers a restart only if the watcher also
+        # can't see any other key activity.
+        self._last_event_at = time.monotonic()
         # The latch is the only piece of state shared between per-
         # device read threads, so it gets a dedicated lock (separate
         # from anything the user's callback might take). Cheap —
@@ -491,6 +536,10 @@ class EvdevHotkeyListener:
     def start(self) -> None:
         if self._threads:
             return
+        # Reset the heartbeat on start so a recreated listener isn't
+        # immediately flagged by the liveness watcher before the user
+        # has had a chance to press anything.
+        self._last_event_at = time.monotonic()
         self._devices = self._open_devices()
         for dev in self._devices:
             t = threading.Thread(
@@ -536,3 +585,16 @@ class EvdevHotkeyListener:
         # once), we're effectively dead. The liveness watcher in app.py
         # uses this to warn the user.
         return bool(self._threads) and any(t.is_alive() for t in self._threads)
+
+    def last_event_at(self) -> float | None:
+        """Monotonic time of the last event seen on any device, for the
+        liveness watcher's "thread alive but no events" check.
+
+        The evdev backend is much less likely than pynput to silently
+        stop receiving events (kernel input is harder to wedge than a
+        CGEventTap), but a device-unplug-then-replug sequence, an
+        evdev UAF after sleep, or a permissions rev can all land
+        here. Returning None until the first event is critical for
+        not flagging a freshly-spawned listener as wedged.
+        """
+        return self._last_event_at

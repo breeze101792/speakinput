@@ -157,18 +157,40 @@ class _LivenessWatcher:
     called or when the process is about to exit.
     """
 
+    # If a listener's thread is alive but no events have arrived for
+    # this many seconds, treat it as dead. macOS can disable the
+    # CGEventTap (brief sleep/wake, focus churn, permission transition)
+    # and the pynput run loop will just time out without ever
+    # delivering events; this is the backstop for that case when the
+    # self-healing tap re-enable in `_mac_tap_heal.py` can't recover
+    # (e.g. Input Monitoring permission permanently revoked, the tap
+    # object is gone). Long enough to not false-positive on a user
+    # who thinks before pressing; short enough that a real hang is
+    # detected and the listener is recreated within a few minutes of
+    # the next time the user sits down to use it.
+    _STALE_EVENT_THRESHOLD_S = 300.0
+
     def __init__(
         self,
         listeners: list,
         interval_s: float,
         on_dead,
         on_sleep=None,
-        sleep_threshold_s: float = 15.0,
+        sleep_threshold_s: float = 5.0,
     ) -> None:
         self._listeners = listeners
         self._interval_s = interval_s
         self._on_dead = on_dead
         self._on_sleep = on_sleep
+        # The sleep threshold used to be 15s because most laptops
+        # don't sleep for less than that, and the rare sub-15s suspend
+        # (a quick lid-close) wasn't worth the false-positive risk of
+        # restarting the listener. In practice macOS disables the
+        # CGEventTap on ANY sleep, including sub-5s lid-close / clamshell
+        # transitions, and the listener can't recover on its own (the
+        # self-heal only re-enables a still-present tap). Lowering the
+        # threshold to 5s catches those events and triggers the
+        # restart path so the user doesn't have to relaunch the app.
         self._sleep_threshold_s = sleep_threshold_s
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -176,6 +198,12 @@ class _LivenessWatcher:
         # `on_dead` exactly once per transition (alive -> dead), not
         # every poll after the thread dies.
         self._was_alive: dict[int, bool] = {id(lst): True for lst in listeners}
+        # Set to True the first time the heartbeat check fires for a
+        # given listener, so we only call `on_dead` ONCE per wedged
+        # episode (subsequent polls see the listener is being
+        # restarted and don't double-fire). Reset to False by
+        # `swap()` when the listener is recreated.
+        self._heartbeat_wedged: dict[int, bool] = {}
         # Clock samples for the sleep detector. `monotonic` freezes
         # while the machine is suspended; `wall` keeps going. Both are
         # re-sampled every poll tick.
@@ -209,6 +237,11 @@ class _LivenessWatcher:
             self._listeners.append(new)
         self._was_alive.pop(id(old), None)
         self._was_alive[id(new)] = True
+        # Clear the heartbeat-wedged flag so the freshly recreated
+        # listener gets a fresh grace period before the next backstop
+        # restart fires.
+        self._heartbeat_wedged.pop(id(old), None)
+        self._heartbeat_wedged[id(new)] = False
 
     def _check_sleep(self) -> None:
         now_mono = time.monotonic()
@@ -230,6 +263,7 @@ class _LivenessWatcher:
         while not self._stop_event.wait(self._interval_s):
             try:
                 self._check_sleep()
+                now = time.monotonic()
                 for listener in self._listeners:
                     key = getattr(listener, "_key", None) or getattr(
                         listener, "_keycode", "?"
@@ -252,6 +286,37 @@ class _LivenessWatcher:
                         except Exception:
                             log.exception("on_dead callback failed (key=%r)", key)
                     self._was_alive[id(listener)] = alive
+                    # Heartbeat backstop: thread is alive but the
+                    # listener hasn't delivered any event for a long
+                    # time. This catches the macOS CGEventTap being
+                    # disabled in a way the self-heal in
+                    # `_mac_tap_heal.py` can't fix (e.g. Input
+                    # Monitoring permission permanently revoked, the
+                    # tap object gone). The threshold is long enough
+                    # to not false-positive on a user who walks away
+                    # from the keyboard to think about what to say
+                    # next, but short enough that a wedged tap is
+                    # recovered within a few minutes of the user
+                    # sitting back down.
+                    if alive and not self._heartbeat_wedged.get(id(listener), False):
+                        last_evt = listener.last_event_at()
+                        if last_evt is None:
+                            # No events ever — the listener has been
+                            # alive for at least one poll cycle
+                            # without seeing a single key. Treat as
+                            # freshly-started (the on_dead above
+                            # handles the "never came up" case via
+                            # `is_running()`); don't double-fire.
+                            continue
+                        if (now - last_evt) >= self._STALE_EVENT_THRESHOLD_S:
+                            self._heartbeat_wedged[id(listener)] = True
+                            try:
+                                self._on_dead(key)
+                            except Exception:
+                                log.exception(
+                                    "on_dead callback failed on heartbeat (key=%r)",
+                                    key,
+                                )
             except Exception:
                 # A watcher that dies silently is worse than any single
                 # bad poll — keep looping so the next tick gets a shot.
