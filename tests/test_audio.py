@@ -565,3 +565,73 @@ def test_close_sets_chunks_to_none(fake_sd):
     # and should not raise.
     cb(np.zeros((1, 160), dtype="float32"), 160, None, None)
     assert r._chunks is None  # callback dropped the chunk
+
+
+# --- stream health check (post-sleep/wake dead-stream detection) ----------
+
+
+def test_stream_healthy_returns_false_before_start(fake_sd):
+    """stream_healthy() must return False if the recorder was never
+    started — _last_callback_at is 0.0 and _recording is False."""
+    from speakinput.audio import AudioRecorder
+    r = AudioRecorder()
+    assert not r.stream_healthy()
+
+
+def test_stream_healthy_returns_true_after_start_with_grace_period(fake_sd):
+    """Immediately after start(), before any callback fires, the stream
+    must be considered healthy (grace period for the first callback)."""
+    from speakinput.audio import AudioRecorder
+    r = AudioRecorder()
+    r.start()
+    assert r.stream_healthy()
+    r.close()
+
+
+def test_stream_healthy_returns_true_while_callbacks_firing(fake_sd):
+    """If the callback is actively firing (we simulate by calling it
+    directly), stream_healthy() must return True."""
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    cb(np.zeros((480, 1), dtype=np.float32), 480, None, None)
+    assert r.stream_healthy()
+    r.close()
+
+
+def test_stream_healthy_returns_false_after_callbacks_stop(fake_sd, monkeypatch):
+    """Simulate the post-sleep/wake failure: the callback stops firing
+    but is_recording() stays True. After the health timeout expires,
+    stream_healthy() must return False."""
+    from speakinput.audio import AudioRecorder
+
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    # Fire one callback to set the timestamp.
+    cb(np.zeros((480, 1), dtype=np.float32), 480, None, None)
+    assert r.stream_healthy()
+    # A timeout of 0.0 means "any staleness is unhealthy" — the
+    # callback just fired but the elapsed time (microseconds) is
+    # already > 0.0, so this must return False.
+    assert not r.stream_healthy(timeout_s=0.0)
+    # A generous timeout still passes because the callback just ran.
+    assert r.stream_healthy(timeout_s=10.0)
+    r.close()
+
+
+def test_stream_healthy_returns_false_after_close(fake_sd):
+    """After close(), stream_healthy() must return False even though
+    _last_callback_at might still hold a recent timestamp."""
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    cb(np.zeros((480, 1), dtype=np.float32), 480, None, None)
+    r.close()
+    assert not r.stream_healthy()
+
+
+def test_stream_healthy_timeout_is_configurable(fake_sd):
+    """The timeout_s parameter controls how stale the callback can be
+    before the stream is considered unhealthy."""
+    r, cb = _make_recorder_with_captured_callback(fake_sd)
+    cb(np.zeros((480, 1), dtype=np.float32), 480, None, None)
+    # Immediately after the callback, a 10s timeout is fine.
+    assert r.stream_healthy(timeout_s=10.0)
+    # A 0.0s timeout means "any staleness is unhealthy".
+    assert not r.stream_healthy(timeout_s=0.0)
+    r.close()

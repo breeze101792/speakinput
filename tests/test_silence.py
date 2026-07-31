@@ -235,3 +235,103 @@ def test_watchdog_can_restart_after_thread_exits():
     dog.stop()
     # The thread reference was reassigned; it's the second thread.
     assert dog._thread is not None
+
+
+# --- stream health check: dead-stream detection in the watchdog -----------
+
+
+def _fake_recorder_healthy(**kwargs):
+    """Build a MagicMock recorder with stream_healthy support."""
+    healthy = kwargs.pop("healthy", True)
+    rec = _fake_recorder(**kwargs)
+    rec.stream_healthy.return_value = healthy
+    return rec
+
+
+def test_watchdog_triggers_on_dead_stream(monkeypatch):
+    """If stream_healthy() returns False for long enough, the watchdog
+    must fire on_trigger even if the RMS is still above threshold.
+    This catches the post-sleep/wake failure where the PortAudio
+    callback stops but is_recording() stays True."""
+    monkeypatch.setattr(SilenceWatchdog, "HEALTHY_TIMEOUT_S", 0.15)
+    rec = _fake_recorder_healthy(rms=0.5, healthy=False)
+    triggered = []
+
+    dog = SilenceWatchdog(
+        recorder=rec,
+        threshold=0.005,
+        auto_stop_seconds=10.0,  # very long — we don't want silence trigger
+        on_trigger=lambda: triggered.append(True),
+    )
+    dog.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while not triggered and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert triggered == [True], "watchdog should fire on dead stream"
+    finally:
+        dog.stop()
+
+
+def test_watchdog_does_not_trigger_on_healthy_stream():
+    """If stream_healthy() returns True, the watchdog must NOT fire
+    from the health-check path (silence path is independent)."""
+    rec = _fake_recorder_healthy(rms=0.5, healthy=True)
+    triggered = []
+
+    dog = SilenceWatchdog(
+        recorder=rec,
+        threshold=0.005,
+        auto_stop_seconds=10.0,
+        on_trigger=lambda: triggered.append(True),
+    )
+    dog.start()
+    time.sleep(0.3)
+    dog.stop()
+    assert triggered == []
+
+
+def test_watchdog_resets_health_on_recovery():
+    """If the stream briefly goes unhealthy then recovers, the
+    dead-since timer must reset so we don't false-positive."""
+    healthy_sequence = [True, True, False, False, True, True, True]
+    rec = MagicMock()
+    rec.is_recording.return_value = True
+    rec.current_rms.return_value = 0.5
+    rec.stream_healthy.side_effect = healthy_sequence
+    triggered = []
+
+    dog = SilenceWatchdog(
+        recorder=rec,
+        threshold=0.005,
+        auto_stop_seconds=10.0,
+        on_trigger=lambda: triggered.append(True),
+    )
+    dog.start()
+    time.sleep(0.4)  # enough for ~8 polls
+    dog.stop()
+    # The stream recovered after 2 unhealthy polls (< HEALTHY_TIMEOUT_S),
+    # so the watchdog should NOT have triggered.
+    assert triggered == []
+
+
+def test_watchdog_does_not_double_trigger():
+    """Once the trigger has fired (either from silence or dead stream),
+    subsequent health-check failures must not fire again."""
+    call_count = 0
+
+    def on_trigger():
+        nonlocal call_count
+        call_count += 1
+
+    rec = _fake_recorder_healthy(rms=0.0, healthy=False)
+    dog = SilenceWatchdog(
+        recorder=rec,
+        threshold=0.005,
+        auto_stop_seconds=0.05,  # 50ms — will trigger from silence fast
+        on_trigger=on_trigger,
+    )
+    dog.start()
+    time.sleep(0.5)  # well past both silence and health timeouts
+    dog.stop()
+    assert call_count == 1, f"trigger called {call_count} times; expected exactly 1"

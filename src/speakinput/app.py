@@ -1207,6 +1207,13 @@ class App:
         is ever delivered again. Restart every listener proactively and
         abort any press that was active when the machine went to sleep
         (its release event was lost while suspended).
+
+        Also close the audio recorder (even if no press was active) so
+        the next start() opens a fresh stream against the re-initialized
+        CoreAudio HAL. Without this, the old stream handle goes silent
+        after wake — callbacks stop, is_recording() stays True, and the
+        next press either fails with a stale device error or records
+        from a dead stream that never delivers audio.
         """
         if self._shutdown.is_set():
             return
@@ -1231,6 +1238,15 @@ class App:
                     file=sys.stderr,
                     flush=True,
                 )
+        # Proactively close the recorder so the next start() opens a
+        # completely fresh stream. The old stream handle is dead after
+        # wake (CoreAudio HAL reinitializes and drops the callback
+        # link). Leaving it open means is_recording() stays True on a
+        # silent stream, confusing the watchdog and the release path.
+        try:
+            self.recorder.close()
+        except Exception:
+            log.exception("failed to close recorder after sleep")
         self._enqueue_event(self._abort_press, "system wake")
 
     def _resume_media_bounded(self, timeout_s: float) -> None:

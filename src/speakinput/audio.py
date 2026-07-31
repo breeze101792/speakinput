@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -102,6 +103,7 @@ class Recorder(Protocol):
     def close(self) -> None: ...
     def is_recording(self) -> bool: ...
     def current_rms(self) -> float: ...
+    def stream_healthy(self, timeout_s: float = ...) -> bool: ...
 
 
 @dataclass
@@ -136,6 +138,14 @@ class AudioRecorder:
     # callback and the watchdog run on different threads.
     _last_rms: float = 0.0
     _rms_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Monotonic timestamp of the most recent audio callback. Updated
+    # unconditionally in `_on_audio()` so `stream_healthy()` can detect
+    # a PortAudio stream that is "open" but stopped delivering audio
+    # (e.g. after macOS sleep/wake when the CoreAudio HAL reinitializes
+    # but the existing stream handle goes silent). Shared read by
+    # `stream_healthy()` on the watchdog thread — only one writer
+    # (the callback) so no lock needed.
+    _last_callback_at: float = 0.0
 
     def _require_sounddevice(self) -> None:
         if sd is None:
@@ -157,6 +167,32 @@ class AudioRecorder:
         """
         with self._rms_lock:
             return self._last_rms
+
+    def stream_healthy(self, timeout_s: float = 3.0) -> bool:
+        """Return True if the stream is recording AND delivering audio.
+
+        Detects the common post-sleep/wake failure where PortAudio's
+        `InputStream` is open (`_recording` is True) but the CoreAudio
+        HAL has stopped delivering callbacks — the stream is "dead" and
+        no audio will ever arrive. After macOS sleep/wake, the HAL can
+        silently drop the callback link without raising an error or
+        closing the stream handle.
+
+        `timeout_s` is the maximum seconds since the last callback
+        before the stream is considered unhealthy. The default 3.0s
+        is long enough to not false-positive during quiet speech (the
+        callback fires every ~30ms at 16kHz/512 frames) but short
+        enough to detect a dead stream within a few seconds.
+
+        Returns False if the recorder was never started or has been
+        closed (`_last_callback_at` remains 0.0 in both cases).
+        """
+        if not self._recording:
+            return False
+        if self._last_callback_at == 0.0:
+            # Stream was just opened — give it a grace period.
+            return True
+        return (time.monotonic() - self._last_callback_at) < timeout_s
 
     def _device_is_present(self, device: int | None) -> bool:
         """Return True if the configured device can be opened.
@@ -188,6 +224,7 @@ class AudioRecorder:
             self._chunks = []
             with self._rms_lock:
                 self._last_rms = 0.0
+            self._last_callback_at = 0.0
             # Fall back to system default if the pinned device disappeared
             # since the last press (USB unplug, Bluetooth headset
             # disconnected, etc.). The check is sub-ms; the stream-open
@@ -257,7 +294,7 @@ class AudioRecorder:
                 ) from exc
             self._recording = True
 
-    def _on_audio(self, indata, frames, time, status) -> None:  # noqa: ANN001 (sounddevice API)
+    def _on_audio(self, indata, frames, _pa_time, status) -> None:  # noqa: ANN001 (sounddevice API)
         # PortAudio's contract is that the callback MUST NOT raise:
         # any uncaught exception here takes the audio thread down and
         # either kills the process or stops further audio from ever
@@ -270,6 +307,13 @@ class AudioRecorder:
             chunk = indata.copy().reshape(-1)
         except Exception:
             return
+        # Record the callback timestamp unconditionally — this is the
+        # heartbeat the `stream_healthy()` check relies on. Updated
+        # before any early-return so even a failed RMS computation
+        # still proves the HAL is alive. Use the `time` module
+        # directly (the callback parameter `_pa_time` does not shadow
+        # it) to avoid the name collision.
+        self._last_callback_at = time.monotonic()
         if self._chunks is not None:
             self._chunks.append(chunk)
         # Track the most recent chunk's RMS for the auto-stop watchdog.
