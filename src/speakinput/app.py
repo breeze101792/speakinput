@@ -164,11 +164,12 @@ class _LivenessWatcher:
     # delivering events; this is the backstop for that case when the
     # self-healing tap re-enable in `_mac_tap_heal.py` can't recover
     # (e.g. Input Monitoring permission permanently revoked, the tap
-    # object is gone). Long enough to not false-positive on a user
-    # who thinks before pressing; short enough that a real hang is
-    # detected and the listener is recreated within a few minutes of
-    # the next time the user sits down to use it.
-    _STALE_EVENT_THRESHOLD_S = 300.0
+    # object is gone). 30s is long enough to not false-positive on a
+    # user who pauses to think, but short enough that a post-wake
+    # dead listener is recovered quickly — the self-healing re-enables
+    # the tap within ~1s on success; if it fails, this threshold
+    # catches it within 30s instead of 5 minutes.
+    _STALE_EVENT_THRESHOLD_S = 30.0
 
     def __init__(
         self,
@@ -1204,40 +1205,27 @@ class App:
 
         macOS disables CGEventTaps across sleep/wake; the listener
         threads survive and pass the liveness check, but no key event
-        is ever delivered again. Restart every listener proactively and
-        abort any press that was active when the machine went to sleep
-        (its release event was lost while suspended).
+        is ever delivered again. We do NOT restart the listeners here
+        because the old listener's cleanup (`CGEventTapEnable(tap,
+        False)` in `_mac_tap_heal.py`'s finally block) races with the
+        new listener's tap enable — the old thread may not have exited
+        yet when the new listener opens its tap, and the old finally
+        disables it. Instead, we rely on the self-healing mechanism
+        (`_mac_tap_heal.py`) to re-enable the tap within ~1s. If it
+        fails, the heartbeat backstop (30s stale threshold) will
+        detect the dead listener and restart it.
 
-        Also close the audio recorder (even if no press was active) so
-        the next start() opens a fresh stream against the re-initialized
-        CoreAudio HAL. Without this, the old stream handle goes silent
-        after wake — callbacks stop, is_recording() stays True, and the
-        next press either fails with a stale device error or records
-        from a dead stream that never delivers audio.
+        We DO close the audio recorder so the next start() opens a
+        fresh stream against the re-initialized CoreAudio HAL.
         """
         if self._shutdown.is_set():
             return
         print(
-            f"[warn] system slept for ~{slept_s:.0f}s — restarting hotkey "
-            f"listeners (the OS may have disabled the event tap)",
+            f"[warn] system slept for ~{slept_s:.0f}s — "
+            f"audio recorder closed, hotkey tap will self-heal",
             file=sys.stderr,
             flush=True,
         )
-        for key in list(self.listeners):
-            if self._restart_listener(key):
-                print(
-                    f"[info] hotkey listener for {key!r} restarted after wake",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[warn] hotkey listener for {key!r} failed to restart "
-                    f"after wake — the push-to-talk key may not respond. "
-                    f"Restart speakinput to recover.",
-                    file=sys.stderr,
-                    flush=True,
-                )
         # Proactively close the recorder so the next start() opens a
         # completely fresh stream. The old stream handle is dead after
         # wake (CoreAudio HAL reinitializes and drops the callback

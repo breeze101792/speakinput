@@ -86,6 +86,16 @@ All hotkey callbacks are **O(microseconds)** — they just enqueue to a `queue.Q
 
 **Rule:** The PortAudio callback (`_on_audio`) never takes `_stream_lock` — it must never block.
 
+## Sleep/Wake Recovery
+
+After macOS sleep, the CGEventTap is disabled. Recovery is layered:
+
+1. **Self-healing** (`_mac_tap_heal.py`): re-enables the tap within ~1s via `CGEventTapEnable(tap, True)`
+2. **Heartbeat backstop** (30s): if self-healing fails, `_LivenessWatcher` detects "thread alive but no events" and restarts the listener
+3. **Recorder close**: `_on_system_sleep()` closes the audio recorder so the next `start()` opens a fresh stream
+
+Listeners are NOT restarted on sleep — the old listener's cleanup races with the new listener's tap enable, causing the new tap to be disabled.
+
 ## Press Lifecycle
 
 ```

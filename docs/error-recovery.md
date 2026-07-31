@@ -20,17 +20,20 @@ Three layers of defense:
 | Layer | What | When |
 |-------|------|------|
 | `_mac_tap_heal.py` | Monkey-patches pynput to call `CGEventTapIsEnabled()` + `CGEventTapEnable()` every 1s | Every CFRunLoop timeout |
-| Heartbeat backstop | `_LivenessWatcher` detects "thread alive but no events for 300s" | Background poll |
-| Sleep restart | `_on_system_sleep()` restarts all listeners | Clock skew > 5s |
+| Heartbeat backstop | `_LivenessWatcher` detects "thread alive but no events for 30s" | Background poll |
+| Sleep wake | `_on_system_sleep()` closes audio recorder only (self-healing handles listener) | Clock skew > 5s |
+
+**Why we don't restart listeners on sleep:** The old listener's cleanup (`CGEventTapEnable(tap, False)` in `_mac_tap_heal.py`'s finally block) races with the new listener's tap enable. If the old thread hasn't exited yet, it disables the new listener's tap. Instead, we rely on the self-healing mechanism to re-enable the tap within ~1s. If it fails, the heartbeat backstop (30s) detects the dead listener and restarts it.
 
 ### 3. System Sleep/Wake
 
 **Detection:** `_LivenessWatcher._check_sleep()` computes wall-clock vs monotonic-clock skew. Threshold: 5s.
 
 **Recovery (`_on_system_sleep`):**
-1. Restart all hotkey listeners
-2. Close the audio recorder (so next `start()` opens fresh stream)
-3. Abort any orphaned press
+1. Close the audio recorder (so next start() opens fresh stream)
+2. Abort any orphaned press
+
+Listeners are NOT restarted here. The self-healing mechanism in `_mac_tap_heal.py` re-enables the CGEventTap within ~1s. If self-healing fails, the heartbeat backstop (30s stale threshold) detects the dead listener and triggers `_on_listener_dead` which restarts it.
 
 ### 4. Dead Audio Stream (post-sleep PortAudio)
 
