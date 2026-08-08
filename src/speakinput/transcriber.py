@@ -300,12 +300,323 @@ class WhisperCppTranscriber:
         return " ".join(seen).strip()
 
 
+class FasterWhisperTranscriber:
+    """Wraps faster-whisper (CTranslate2) for GPU-accelerated inference.
+
+    faster-whisper is an alternative backend that uses CTranslate2
+    for inference. It's typically faster than whisper.cpp on NVIDIA
+    GPUs and supports int8 quantization for CPU. The model is
+    downloaded from Hugging Face on first use (same models as
+    openai/whisper).
+
+    OS support: Linux (NVIDIA, AMD, Intel), macOS (Intel), Windows.
+    Not recommended on Apple Silicon — use the apple or whispercpp
+    engine there.
+
+    The model is loaded eagerly in the constructor. The caller is
+    expected to have already ensured the model file is available
+    (faster-whisper downloads from HF on first use, similar to
+    pywhispercpp).
+    """
+
+    def __init__(
+        self,
+        model: str | Path = "small",
+        language: str = "auto",
+        beam_size: int = 1,
+        translate: bool = False,
+        initial_prompt: str = "",
+        *,
+        use_gpu: bool | None = None,
+        gpu_device: int = 0,
+        n_threads: int = 0,
+    ) -> None:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise TranscriberError(
+                "faster_whisper is not installed. Install with "
+                "`pip install faster-whisper`."
+            ) from exc
+        self._model_name = str(model)
+        self._language = None if language in (None, "", "auto") else language
+        self._beam_size = beam_size
+        self._translate = translate
+        self._initial_prompt = initial_prompt or None
+        # CTranslate2 device selection: "cuda" for NVIDIA GPU, "cpu" otherwise.
+        # compute_type: "int8" for CPU, "float16" for GPU.
+        backend = _probe_gpu_backend()
+        if use_gpu is False:
+            device = "cpu"
+            compute_type = "int8"
+        elif backend == "cuda" and (use_gpu is None or use_gpu is True):
+            device = "cuda"
+            compute_type = "float16"
+        else:
+            device = "cpu"
+            compute_type = "int8"
+        if use_gpu is True and backend is None:
+            print(
+                "[transcribe] warning: use_gpu=true but no GPU backend found "
+                "— faster_whisper falling back to CPU.",
+                file=sys.stderr,
+                flush=True,
+            )
+        model_kwargs: dict[str, Any] = dict(
+            device=device,
+            compute_type=compute_type,
+        )
+        if n_threads > 0:
+            model_kwargs["cpu_threads"] = n_threads
+        self._model = WhisperModel(self._model_name, **model_kwargs)
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        initial_prompt: str | None = None,
+    ) -> str:
+        if audio.size == 0:
+            return ""
+        del sample_rate
+        if initial_prompt is None:
+            effective_prompt = self._initial_prompt
+        elif not initial_prompt:
+            effective_prompt = None
+        else:
+            effective_prompt = initial_prompt
+        segments, _info = self._model.transcribe(
+            audio,
+            language=self._language,
+            beam_size=self._beam_size,
+            initial_prompt=effective_prompt,
+        )
+        texts: list[str] = []
+        for seg in segments:
+            text = getattr(seg, "text", "").strip()
+            if not text or text in ("[BLANK_AUDIO]",):
+                continue
+            if texts and texts[-1] == text:
+                continue
+            texts.append(text)
+        return " ".join(texts).strip()
+
+
+class AppleSpeechTranscriber:
+    """Wraps Apple's SFSpeechRecognizer for on-device transcription.
+
+    Available on macOS 13+ (Ventura) with Apple Silicon or Intel.
+    Uses the OS's built-in speech recognition — no model download
+    needed, lowest latency on Apple hardware, and respects the
+    system's language settings. Falls back to whispercpp if the
+    framework isn't available (pre-Ventura, non-macOS).
+
+    This engine is special: it doesn't use whisper models at all.
+    The `model` and `initial_prompt` config fields are ignored.
+    Language is mapped from the profile's language setting to a
+    BCP-47 locale code.
+    """
+
+    # Mapping from our language codes to Apple locale identifiers.
+    _LOCALE_MAP = {
+        "en": "en-US",
+        "zh": "zh-CN",
+        "auto": None,  # auto = use system locale
+    }
+
+    def __init__(
+        self,
+        model: str | Path = "small",
+        language: str = "auto",
+        beam_size: int = 1,
+        translate: bool = False,
+        initial_prompt: str = "",
+        *,
+        use_gpu: bool | None = None,
+        gpu_device: int = 0,
+        n_threads: int = 0,
+    ) -> None:
+        if sys.platform != "darwin":
+            raise TranscriberError(
+                "Apple Speech engine is only available on macOS."
+            )
+        try:
+            import Speech  # noqa: F401
+            from Speech import SFSpeechRecognizer
+        except ImportError as exc:
+            raise TranscriberError(
+                "pyobjc-framework-Speech is not installed. Install with "
+                "`pip install pyobjc-framework-Speech`. Requires macOS 13+."
+            ) from exc
+        if not SFSpeechRecognizer.isAvailable():
+            raise TranscriberError(
+                "SFSpeechRecognizer is not available on this system. "
+                "Requires macOS 13+ and speech recognition enabled in "
+                "System Settings → Keyboard → Dictation."
+            )
+        self._language = self._LOCALE_MAP.get(language)
+        self._recognizer = SFSpeechRecognizer.alloc().init()
+        del model, beam_size, translate, initial_prompt, use_gpu, gpu_device, n_threads
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        initial_prompt: str | None = None,
+    ) -> str:
+        del initial_prompt
+        if audio.size == 0:
+            return ""
+        # Apple's SFSpeechRecognizer works with audio files, not raw
+        # numpy arrays. We write the audio to a temporary WAV file,
+        # then feed it to the recognizer. This adds ~50ms of I/O
+        # overhead per transcription, which is negligible compared to
+        # the recognition time.
+        import tempfile
+        import wave
+
+        from Foundation import NSURL
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+        try:
+            with wave.open(tmp_path, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(sample_rate)
+                wav.writeframes((audio * 32767).astype(np.int16).tobytes())
+            url = NSURL.fileURLWithPath_(tmp_path)
+            try:
+                from Speech import SFSpeechURLRecognitionRequest
+
+                request = SFSpeechURLRecognitionRequest.alloc().initWithURL_(url)
+                if self._language:
+                    from Locale import NSLocale
+
+                    request.setLocale_(NSLocale.localeWithLocaleIdentifier_(self._language))
+            except ImportError:
+                return ""
+            # SFSpeechRecognizer is async; we need to wait for the
+            # result. Use a semaphore to block until the callback fires.
+            import threading
+
+            done = threading.Event()
+            result_text: list[str] = []
+
+            def _handler(recognition_result, error):
+                if error:
+                    done.set()
+                    return
+                if recognition_result and recognition_result.isFinal():
+                    result_text.append(
+                        recognition_result.bestTranscription().formattedString()
+                    )
+                done.set()
+
+            self._recognizer.recognitionTaskWithRequest_resultHandler_(
+                request, _handler
+            )
+            done.wait(timeout=30.0)
+            return " ".join(result_text).strip()
+        finally:
+            import os
+
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+# --- engine registry -------------------------------------------------------
+#
+# The registry maps engine name -> transcriber class. The factory
+# `create_transcriber` tries the requested engine first, then falls
+# back to whispercpp (the always-available default) if the engine's
+# package isn't installed or the constructor raises. This keeps the
+# app running even when an optional engine is misconfigured.
+
+_ENGINE_REGISTRY: dict[str, type] = {}
+
+
+def _register_engine(name: str, cls: type) -> None:
+    _ENGINE_REGISTRY[name] = cls
+
+
+_register_engine("whispercpp", WhisperCppTranscriber)
+_register_engine("faster_whisper", FasterWhisperTranscriber)
+_register_engine("apple", AppleSpeechTranscriber)
+
+
+def create_transcriber(
+    engine: str,
+    model: str | Path = "small",
+    language: str = "auto",
+    beam_size: int = 1,
+    translate: bool = False,
+    initial_prompt: str = "",
+    *,
+    use_gpu: bool | None = None,
+    gpu_device: int = 0,
+    n_threads: int = 0,
+) -> "Transcriber":
+    """Create a transcriber for the named engine, with fallback.
+
+    Tries the requested engine first. If the engine's package isn't
+    installed or the constructor raises TranscriberError, falls back
+    to whispercpp (the always-available default) with a warning. This
+    means the app never fails to start just because an optional engine
+    was requested but isn't installed — the user gets a working
+    whispercpp transcriber instead.
+    """
+    cls = _ENGINE_REGISTRY.get(engine)
+    if cls is None:
+        print(
+            f"[transcribe] unknown engine {engine!r}; falling back to whispercpp",
+            file=sys.stderr,
+            flush=True,
+        )
+        cls = WhisperCppTranscriber
+    try:
+        return cls(
+            model=model,
+            language=language,
+            beam_size=beam_size,
+            translate=translate,
+            initial_prompt=initial_prompt,
+            use_gpu=use_gpu,
+            gpu_device=gpu_device,
+            n_threads=n_threads,
+        )
+    except TranscriberError as exc:
+        if engine == "whispercpp":
+            raise
+        print(
+            f"[transcribe] engine {engine!r} unavailable ({exc}); "
+            f"falling back to whispercpp",
+            file=sys.stderr,
+            flush=True,
+        )
+        return WhisperCppTranscriber(
+            model=model,
+            language=language,
+            beam_size=beam_size,
+            translate=translate,
+            initial_prompt=initial_prompt,
+            use_gpu=use_gpu,
+            gpu_device=gpu_device,
+            n_threads=n_threads,
+        )
+
+
 # Allow `from speakinput.transcriber import _GPU_BACKEND_MARKERS` for tests
 # that want to assert against the table without re-defining it.
 __all__ = [
     "Transcriber",
     "TranscriberError",
     "WhisperCppTranscriber",
+    "FasterWhisperTranscriber",
+    "AppleSpeechTranscriber",
+    "create_transcriber",
     "_GPU_BACKEND_MARKERS",
     "_LIB_NAMES",
     "_locate_libwhisper",

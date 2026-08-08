@@ -120,6 +120,14 @@ trailing_space = true       # append a single space after each transcript
                             # then ydotool, then falls back to pynput.
 
 [transcribe]
+# engine = "whispercpp"    # STT engine. One of:
+                            #   "whispercpp" — whisper.cpp via pywhispercpp (default)
+                            #   "faster_whisper" — faster-whisper (CTranslate2)
+                            #   "apple" — Apple SFSpeechRecognizer (macOS only)
+                            # The engine is selected at startup; if the required
+                            # package isn't installed, the app falls back to
+                            # whispercpp with a warning. See DESIGN.md for the
+                            # engine matrix and OS support.
 # use_gpu = "auto"          # Enable GPU acceleration. One of:
                             #   "auto"  — use GPU if the wheel has one (default)
                             #   true    — force on (warns if wheel is CPU-only)
@@ -132,3 +140,34 @@ trailing_space = true       # append a single space after each transcript
                             # (pywhispercpp's default: min(4, cores)).
                             # Bump this on big x86 boxes (16+ cores) where
                             # the default leaves cores idle.
+
+[recovery]
+# Auto-recovery for every component that can fail at runtime. Every
+# error — hardware removal, model crash, injector wedge — is recovered
+# by the program itself. The user should never have to restart
+# speakinput to get a working hotkey again. Set any of these to 0 to
+# disable that recovery path (useful when you'd rather see the
+# failure than have it masked).
+transcribe_retries = 2          # When transcribe() raises, reload the
+                                # model and retry up to this many times
+                                # before giving up on this chunk.
+                                # 0 = no retry (log and drop audio).
+transcribe_backoff_s = 0.5     # Seconds to wait between transcribe
+                                # retries. 0 = retry immediately.
+mic_failover_scan = true        # When the configured mic disappears,
+                                # scan all input devices and pick a
+                                # working one (not just system default).
+                                # false = system-default fallback only.
+mic_open_retries = 2            # Retry opening the audio stream this
+                                # many times (with fallback device)
+                                # before surfacing the error.
+injector_fallback = true        # When the output backend fails at
+                                # runtime, try the next backend in the
+                                # chain (wtype -> ydotool -> pynput).
+                                # false = no fallback.
+listener_restart_min_interval_s = 60  # Backoff window for listener
+                                # restart. A listener that dies again
+                                # within this window is considered
+                                # unrecoverable and the user is warned
+                                # instead of flapping. 0 = always
+                                # restart (may flap forever).

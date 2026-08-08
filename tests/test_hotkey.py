@@ -856,7 +856,10 @@ def test_evdev_listener_latch_serializes_concurrent_devices(monkeypatch):
         h._handle_event(FakeEvent(99, 1))
     t1 = threading.Thread(target=fire_press)
     t2 = threading.Thread(target=fire_press)
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     assert len(presses) == 1, f"expected exactly one press, got {presses}"
     # And the release side is similarly serialized.
     barrier = threading.Barrier(2)
@@ -865,7 +868,10 @@ def test_evdev_listener_latch_serializes_concurrent_devices(monkeypatch):
         h._handle_event(FakeEvent(99, 0))
     t1 = threading.Thread(target=fire_release)
     t2 = threading.Thread(target=fire_release)
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     assert len(releases) == 1, f"expected exactly one release, got {releases}"
 
 
@@ -1002,6 +1008,8 @@ def test_evdev_listener_raises_when_evdev_missing(monkeypatch):
 # ListenerMixin so we exercise the patched `_run` end-to-end, with
 # only the CFRunLoop / CoreGraphics primitives mocked.
 
+pytestmark_macos = pytest.mark.macos
+
 
 @pytest.fixture
 def darwin_mocks(monkeypatch):
@@ -1076,6 +1084,7 @@ def darwin_mocks(monkeypatch):
     )
 
 
+@pytest.mark.macos
 def test_self_heal_reenables_disabled_tap(darwin_mocks, monkeypatch):
     """When CGEventTapIsEnabled returns False on a loop iteration, the
     self-heal loop must call CGEventTapEnable(tap, True) to re-enable
@@ -1151,6 +1160,7 @@ def test_self_heal_reenables_disabled_tap(darwin_mocks, monkeypatch):
     )
 
 
+@pytest.mark.macos
 def test_self_heal_calls_enable_on_every_iteration_until_tap_is_back(
     darwin_mocks, monkeypatch
 ):
@@ -1217,6 +1227,7 @@ def test_self_heal_calls_enable_on_every_iteration_until_tap_is_back(
     )
 
 
+@pytest.mark.macos
 def test_self_heal_does_not_reenable_already_enabled_tap(darwin_mocks, monkeypatch):
     """When the tap is already enabled, the self-heal must not call
     Enable(True) repeatedly — that would be a no-op but costs a
@@ -1295,8 +1306,10 @@ def test_liveness_watcher_heartbeat_backstop_fires_on_dead(monkeypatch):
 
     # Build a fake listener that is "running" but has a stale heartbeat.
     class _FakeListener:
-        is_running = lambda self: True
-        last_event_at = lambda self: time.monotonic() - 999.0  # very stale
+        def is_running(self):
+            return True
+        def last_event_at(self):
+            return time.monotonic() - 999.0  # very stale
 
     listener = _FakeListener()
     on_dead_calls: list = []
@@ -1323,8 +1336,10 @@ def test_liveness_watcher_heartbeat_does_not_fire_when_events_recent(monkeypatch
     from speakinput.app import _LivenessWatcher
 
     class _HealthyListener:
-        is_running = lambda self: True
-        last_event_at = lambda self: time.monotonic()  # just now
+        def is_running(self):
+            return True
+        def last_event_at(self):
+            return time.monotonic()  # just now
 
     on_dead_calls: list = []
     watcher = _LivenessWatcher(
@@ -1349,8 +1364,10 @@ def test_liveness_watcher_heartbeat_does_not_fire_when_never_received_event(monk
     from speakinput.app import _LivenessWatcher
 
     class _FreshListener:
-        is_running = lambda self: True
-        last_event_at = lambda self: None
+        def is_running(self):
+            return True
+        def last_event_at(self):
+            return None
 
     on_dead_calls: list = []
     watcher = _LivenessWatcher(
@@ -1374,8 +1391,10 @@ def test_liveness_watcher_heartbeat_only_fires_once_per_wedged_episode(monkeypat
     from speakinput.app import _LivenessWatcher
 
     class _StuckListener:
-        is_running = lambda self: True
-        last_event_at = lambda self: time.monotonic() - 999.0
+        def is_running(self):
+            return True
+        def last_event_at(self):
+            return time.monotonic() - 999.0
 
     on_dead_calls: list = []
     listener = _StuckListener()

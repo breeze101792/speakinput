@@ -884,9 +884,14 @@ def test_app_uses_wtype_injector_on_wayland(monkeypatch):
         injector=None,  # force the auto-select path
         feedback=MagicMock(),
     )
-    from speakinput.injector import WtypeInjector
+    from speakinput.injector import FallbackInjector, WtypeInjector
 
-    assert isinstance(app.injector, WtypeInjector)
+    # On Wayland with fallback enabled, the injector is wrapped in a
+    # FallbackInjector whose primary is WtypeInjector.
+    if isinstance(app.injector, FallbackInjector):
+        assert isinstance(app.injector._injectors[0], WtypeInjector)
+    else:
+        assert isinstance(app.injector, WtypeInjector)
 
 
 def test_app_uses_pynput_injector_on_macos(monkeypatch):
@@ -2341,13 +2346,14 @@ def test_restart_listener_replaces_dead_listener():
     listener, and informs the watcher (so it polls the new one)."""
     app, _, _, _, _ = _build_app()
     app._use_evdev = False
+    key = app.config.primary.key
     old = MagicMock()
-    app.listeners["alt_r"] = old
+    app.listeners[key] = old
     watcher = MagicMock()
     app._liveness_watcher = watcher
 
-    assert app._restart_listener("alt_r") is True
-    new = app.listeners["alt_r"]
+    assert app._restart_listener(key) is True
+    new = app.listeners[key]
     assert new is not old
     new.start.assert_called_once()
     old.stop.assert_called_once()
@@ -2359,14 +2365,15 @@ def test_restart_listener_failure_keeps_old(monkeypatch):
     so the liveness watcher's next tick retries the restart."""
     app, _, _, _, _ = _build_app()
     app._use_evdev = False
+    key = app.config.primary.key
     old = MagicMock()
-    app.listeners["alt_r"] = old
+    app.listeners[key] = old
     monkeypatch.setattr(
         "speakinput.app.HotkeyListener",
         MagicMock(side_effect=RuntimeError("HIToolbox wedged")),
     )
-    assert app._restart_listener("alt_r") is False
-    assert app.listeners["alt_r"] is old
+    assert app._restart_listener(key) is False
+    assert app.listeners[key] is old
     old.stop.assert_not_called()
 
 
@@ -2375,14 +2382,15 @@ def test_on_listener_dead_restarts_and_enqueues_abort(capsys):
     event queue (the release event died with the listener)."""
     app, _, _, _, _ = _build_app()
     app._use_evdev = False
+    key = app.config.primary.key
     old = MagicMock()
-    app.listeners["alt_r"] = old
+    app.listeners[key] = old
 
-    app._on_listener_dead("alt_r")
-    assert app.listeners["alt_r"] is not old
+    app._on_listener_dead(key)
+    assert app.listeners[key] is not old
     fn, args = app._work_q.get_nowait()
     assert fn == app._abort_press
-    assert "alt_r" in args[0]
+    assert key in args[0]
     captured = capsys.readouterr()
     assert "restarted" in captured.err
 
@@ -2393,12 +2401,13 @@ def test_on_listener_dead_warns_when_restart_fails(monkeypatch, capsys):
     hotkey is dead."""
     app, _, _, _, _ = _build_app()
     app._use_evdev = False
-    app.listeners["alt_r"] = MagicMock()
+    key = app.config.primary.key
+    app.listeners[key] = MagicMock()
     monkeypatch.setattr(
         "speakinput.app.HotkeyListener",
         MagicMock(side_effect=RuntimeError("boom")),
     )
-    app._on_listener_dead("alt_r")
+    app._on_listener_dead(key)
     captured = capsys.readouterr()
     assert "no longer alive" in captured.err
     assert "Restart speakinput" in captured.err
@@ -2412,14 +2421,15 @@ def test_on_listener_dead_backs_off_when_flapping(capsys):
     needs ('fix your permissions, then restart speakinput')."""
     app, _, _, _, _ = _build_app()
     app._use_evdev = False
+    key = app.config.primary.key
     old = MagicMock()
-    app.listeners["alt_r"] = old
+    app.listeners[key] = old
     # Simulate a restart moments ago.
-    app._listener_restart_at["alt_r"] = time.monotonic()
+    app._listener_restart_at[key] = time.monotonic()
 
-    app._on_listener_dead("alt_r")
+    app._on_listener_dead(key)
     # No restart: the registry still holds the dead listener...
-    assert app.listeners["alt_r"] is old
+    assert app.listeners[key] is old
     # ...the user got the warning...
     captured = capsys.readouterr()
     assert "no longer alive" in captured.err

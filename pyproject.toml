@@ -44,6 +44,12 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "macos: tests that only run on macOS (CGEventTap, SFSpeechRecognizer, rumps)",
+    "linux: tests that only run on Linux (evdev, wtype, ydotool)",
+    "recovery: tests for the auto-recovery system (transcriber crash, mic failover, injector fallback)",
+    "engine: tests for the pluggable STT engine registry",
+]
 
 [tool.ruff]
 line-length = 100

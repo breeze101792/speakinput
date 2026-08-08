@@ -516,3 +516,94 @@ def select_injector(config: InjectConfig) -> Injector:
         restore_clipboard_ms=config.restore_clipboard_ms,
         trailing_space=config.trailing_space,
     )
+
+
+class FallbackInjector:
+    """Wraps a chain of injectors with runtime fallback.
+
+    The primary injector is tried first. If `inject()` raises (wtype
+    returns non-zero, ydotool socket vanished, pynput wedged), the
+    next injector in the chain is tried. This means the app never
+    loses the ability to type just because one backend died at
+    runtime — it falls through to the next one silently.
+
+    On macOS there's only one backend (pynput), so the chain is a
+    single element and this wrapper is effectively transparent. On
+    Linux Wayland the chain is wtype → ydotool → pynput.
+    """
+
+    def __init__(self, injectors: list[Injector]) -> None:
+        if not injectors:
+            raise ValueError("FallbackInjector requires at least one injector")
+        self._injectors = injectors
+        # The index of the currently-active injector. Advances when a
+        # backend fails. Never goes back (a failed backend is
+        # considered dead for the rest of the session).
+        self._active_idx = 0
+        self._lock = threading.Lock()
+
+    def inject(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            idx = self._active_idx
+            while idx < len(self._injectors):
+                try:
+                    self._injectors[idx].inject(text)
+                    return
+                except Exception as exc:
+                    if idx + 1 < len(self._injectors):
+                        print(
+                            f"[warn] injector {type(self._injectors[idx]).__name__} "
+                            f"failed ({exc}); falling back to "
+                            f"{type(self._injectors[idx + 1]).__name__}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        self._active_idx = idx + 1
+                        idx += 1
+                    else:
+                        # Last resort — let the exception propagate.
+                        raise
+
+
+def select_injector_with_fallback(
+    config: InjectConfig,
+    *,
+    enable_fallback: bool = True,
+) -> Injector:
+    """Like `select_injector` but wraps the result in a fallback chain.
+
+    When `enable_fallback` is True (the default, controlled by
+    [recovery].injector_fallback), the returned injector is a
+    `FallbackInjector` that tries the primary backend first and falls
+    through to the next one on runtime failure. When False, returns
+    a single injector with no fallback (the old behavior).
+    """
+    primary = select_injector(config)
+    if not enable_fallback:
+        return primary
+
+    # Build the fallback chain based on the platform. On macOS and
+    # Windows, pynput is the only backend — no chain. On Linux Wayland,
+    # the chain is wtype → ydotool → pynput.
+    chain: list[Injector] = [primary]
+    if sys.platform == "linux" and os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        # Add the backends that weren't selected as primary, in order.
+        for cls in (WtypeInjector, YdotoolInjector, TypingInjector):
+            if isinstance(primary, cls):
+                continue
+            try:
+                chain.append(
+                    cls(
+                        restore_clipboard_ms=config.restore_clipboard_ms,
+                        trailing_space=config.trailing_space,
+                    )
+                )
+            except RuntimeError:
+                # Backend not installed — skip it.
+                pass
+
+    if len(chain) == 1:
+        return primary
+    return FallbackInjector(chain)

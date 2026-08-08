@@ -24,7 +24,7 @@ from speakinput.hotkey import (
     resolve_evdev_key,
     resolve_key,
 )
-from speakinput.injector import Injector, select_injector
+from speakinput.injector import Injector, select_injector_with_fallback
 from speakinput.media import MediaController
 from speakinput.models import (
     ModelDownloadError,
@@ -33,7 +33,7 @@ from speakinput.models import (
     resolve_for_language,
 )
 from speakinput.silence import SilenceWatchdog, trim_trailing_silence
-from speakinput.transcriber import Transcriber, WhisperCppTranscriber, _gpu_summary
+from speakinput.transcriber import Transcriber, WhisperCppTranscriber, _gpu_summary, create_transcriber
 
 log = logging.getLogger("speakinput")
 
@@ -374,6 +374,7 @@ def _build_transcribers(
     use_gpu: bool | None = None,
     gpu_device: int = 0,
     n_threads: int = 0,
+    engine: str = "whispercpp",
 ) -> dict[str, Transcriber]:
     """Construct one Transcriber per profile, sharing instances by model path.
 
@@ -393,6 +394,10 @@ def _build_transcribers(
     `use_gpu` / `gpu_device` / `n_threads` are forwarded to the
     `WhisperCppTranscriber` constructor — see
     `speakinput.transcriber` for the auto-detect behavior.
+
+    `engine` selects the STT engine. See `create_transcriber` in
+    `speakinput.transcriber` for the engine registry and fallback
+    behavior.
     """
     overrides = transcriber_overrides or {}
     by_name: dict[str, Path] = {}
@@ -420,15 +425,29 @@ def _build_transcribers(
         if cached is not None:
             by_key[profile.key] = cached
         else:
-            t = WhisperCppTranscriber(
-                model=model_path,
-                language=profile.language,
-                beam_size=profile.beam_size,
-                initial_prompt=profile.initial_prompt,
-                use_gpu=use_gpu,
-                gpu_device=gpu_device,
-                n_threads=n_threads,
-            )
+            if engine == "whispercpp":
+                # Fast path: use the class directly so tests that
+                # monkeypatch WhisperCppTranscriber still work.
+                t = WhisperCppTranscriber(
+                    model=model_path,
+                    language=profile.language,
+                    beam_size=profile.beam_size,
+                    initial_prompt=profile.initial_prompt,
+                    use_gpu=use_gpu,
+                    gpu_device=gpu_device,
+                    n_threads=n_threads,
+                )
+            else:
+                t = create_transcriber(
+                    engine=engine,
+                    model=model_path,
+                    language=profile.language,
+                    beam_size=profile.beam_size,
+                    initial_prompt=profile.initial_prompt,
+                    use_gpu=use_gpu,
+                    gpu_device=gpu_device,
+                    n_threads=n_threads,
+                )
             by_path[str(model_path)] = t
             by_key[profile.key] = t
     return by_key
@@ -455,6 +474,8 @@ class App:
         self.recorder = recorder or AudioRecorder(
             sample_rate=config.audio.sample_rate,
             device=config.audio.device,
+            mic_failover_scan=config.recovery.mic_failover_scan,
+            mic_open_retries=config.recovery.mic_open_retries,
         )
         # Profiles in (key, model, language, prompt) order, primary first.
         # Used to build the per-key transcribers and hotkey listeners.
@@ -465,7 +486,10 @@ class App:
         # resolve and download models first. Tests inject transcribers
         # via the `transcribers` kwarg and skip the bootstrap step.
         self.transcribers: dict[str, Transcriber] = transcribers or {}
-        self.injector = injector or select_injector(config.inject)
+        self.injector = injector or select_injector_with_fallback(
+            config.inject,
+            enable_fallback=config.recovery.injector_fallback,
+        )
         self.media_controller = (
             MediaController()
             if config.audio.pause_media
@@ -533,6 +557,10 @@ class App:
         # backoff makes the second death inside the window warn instead
         # of restart, which is the signal the user actually needs.
         self._listener_restart_at: dict[str, float] = {}
+        # Configurable backoff for listener restart (from [recovery]).
+        self._listener_restart_min_interval = (
+            config.recovery.listener_restart_min_interval_s
+        )
         # Single-consumer FIFO that serializes hotkey press/release
         # bodies on a dedicated worker thread. The pynput CGEventTap
         # callback only enqueues and returns immediately: macOS disables
@@ -857,11 +885,11 @@ class App:
                 f"initial_prompt: {prompt!r} (len={len(prompt)} chars)",
             )
         try:
-            text = transcriber.transcribe(
-                audio, self.config.audio.sample_rate, initial_prompt=prompt or None
+            text = self._transcribe_with_recovery(
+                transcriber, audio, profile, prompt
             )
         except Exception:
-            log.exception("transcription failed")
+            log.exception("transcription failed after recovery attempts")
             return
         zh_conversion = profile.zh_conversion if profile else "traditional"
         if text and zh_conversion != "off" and _contains_chinese(text):
@@ -970,6 +998,90 @@ class App:
             capped.pop(-1)
             sep_budget = self._PROMPT_SEP_LEN * (len(capped) - 1)
         return self._PROMPT_SEP.join(capped)
+
+    def _transcribe_with_recovery(
+        self,
+        transcriber: Transcriber,
+        audio: np.ndarray,
+        profile: Profile,
+        prompt: str,
+    ) -> str:
+        """Transcribe audio with automatic crash recovery.
+
+        If transcribe() raises, reload the model and retry up to
+        `recovery.transcribe_retries` times with backoff. This handles
+        the case where the whisper model gets into a bad state (GPU
+        memory corruption, a corrupted model file, a native crash in
+        the inference engine) — reloading clears the state and the
+        retry has a good chance of succeeding.
+
+        The user never sees a "transcription failed" error unless
+        ALL retries are exhausted. The audio chunk is preserved across
+        retries (it's just a numpy array, not tied to the model).
+        """
+        retries = self.config.recovery.transcribe_retries
+        backoff = self.config.recovery.transcribe_backoff_s
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return transcriber.transcribe(
+                    audio,
+                    self.config.audio.sample_rate,
+                    initial_prompt=prompt or None,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= retries:
+                    break
+                log.warning(
+                    "transcribe attempt %d/%d failed: %s; reloading model",
+                    attempt + 1,
+                    retries + 1,
+                    exc,
+                )
+                if backoff > 0:
+                    time.sleep(backoff)
+                new_t = self._reload_transcriber(profile)
+                if new_t is not None:
+                    transcriber = new_t
+                else:
+                    break
+        if last_exc is not None:
+            raise last_exc
+        return ""
+
+    def _reload_transcriber(self, profile: Profile) -> Transcriber | None:
+        """Reload the transcriber for `profile` after a crash.
+
+        Reconstructs the transcriber from scratch (re-downloads the
+        model if it was deleted, re-initializes the engine). On
+        success, updates the `self.transcribers` dict so subsequent
+        presses use the fresh instance. On failure, returns None and
+        the caller falls back to the old (possibly wedged) instance.
+        """
+        try:
+            model_name, _ = resolve_for_language(profile.model, profile.language)
+            model_path = ensure_model(model_name)
+            new_t = create_transcriber(
+                engine=self.config.transcribe.engine,
+                model=model_path,
+                language=profile.language,
+                beam_size=profile.beam_size,
+                initial_prompt=profile.initial_prompt,
+                use_gpu=self.config.transcribe.use_gpu,
+                gpu_device=self.config.transcribe.gpu_device,
+                n_threads=self.config.transcribe.n_threads,
+            )
+            self.transcribers[profile.key] = new_t
+            print(
+                f"[info] transcriber for {profile.key!r} reloaded successfully",
+                file=sys.stderr,
+                flush=True,
+            )
+            return new_t
+        except Exception:
+            log.exception("transcriber reload failed for %r", profile.key)
+            return None
 
     def _record_transcript(self, text: str) -> None:
         """Update continuity state after a successful non-empty transcribe.
@@ -1165,7 +1277,9 @@ class App:
     # A restarted listener that dies again within this many seconds is
     # considered unrecoverable by restarting (permission revoked, HID
     # subsystem wedged, ...) — warn the user instead of flapping.
-    _LISTENER_RESTART_MIN_INTERVAL_S = 60.0
+    # Configurable via [recovery].listener_restart_min_interval_s so
+    # users who want always-restart can set it to 0.
+    _LISTENER_RESTART_MIN_INTERVAL_S = 60.0  # replaced by config at init
 
     def _on_listener_dead(self, key: str) -> None:
         """Liveness callback: a hotkey listener's run loop died.
@@ -1180,7 +1294,7 @@ class App:
         if self._shutdown.is_set():
             return
         last_restart = self._listener_restart_at.get(key, 0.0)
-        flapping = (time.monotonic() - last_restart) < self._LISTENER_RESTART_MIN_INTERVAL_S
+        flapping = (time.monotonic() - last_restart) < self._listener_restart_min_interval
         restarted = False
         if not flapping:
             restarted = self._restart_listener(key)
@@ -1288,6 +1402,7 @@ class App:
                     use_gpu=self.config.transcribe.use_gpu,
                     gpu_device=self.config.transcribe.gpu_device,
                     n_threads=self.config.transcribe.n_threads,
+                    engine=self.config.transcribe.engine,
                 )
             except ModelNotFoundError as exc:
                 print(f"model error: {exc}", file=sys.stderr)

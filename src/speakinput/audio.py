@@ -121,6 +121,14 @@ class AudioRecorder:
     _stream: object | None = None
     _chunks: list[np.ndarray] | None = None
     _recording: bool = False
+    # When True, a disappeared configured device triggers a scan of all
+    # available input devices (not just system default). Set by the App
+    # from [recovery].mic_failover_scan. When False, only falls back to
+    # system default (the old behavior).
+    mic_failover_scan: bool = True
+    # How many times to retry opening a stream with the fallback device
+    # before raising. Set by the App from [recovery].mic_open_retries.
+    mic_open_retries: int = 2
     # Serializes stream open/stop/close. PortAudio/CoreAudio does NOT
     # tolerate two threads stopping the same stream concurrently: both
     # end up inside AudioOutputUnitStop contending on the HAL mutex
@@ -216,6 +224,27 @@ class AudioRecorder:
             return False
         return True
 
+    def _find_fallback_device(self) -> int | None:
+        """Scan all input devices and return the first usable one.
+
+        Used when the configured device disappeared and
+        `mic_failover_scan` is True. Picks the device with the most
+        input channels (usually a real microphone, not a virtual
+        loopback). Returns None if no input device is found.
+        """
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return None
+        best_idx: int | None = None
+        best_channels = 0
+        for i, d in enumerate(devices):
+            ch = int(d.get("max_input_channels", 0))
+            if ch > best_channels:
+                best_idx = i
+                best_channels = ch
+        return best_idx
+
     def start(self) -> None:
         if self._recording:
             return
@@ -233,66 +262,91 @@ class AudioRecorder:
             # by PortAudio on every call, so the fallback is unnecessary.
             device = self.device
             if device is not None and not self._device_is_present(device):
-                print(
-                    f"[warn] configured audio device {device} is not available; "
-                    f"falling back to system default microphone",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                device = None
-            try:
-                self._stream = sd.InputStream(
-                    samplerate=self.sample_rate,
-                    channels=self.channels,
-                    dtype="float32",
-                    device=device,
-                    callback=self._on_audio,
-                )
-                self._stream.start()
-            except Exception as exc:
-                # No microphone at all (system default also gone), or the
-                # OS denied us access, or the device rejected the stream
-                # (e.g. the macOS AUHAL "Invalid Property Value" that
-                # surfaces as PortAudio -9986 when a sample rate the
-                # device doesn't natively support is requested). Surface
-                # a clear, actionable message instead of letting the
-                # press fail silently — the user needs to know WHY
-                # their key did nothing. The full traceback is NOT
-                # printed: this is a user-fixable environment problem,
-                # not a bug, and a stack trace just scares people.
-                reason = _describe_audio_error(exc)
-                print(
-                    f"[error] could not open audio input stream: {reason}. "
-                    f"Check that a microphone is connected and that speakinput "
-                    f"has Microphone permission in System Settings → Privacy "
-                    f"& Security → Microphone. If a USB/Bluetooth mic is "
-                    f"configured, try setting `device = null` in config.toml "
-                    f"to use the system default instead. (Original error: "
-                    f"{type(exc).__name__}: {exc})",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                # If the InputStream object was constructed but
-                # `start()` failed (e.g. AUHAL "Invalid Property
-                # Value"), the native stream is now in a half-open
-                # state and would leak until sounddevice's atexit
-                # handler tried to close it. Close it here while we
-                # still hold `_stream_lock` and the CoreAudio HAL
-                # mutex is uncontended. Worst case this also raises
-                # — swallow and continue so the user still gets the
-                # actionable error above.
-                if self._stream is not None:
-                    leaked = self._stream
-                    self._stream = None
-                    try:
-                        leaked.close()
-                    except Exception:
-                        pass
-                self._recording = False
-                raise AudioError(
-                    f"audio stream open failed: {reason}"
-                ) from exc
-            self._recording = True
+                fallback = None
+                if self.mic_failover_scan:
+                    scanned = self._find_fallback_device()
+                    if scanned is not None:
+                        print(
+                            f"[warn] configured audio device {device} is not available; "
+                            f"switching to device {scanned}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        fallback = scanned
+                    else:
+                        print(
+                            f"[warn] configured audio device {device} is not available; "
+                            f"no other input devices found; trying system default",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                else:
+                    print(
+                        f"[warn] configured audio device {device} is not available; "
+                        f"falling back to system default microphone",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                device = fallback
+            # Try opening the stream, with retries if the first attempt
+            # fails (e.g. the fallback device is also being unplugged
+            # mid-open, or PortAudio needs a moment to settle after a
+            # device change). Each retry scans for a fresh device.
+            last_exc: Exception | None = None
+            for attempt in range(max(self.mic_open_retries, 0) + 1):
+                try:
+                    self._stream = sd.InputStream(
+                        samplerate=self.sample_rate,
+                        channels=self.channels,
+                        dtype="float32",
+                        device=device,
+                        callback=self._on_audio,
+                    )
+                    self._stream.start()
+                    self._recording = True
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt >= max(self.mic_open_retries, 0):
+                        break
+                    # The device we picked might also be gone. Re-scan.
+                    if self.mic_failover_scan:
+                        scanned = self._find_fallback_device()
+                        if scanned is not None and scanned != device:
+                            device = scanned
+                    # Close any half-open stream from the failed attempt.
+                    if self._stream is not None:
+                        leaked = self._stream
+                        self._stream = None
+                        try:
+                            leaked.close()
+                        except Exception:
+                            pass
+            # All retries exhausted — close any half-open stream and
+            # surface the error.
+            if self._stream is not None:
+                leaked = self._stream
+                self._stream = None
+                try:
+                    leaked.close()
+                except Exception:
+                    pass
+            reason = _describe_audio_error(last_exc) if last_exc else "unknown"
+            print(
+                f"[error] could not open audio input stream: {reason}. "
+                f"Check that a microphone is connected and that speakinput "
+                f"has Microphone permission in System Settings → Privacy "
+                f"& Security → Microphone. If a USB/Bluetooth mic is "
+                f"configured, try setting `device = null` in config.toml "
+                f"to use the system default instead. (Original error: "
+                f"{type(last_exc).__name__}: {last_exc})",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._recording = False
+            raise AudioError(
+                f"audio stream open failed: {reason}"
+            ) from last_exc
 
     def _on_audio(self, indata, frames, _pa_time, status) -> None:  # noqa: ANN001 (sounddevice API)
         # PortAudio's contract is that the callback MUST NOT raise:
