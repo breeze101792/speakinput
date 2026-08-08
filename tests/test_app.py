@@ -2438,10 +2438,12 @@ def test_on_listener_dead_backs_off_when_flapping(capsys):
     assert fn == app._abort_press
 
 
-def test_on_system_sleep_restarts_all_listeners_and_aborts(capsys):
-    """Wake detection restarts every listener (macOS disables event
-    taps across sleep even though the threads stay alive) and enqueues
-    a stranded-press abort."""
+def test_on_system_sleep_closes_recorder_and_aborts(capsys):
+    """Wake detection closes the audio recorder (so the next start()
+    opens a fresh stream) and enqueues a stranded-press abort. Listeners
+    are NOT restarted here — the self-healing tap re-enable handles
+    that, and restarting them would race with the old listener's
+    cleanup (CGEventTapEnable(tap, False) in the finally block)."""
     from speakinput.config import Profile
 
     config = Config(
@@ -2451,7 +2453,7 @@ def test_on_system_sleep_restarts_all_listeners_and_aborts(capsys):
     )
     t = MagicMock()
     t.transcribe.return_value = "x"
-    app, _, _, _, _ = _build_app(
+    app, recorder, _, _, _ = _build_app(
         config=config, transcribers={"alt_r": t, "cmd_r": t}
     )
     old_primary = MagicMock()
@@ -2459,13 +2461,18 @@ def test_on_system_sleep_restarts_all_listeners_and_aborts(capsys):
     app.listeners = {"alt_r": old_primary, "cmd_r": old_secondary}
 
     app._on_system_sleep(120.0)
-    assert app.listeners["alt_r"] is not old_primary
-    assert app.listeners["cmd_r"] is not old_secondary
+    # Listeners must NOT be replaced — the self-healing mechanism
+    # re-enables the tap; restarting would race with old cleanup.
+    assert app.listeners["alt_r"] is old_primary
+    assert app.listeners["cmd_r"] is old_secondary
+    # Recorder must be closed so next start() opens fresh stream.
+    recorder.close.assert_called()
     fn, args = app._work_q.get_nowait()
     assert fn == app._abort_press
     assert "wake" in args[0]
     captured = capsys.readouterr()
     assert "system slept" in captured.err
+    assert "self-heal" in captured.err
 
 
 def test_abort_press_releases_busy_and_discards_audio():

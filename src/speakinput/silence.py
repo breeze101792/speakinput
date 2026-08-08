@@ -103,6 +103,13 @@ class SilenceWatchdog:
     accumulated. The watchdog stops polling as soon as it's triggered
     OR `stop()` is called (which `on_hotkey_release` does).
 
+    Also monitors stream health via `recorder.stream_healthy()`. If
+    the PortAudio callback stops delivering audio (common after macOS
+    sleep/wake — the HAL silently drops the link without raising or
+    closing the stream), the stream is considered dead and
+    `on_trigger` fires so the press is finalized instead of hanging
+    forever waiting for audio that will never arrive.
+
     `on_trigger` runs on the watchdog's own thread. The App's
     `on_hotkey_release` is safe to call from any thread — it acquires
     the same `_busy` lock the press path uses, so a manual release
@@ -131,6 +138,17 @@ class SilenceWatchdog:
         self._stop_event = threading.Event()
         self._triggered = threading.Event()
         self._thread: threading.Thread | None = None
+        # Stream health tracking. Set to the monotonic time when
+        # `stream_healthy()` first returns False. Cleared when the
+        # stream recovers. Used to avoid false-positives on a single
+        # slow callback — the stream must be unhealthy for at least
+        # `HEALTHY_TIMEOUT_S` before we fire the trigger.
+        self._stream_dead_since: float | None = None
+
+    # How long a stream must be unhealthy before we fire the trigger.
+    # Longer than `stream_healthy()`'s default 3.0s timeout so we
+    # don't race with the health check's own grace period.
+    HEALTHY_TIMEOUT_S = 4.0
 
     def start(self) -> None:
         # Re-startable: if the previous run's thread exited
@@ -172,16 +190,35 @@ class SilenceWatchdog:
             rms = self._recorder.current_rms()
             if rms >= self._threshold:
                 self._silence_start = None
-                continue
-            if self._silence_start is None:
-                self._silence_start = time.monotonic()
-                continue
-            if time.monotonic() - self._silence_start >= self._auto_stop_seconds:
-                # First to claim the trigger wins. Either we or the
-                # manual release (which calls stop()) will be first;
-                # the loser's no-op.
-                if self._triggered.is_set():
+            else:
+                if self._silence_start is None:
+                    self._silence_start = time.monotonic()
+                elif time.monotonic() - self._silence_start >= self._auto_stop_seconds:
+                    if self._triggered.is_set():
+                        return
+                    self._triggered.set()
+                    self._on_trigger()
                     return
-                self._triggered.set()
-                self._on_trigger()
-                return
+            # Stream health check: detect a dead PortAudio stream
+            # (common after macOS sleep/wake). If the HAL stops
+            # delivering callbacks, `stream_healthy()` returns False
+            # after its own timeout. Once we've seen the stream
+            # unhealthy for HEALTHY_TIMEOUT_S, fire the trigger so
+            # the press is finalized with whatever audio was buffered
+            # — instead of hanging forever waiting for audio that
+            # will never arrive.
+            try:
+                healthy = self._recorder.stream_healthy()
+            except Exception:
+                healthy = True  # don't let a broken method kill us
+            if not healthy:
+                if self._stream_dead_since is None:
+                    self._stream_dead_since = time.monotonic()
+                elif (time.monotonic() - self._stream_dead_since) >= self.HEALTHY_TIMEOUT_S:
+                    if self._triggered.is_set():
+                        return
+                    self._triggered.set()
+                    self._on_trigger()
+                    return
+            else:
+                self._stream_dead_since = None
