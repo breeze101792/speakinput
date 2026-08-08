@@ -188,21 +188,29 @@ class AudioRecorder:
             return False
         return True
 
-    def _find_fallback_device(self) -> int | None:
-        """Scan all input devices and return the first usable one.
+    def _find_fallback_device(self, exclude: set[int] | None = None) -> int | None:
+        """Scan all input devices and return the best usable one.
 
         Used when the configured device disappeared and
         `mic_failover_scan` is True. Picks the device with the most
         input channels (usually a real microphone, not a virtual
-        loopback). Returns None if no input device is found.
+        loopback). Devices in `exclude` are skipped — this is how the
+        retry loop avoids hammering the same broken device (e.g. an
+        ALSA device that fails `PaAlsaStream_Configure` every time).
+
+        Returns None if no usable input device is found (either no
+        devices at all, or all candidates are in the exclude set).
         """
         try:
             devices = sd.query_devices()
         except Exception:
             return None
+        excluded = exclude or set()
         best_idx: int | None = None
         best_channels = 0
         for i, d in enumerate(devices):
+            if i in excluded:
+                continue
             ch = int(d.get("max_input_channels", 0))
             if ch > best_channels:
                 best_idx = i
@@ -251,10 +259,23 @@ class AudioRecorder:
                         flush=True,
                     )
                 device = fallback
-            # Try opening the stream, with retries if the first attempt
-            # fails (e.g. the fallback device is also being unplugged
-            # mid-open, or PortAudio needs a moment to settle after a
-            # device change). Each retry scans for a fresh device.
+            # Try opening the stream. The retry strategy depends on
+            # WHY the open failed:
+            #
+            # - If the device is still present (query_devices succeeds),
+            #   the failure is likely transient (ALSA state glitch, a
+            #   momentary resource conflict). Retry the SAME device —
+            #   don't switch. Switching on a transient error causes
+            #   the user's configured mic to be silently abandoned
+            #   just because ALSA had a one-time hiccup.
+            #
+            # - If the device is gone (query_devices fails), it's a
+            #   real hardware change. Switch to the next available
+            #   device, excluding ones that already failed.
+            #
+            # - If all specific devices are exhausted, try system
+            #   default (device=None) as a last resort.
+            failed_devices: set[int] = set()
             last_exc: Exception | None = None
             for attempt in range(max(self.mic_open_retries, 0) + 1):
                 try:
@@ -272,11 +293,6 @@ class AudioRecorder:
                     last_exc = exc
                     if attempt >= max(self.mic_open_retries, 0):
                         break
-                    # The device we picked might also be gone. Re-scan.
-                    if self.mic_failover_scan:
-                        scanned = self._find_fallback_device()
-                        if scanned is not None and scanned != device:
-                            device = scanned
                     # Close any half-open stream from the failed attempt.
                     if self._stream is not None:
                         leaked = self._stream
@@ -285,6 +301,38 @@ class AudioRecorder:
                             leaked.close()
                         except Exception:
                             pass
+                    # Is the device still present? If yes, retry the
+                    # SAME device — this is a transient failure, not a
+                    # hardware change. Don't switch.
+                    if device is not None and self._device_is_present(device):
+                        continue
+                    # The device is gone (or was None and the default
+                    # failed). Switch to the next available device,
+                    # excluding everything that already failed.
+                    if device is not None:
+                        failed_devices.add(device)
+                    next_device: int | None = None
+                    if self.mic_failover_scan:
+                        scanned = self._find_fallback_device(exclude=failed_devices)
+                        if scanned is not None:
+                            next_device = scanned
+                    # If no specific fallback device was found, try
+                    # system default (device=None) as a last resort.
+                    # Only do this once — if the default also fails,
+                    # we're done.
+                    if next_device is None and None not in failed_devices:
+                        next_device = None
+                    elif next_device is None:
+                        # Even the system default already failed — give up.
+                        break
+                    if next_device != device:
+                        print(
+                            f"[warn] audio device {device} failed to open; "
+                            f"trying device {next_device if next_device is not None else 'default'}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    device = next_device
             # All retries exhausted — close any half-open stream and
             # surface the error.
             if self._stream is not None:
