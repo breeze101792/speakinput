@@ -240,6 +240,37 @@ def test_watchdog_can_restart_after_thread_exits():
 # --- stream health check: dead-stream detection in the watchdog -----------
 
 
+def test_chunk_rms_of_empty_chunk_is_zero():
+    """The RMS helper must define the empty-chunk case (0.0) so the trim
+    scan never divides by zero or NaNs a boundary hop."""
+    from speakinput.silence import _chunk_rms
+
+    assert _chunk_rms(np.zeros(0, dtype=np.float32)) == 0.0
+
+
+def test_watchdog_treats_broken_stream_health_as_healthy(monkeypatch):
+    """If stream_healthy() itself raises, the watchdog must not crash or
+    spine-off the dead-stream trigger — a broken health probe is treated
+    as 'healthy enough' so the press isn't prematurely finalized."""
+    monkeypatch.setattr(SilenceWatchdog, "HEALTHY_TIMEOUT_S", 0.1)
+    rec = MagicMock()
+    rec.is_recording.return_value = True
+    rec.current_rms.return_value = 0.5  # loud — no silence trigger
+    rec.stream_healthy.side_effect = RuntimeError("HAL died")
+
+    triggered: list[bool] = []
+    dog = SilenceWatchdog(
+        recorder=rec,
+        threshold=0.005,
+        auto_stop_seconds=10.0,
+        on_trigger=lambda: triggered.append(True),
+    )
+    dog.start()
+    time.sleep(0.3)  # several polls, all with a raising health check
+    dog.stop()
+    assert triggered == []
+
+
 def _fake_recorder_healthy(**kwargs):
     """Build a MagicMock recorder with stream_healthy support."""
     healthy = kwargs.pop("healthy", True)

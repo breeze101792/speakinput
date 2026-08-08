@@ -120,6 +120,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpu",
         action="store_true",
+        dest="use_gpu",
         default=None,
         help="Force GPU acceleration on. If the pywhispercpp wheel is "
         "CPU-only, logs a warning and falls back to CPU. See README "

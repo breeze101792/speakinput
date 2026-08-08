@@ -7,6 +7,7 @@ from speakinput.config import (
     Config,
     InjectConfig,
     Profile,
+    TranscribeConfig,
     load_config,
     primary_profile,
     secondary_profile,
@@ -546,3 +547,70 @@ def test_secondary_profile_has_same_default_prompt():
     """Both profiles start with the embedded-vocab bias; users override
     per profile as needed."""
     assert secondary_profile().initial_prompt == primary_profile().initial_prompt
+
+
+# --- validation: remaining error branches ----------------------------------
+
+
+def test_validation_rejects_invalid_zh_conversion():
+    with pytest.raises(ValueError, match="zh_conversion"):
+        Config(primary=Profile(zh_conversion="wrong")).validate()
+
+
+def test_validation_rejects_negative_silence_threshold():
+    with pytest.raises(ValueError, match="silence_threshold"):
+        Config(audio=AudioConfig(silence_threshold=-1)).validate()
+
+
+def test_validation_rejects_unknown_inject_backend():
+    with pytest.raises(ValueError, match="inject.backend"):
+        Config(inject=InjectConfig(backend="fancy")).validate()
+
+
+def test_validation_rejects_non_bool_use_gpu():
+    cfg = Config.from_dict({"transcribe": {"use_gpu": "maybe"}})
+    with pytest.raises(ValueError, match="use_gpu"):
+        cfg.validate()
+
+
+def test_validation_rejects_negative_gpu_device():
+    with pytest.raises(ValueError, match="gpu_device"):
+        Config(transcribe=TranscribeConfig(gpu_device=-1)).validate()
+
+
+def test_validation_rejects_negative_n_threads():
+    with pytest.raises(ValueError, match="n_threads"):
+        Config(transcribe=TranscribeConfig(n_threads=-1)).validate()
+
+
+# --- from_dict: TOML "use_gpu" string normalization ------------------------
+
+
+def test_from_dict_use_gpu_string_auto_normalizes_to_none():
+    """TOML has no null literal; the string "auto" (or "") means the
+    app decides, mapping to Python None."""
+    cfg = Config.from_dict({"transcribe": {"use_gpu": "auto"}})
+    assert cfg.transcribe.use_gpu is None
+    cfg = Config.from_dict({"transcribe": {"use_gpu": ""}})
+    assert cfg.transcribe.use_gpu is None
+
+
+def test_from_dict_use_gpu_string_true_false_normalized():
+    assert Config.from_dict({"transcribe": {"use_gpu": "true"}}).transcribe.use_gpu is True
+    assert Config.from_dict({"transcribe": {"use_gpu": "yes"}}).transcribe.use_gpu is True
+    assert Config.from_dict({"transcribe": {"use_gpu": "1"}}).transcribe.use_gpu is True
+    assert Config.from_dict({"transcribe": {"use_gpu": "false"}}).transcribe.use_gpu is False
+    assert Config.from_dict({"transcribe": {"use_gpu": "no"}}).transcribe.use_gpu is False
+    assert Config.from_dict({"transcribe": {"use_gpu": "0"}}).transcribe.use_gpu is False
+
+
+def test_from_dict_use_gpu_bool_passthrough():
+    assert Config.from_dict({"transcribe": {"use_gpu": True}}).transcribe.use_gpu is True
+    assert Config.from_dict({"transcribe": {"use_gpu": False}}).transcribe.use_gpu is False
+
+
+def test_from_dict_use_gpu_garbage_string_is_left_for_validate():
+    """A non-boolean string must be left as-is so validate() reports it
+    with a clear message rather than silently coercing it."""
+    cfg = Config.from_dict({"transcribe": {"use_gpu": "maybe"}})
+    assert cfg.transcribe.use_gpu == "maybe"

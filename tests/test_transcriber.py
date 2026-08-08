@@ -509,3 +509,319 @@ def test_gpu_summary_forced_off_explicit(monkeypatch, _clear_gpu_probe_cache):
     summary = t_mod._gpu_summary(use_gpu=False, gpu_device=0)
     assert "cpu" in summary
     assert "forced" in summary
+
+
+# --- libwhisper location + probe edge cases --------------------------------
+
+
+def test_locate_libwhisper_returns_none_when_package_missing(monkeypatch):
+    """A None entry in sys.modules makes the `import _pywhispercpp` fail →
+    the lib can't be located, so the probe reports no GPU."""
+    import sys
+
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setitem(sys.modules, "_pywhispercpp", None)
+    assert t_mod._locate_libwhisper() is None
+
+
+def test_locate_libwhisper_finds_lib_next_to_extension(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    from speakinput import transcriber as t_mod
+
+    lib_dir = tmp_path / "whisperlib"
+    lib_dir.mkdir()
+    lib = lib_dir / "libwhisper.so"
+    lib.write_bytes(b"ggml-cuda init")
+    fake_pkg = SimpleNamespace(__file__=str(lib_dir / "__init__.py"))
+    monkeypatch.setitem(sys.modules, "_pywhispercpp", fake_pkg)
+    assert t_mod._locate_libwhisper() == lib
+
+
+def test_locate_libwhisper_returns_none_when_no_lib_file(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    from speakinput import transcriber as t_mod
+
+    lib_dir = tmp_path / "empty"
+    lib_dir.mkdir()
+    fake_pkg = SimpleNamespace(__file__=str(lib_dir / "__init__.py"))
+    monkeypatch.setitem(sys.modules, "_pywhispercpp", fake_pkg)
+    assert t_mod._locate_libwhisper() is None
+
+
+def test_probe_returns_none_when_lib_unreadable(
+    monkeypatch, tmp_path, _clear_gpu_probe_cache
+):
+    """An unreadable / missing lib file must degrade to 'no GPU', not crash."""
+    from speakinput import transcriber as t_mod
+
+    missing = tmp_path / "gone" / "libwhisper.so"
+    monkeypatch.setattr(t_mod, "_locate_libwhisper", lambda: missing)
+    assert t_mod._probe_gpu_backend() is None
+
+
+def test_gpu_summary_plain_when_resolve_has_no_extras(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    """When the resolved context_params has no flash_attn (only possible if
+    the resolver returns {}), the summary omits the extras suffix."""
+    from speakinput import transcriber as t_mod
+
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "cuda")
+    monkeypatch.setattr(t_mod, "_resolve_context_params", lambda use_gpu, gpu_device: {})
+    summary = t_mod._gpu_summary(use_gpu=True, gpu_device=0)
+    assert summary == "cuda (GPU 0)"
+
+
+# --- per-call initial_prompt override ---------------------------------------
+
+
+def test_transcribe_per_call_initial_prompt_overrides_constructor_default(
+    fake_pywhispercpp,
+):
+    """A per-call initial_prompt beats the constructor's instance default."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    model_instance.transcribe.return_value = [MagicMock(text="kubectl")]
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber(initial_prompt="instance default")
+    t.transcribe(np.zeros(1600, dtype=np.float32), 16000, initial_prompt="override")
+    assert model_instance.transcribe.call_args.kwargs["initial_prompt"] == "override"
+
+
+def test_transcribe_empty_per_call_prompt_disables_instance_default(
+    fake_pywhispercpp,
+):
+    """A per-call empty string must erase even the constructor's instance
+    default — `""` is the whisper.cpp 'no prompt' sentinel."""
+    from speakinput.transcriber import WhisperCppTranscriber
+
+    model_instance = MagicMock()
+    model_instance.transcribe.return_value = [MagicMock(text="kubectl")]
+    fake_pywhispercpp.return_value = model_instance
+
+    t = WhisperCppTranscriber(initial_prompt="instance default")
+    t.transcribe(np.zeros(1600, dtype=np.float32), 16000, initial_prompt="")
+    assert model_instance.transcribe.call_args.kwargs["initial_prompt"] is None
+
+
+# --- FasterWhisperTranscriber ------------------------------------------------
+#
+# faster-whisper is an optional engine. Tests inject a fake `faster_whisper`
+# package into sys.modules so the CTranslate2 wheel is never touched.
+
+
+def _inject_faster_whisper(monkeypatch, whisper_model_cls):
+    import sys
+    import types
+
+    fw = types.ModuleType("faster_whisper")
+    setattr(fw, "WhisperModel", whisper_model_cls)
+    monkeypatch.setitem(sys.modules, "faster_whisper", fw)
+    return fw
+
+
+def test_faster_whisper_missing_package_raises(monkeypatch):
+    import builtins
+
+    from speakinput.transcriber import FasterWhisperTranscriber, TranscriberError
+
+    real_import = builtins.__import__
+
+    def _import(name, *args, **kwargs):  # noqa: ANN001, ANN002
+        if name == "faster_whisper":
+            raise ImportError("No module named faster_whisper")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    with pytest.raises(TranscriberError, match="faster_whisper"):
+        FasterWhisperTranscriber()
+
+
+def test_faster_whisper_cuda_device_when_backend_present(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+    from speakinput.transcriber import FasterWhisperTranscriber
+
+    whisper_cls = MagicMock()
+    _inject_faster_whisper(monkeypatch, whisper_cls)
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "cuda")
+    FasterWhisperTranscriber()
+    kwargs = whisper_cls.call_args.kwargs
+    assert kwargs["device"] == "cuda"
+    assert kwargs["compute_type"] == "float16"
+
+
+def test_faster_whisper_cpu_when_use_gpu_false(monkeypatch, _clear_gpu_probe_cache):
+    from speakinput import transcriber as t_mod
+    from speakinput.transcriber import FasterWhisperTranscriber
+
+    whisper_cls = MagicMock()
+    _inject_faster_whisper(monkeypatch, whisper_cls)
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: "cuda")
+    FasterWhisperTranscriber(use_gpu=False)
+    kwargs = whisper_cls.call_args.kwargs
+    assert kwargs["device"] == "cpu"
+    assert kwargs["compute_type"] == "int8"
+
+
+def test_faster_whisper_cpu_when_lib_is_cpu_only(monkeypatch, _clear_gpu_probe_cache):
+    from speakinput import transcriber as t_mod
+    from speakinput.transcriber import FasterWhisperTranscriber
+
+    whisper_cls = MagicMock()
+    _inject_faster_whisper(monkeypatch, whisper_cls)
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: None)
+    FasterWhisperTranscriber()  # auto → no GPU present → CPU
+    kwargs = whisper_cls.call_args.kwargs
+    assert kwargs["device"] == "cpu"
+    assert kwargs["compute_type"] == "int8"
+
+
+def test_faster_whisper_force_on_with_cpu_lib_warns(
+    monkeypatch, capsys, _clear_gpu_probe_cache
+):
+    from speakinput import transcriber as t_mod
+    from speakinput.transcriber import FasterWhisperTranscriber
+
+    whisper_cls = MagicMock()
+    _inject_faster_whisper(monkeypatch, whisper_cls)
+    monkeypatch.setattr(t_mod, "_probe_gpu_backend", lambda: None)
+    FasterWhisperTranscriber(use_gpu=True)  # must not crash; stays CPU
+    assert whisper_cls.call_args.kwargs["device"] == "cpu"
+    captured = capsys.readouterr()
+    assert "use_gpu=true" in captured.err
+
+
+def test_faster_whisper_forwards_n_threads(monkeypatch, _clear_gpu_probe_cache):
+    from speakinput.transcriber import FasterWhisperTranscriber
+
+    whisper_cls = MagicMock()
+    _inject_faster_whisper(monkeypatch, whisper_cls)
+    FasterWhisperTranscriber(n_threads=6)
+    assert whisper_cls.call_args.kwargs["cpu_threads"] == 6
+
+    whisper_cls.reset_mock()
+    FasterWhisperTranscriber()  # n_threads=0 → omitted
+    assert "cpu_threads" not in whisper_cls.call_args.kwargs
+
+
+def test_faster_whisper_transcribe_empty_audio(monkeypatch):
+    from speakinput.transcriber import FasterWhisperTranscriber
+
+    whisper_cls = MagicMock()
+    _inject_faster_whisper(monkeypatch, whisper_cls)
+    t = FasterWhisperTranscriber()
+    assert t.transcribe(np.zeros(0, dtype=np.float32), 16000) == ""
+    whisper_cls.return_value.transcribe.assert_not_called()
+
+
+def test_faster_whisper_transcribe_passes_kwargs_and_collapses(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput.transcriber import FasterWhisperTranscriber
+
+    whisper_cls = MagicMock()
+    _inject_faster_whisper(monkeypatch, whisper_cls)
+    model = whisper_cls.return_value
+    model.transcribe.return_value = (
+        [
+            MagicMock(text="eh "),
+            MagicMock(text="eh "),
+            MagicMock(text="[BLANK_AUDIO]"),
+            MagicMock(text="" ),
+            MagicMock(text="oh"),
+        ],
+        None,
+    )
+    t = FasterWhisperTranscriber(language="zh", beam_size=3, initial_prompt="")
+    out = t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert out == "eh oh"
+    kwargs = model.transcribe.call_args.kwargs
+    assert kwargs["language"] == "zh"
+    assert kwargs["beam_size"] == 3
+    assert kwargs["initial_prompt"] is None
+
+
+def test_faster_whisper_transcribe_uses_instance_prompt_when_none(
+    monkeypatch, _clear_gpu_probe_cache
+):
+    from speakinput.transcriber import FasterWhisperTranscriber
+
+    whisper_cls = MagicMock()
+    _inject_faster_whisper(monkeypatch, whisper_cls)
+    model = whisper_cls.return_value
+    model.transcribe.return_value = ([MagicMock(text="hi")], None)
+    t = FasterWhisperTranscriber(initial_prompt="pin")
+    t.transcribe(np.zeros(1600, dtype=np.float32), 16000)
+    assert model.transcribe.call_args.kwargs["initial_prompt"] == "pin"
+
+
+# --- AppleSpeechTranscriber (availability guard on Linux) --------------------
+
+
+def test_apple_transcriber_rejected_off_macos(monkeypatch):
+    """The engine is documented as macOS-only; on any other platform the
+    constructor must raise, so the engine registry falls back cleanly."""
+    import sys
+
+    from speakinput.transcriber import AppleSpeechTranscriber, TranscriberError
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(TranscriberError, match="only available on macOS"):
+        AppleSpeechTranscriber()
+
+
+# --- create_transcriber engine registry --------------------------------------
+
+
+def test_create_transcriber_unknown_engine_falls_back(fake_pywhispercpp, capsys):
+    from speakinput.transcriber import WhisperCppTranscriber, create_transcriber
+
+    fake_pywhispercpp.return_value = MagicMock()
+    t = create_transcriber("definitely-not-an-engine")
+    # Falls back to the always-available whispercpp engine.
+    assert isinstance(t, WhisperCppTranscriber)
+    captured = capsys.readouterr()
+    assert "unknown engine" in captured.err
+    assert "whispercpp" in captured.err
+
+
+def test_create_transcriber_falls_back_when_engine_raises(
+    monkeypatch, fake_pywhispercpp, capsys
+):
+    from speakinput import transcriber as t_mod
+    from speakinput.transcriber import TranscriberError, WhisperCppTranscriber, create_transcriber
+
+    class _BoomEngine:
+        def __init__(self, **kwargs):
+            del kwargs
+            raise TranscriberError("engine exploded at construction")
+
+    monkeypatch.setitem(t_mod._ENGINE_REGISTRY, "fake_broken", _BoomEngine)
+    fake_pywhispercpp.return_value = MagicMock()
+    t = create_transcriber("fake_broken")
+    assert isinstance(t, WhisperCppTranscriber)
+    captured = capsys.readouterr()
+    assert "fake_broken" in captured.err
+    assert "unavailable" in captured.err
+    assert isinstance(t._model, MagicMock)
+
+
+def test_create_transcriber_whispercpp_failure_is_not_swallowed(monkeypatch):
+    """The fallback chain assumes whispercpp is always available. If even
+    the whispercpp constructor fails, we must surface that rather than
+    degrade silently to a non-working engine."""
+    from speakinput import transcriber as t_mod
+    from speakinput.transcriber import TranscriberError, create_transcriber
+
+    monkeypatch.setattr(t_mod, "_WhisperModel", None, raising=False)
+    with pytest.raises(TranscriberError, match="pywhispercpp"):
+        create_transcriber("whispercpp")
