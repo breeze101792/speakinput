@@ -340,6 +340,8 @@ def _diagnose(config: Config) -> int:
     recorder = AudioRecorder(
         sample_rate=config.audio.sample_rate,
         device=config.audio.device,
+        mic_failover_scan=config.recovery.mic_failover_scan,
+        mic_open_retries=config.recovery.mic_open_retries,
     )
     recorder.start()
     time.sleep(2.0)

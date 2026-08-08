@@ -230,9 +230,16 @@ class InjectConfig:
 
 VALID_INJECT_BACKENDS = ("auto", "pynput", "wtype", "ydotool")
 
+VALID_ENGINES = ("whispercpp", "faster_whisper", "apple")
+
 
 @dataclass(frozen=True)
 class TranscribeConfig:
+    # STT engine. "whispercpp" is the default (pywhispercpp). The
+    # other engines are loaded lazily and fall back to whispercpp
+    # if their package isn't installed. See transcriber.py for the
+    # engine registry.
+    engine: str = "whispercpp"
     # GPU use. `None` means "auto-detect from the loaded pywhispercpp
     # wheel" — use GPU if the wheel was built with a GPU backend
     # (CUDA/Vulkan/Metal), else stay on CPU. `True` forces GPU on
@@ -248,12 +255,64 @@ class TranscribeConfig:
 
 
 @dataclass(frozen=True)
+class RecoveryConfig:
+    """Configurable auto-recovery for every component that can fail at
+    runtime. Each section controls a different failure domain; all
+    default to the aggressive self-healing behavior the app already
+    had (so existing configs are unchanged). Set any of these to 0 to
+    disable that recovery path — useful when you'd rather see the
+    failure than have it masked.
+
+    The goal: every error — hardware removal, model crash, injector
+    wedge — is recovered by the program itself. The user should never
+    have to restart speakinput to get a working hotkey again.
+    """
+
+    # Transcriber: when transcribe() raises, reload the model and
+    # retry up to this many times before giving up on this chunk.
+    # 0 = no retry (old behavior: log and drop the audio).
+    # 1 = one reload+retry. 2+ = reload, retry, reload, retry, ...
+    transcribe_retries: int = 2
+    # Seconds to wait between transcribe retries (backoff). 0 = retry
+    # immediately; 1.0 = wait 1s between attempts. Keeps a wedged
+    # model from spamming reloads.
+    transcribe_backoff_s: float = 0.5
+
+    # Microphone: when the configured audio device disappears (USB
+    # unplug, Bluetooth disconnect), re-enumerate and try the next
+    # available input device instead of falling back to system
+    # default only. 0 = system-default fallback only (old behavior).
+    # 1 = scan all input devices and pick a working one.
+    mic_failover_scan: bool = True
+    # When a press fails because the mic is gone, how many times to
+    # retry opening a stream (with the fallback device) before
+    # surfacing the error to the user. 0 = fail immediately on the
+    # first press after a disconnect (the release path shows 'error').
+    mic_open_retries: int = 2
+
+    # Injector: when the selected output backend fails at runtime
+    # (wtype returns non-zero, ydotool socket vanished, pynput
+    # wedged), try the next backend in the chain instead of just
+    # logging. 0 = no fallback (old behavior). 1 = try all available
+    # backends.
+    injector_fallback: bool = True
+
+    # Listener: the liveness watcher already restarts dead listeners.
+    # This controls the backoff window (seconds) — a listener that
+    # dies again within this window is considered unrecoverable and
+    # the user is warned instead of flapping. 0 = always try to
+    # restart (may flap forever on a permission revocation).
+    listener_restart_min_interval_s: float = 60.0
+
+
+@dataclass(frozen=True)
 class Config:
     primary: Profile = field(default_factory=primary_profile)
     secondary: Profile | None = None
     audio: AudioConfig = field(default_factory=AudioConfig)
     inject: InjectConfig = field(default_factory=InjectConfig)
     transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
 
     @classmethod
     def from_toml(cls, path: Path) -> "Config":
@@ -306,12 +365,14 @@ class Config:
                 transcribe_raw["use_gpu"] = False
             # else: leave the bool as-is; validate() will catch garbage
         transcribe = TranscribeConfig(**transcribe_raw)
+        recovery = RecoveryConfig(**data.get("recovery", {}))
         return cls(
             primary=primary,
             secondary=secondary,
             audio=audio,
             inject=inject,
             transcribe=transcribe,
+            recovery=recovery,
         )
 
     def validate(self) -> None:
@@ -374,6 +435,11 @@ class Config:
                 f"inject.backend must be one of {VALID_INJECT_BACKENDS}, "
                 f"got {self.inject.backend!r}"
             )
+        if self.transcribe.engine not in VALID_ENGINES:
+            raise ValueError(
+                f"transcribe.engine must be one of {VALID_ENGINES}, "
+                f"got {self.transcribe.engine!r}"
+            )
         if not isinstance(self.transcribe.use_gpu, (bool, type(None))):
             raise ValueError(
                 f"transcribe.use_gpu must be a bool or 'auto', "
@@ -388,6 +454,26 @@ class Config:
             raise ValueError(
                 f"transcribe.n_threads must be >= 0 (0 = auto), "
                 f"got {self.transcribe.n_threads}"
+            )
+        if self.recovery.transcribe_retries < 0:
+            raise ValueError(
+                f"recovery.transcribe_retries must be >= 0, "
+                f"got {self.recovery.transcribe_retries}"
+            )
+        if self.recovery.transcribe_backoff_s < 0:
+            raise ValueError(
+                f"recovery.transcribe_backoff_s must be >= 0, "
+                f"got {self.recovery.transcribe_backoff_s}"
+            )
+        if self.recovery.mic_open_retries < 0:
+            raise ValueError(
+                f"recovery.mic_open_retries must be >= 0, "
+                f"got {self.recovery.mic_open_retries}"
+            )
+        if self.recovery.listener_restart_min_interval_s < 0:
+            raise ValueError(
+                f"recovery.listener_restart_min_interval_s must be >= 0, "
+                f"got {self.recovery.listener_restart_min_interval_s}"
             )
 
     def with_overrides(self, **overrides: Any) -> "Config":
@@ -435,6 +521,15 @@ class Config:
             overrides = {k: v for k, v in overrides.items() if k not in transcribe_keys}
         else:
             transcribe = self.transcribe
+        recovery_keys = set(RecoveryConfig.__annotations__)
+        if any(k in recovery_keys for k in overrides):
+            recovery = replace(
+                self.recovery,
+                **{k: v for k, v in overrides.items() if k in recovery_keys},
+            )
+            overrides = {k: v for k, v in overrides.items() if k not in recovery_keys}
+        else:
+            recovery = self.recovery
         secondary = overrides.pop("secondary", self.secondary)
         return Config(
             primary=primary,
@@ -442,6 +537,7 @@ class Config:
             audio=audio,
             inject=inject,
             transcribe=transcribe,
+            recovery=recovery,
         )
 
 

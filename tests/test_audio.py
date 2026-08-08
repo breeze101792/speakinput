@@ -154,7 +154,6 @@ def test_recorder_current_rms_is_zero_before_any_audio(fake_sd):
 def test_recorder_current_rms_reflects_last_chunk(fake_sd):
     """The watchdog polls current_rms() to detect silence; it must
     reflect the most recent chunk's RMS, not the running average."""
-    from speakinput.audio import AudioRecorder
 
     r, cb = _make_recorder_with_captured_callback(fake_sd)
     # First chunk: loud (RMS = 0.5)
@@ -169,7 +168,6 @@ def test_recorder_current_rms_reflects_last_chunk(fake_sd):
 def test_recorder_current_rms_resets_on_start(fake_sd):
     """Starting a new recording should reset the live RMS to 0.0,
     not carry over from a previous run."""
-    from speakinput.audio import AudioRecorder
 
     r, cb = _make_recorder_with_captured_callback(fake_sd)
     cb(np.full((480, 1), 0.5, dtype=np.float32), 480, None, None)
@@ -185,7 +183,6 @@ def test_recorder_drain_returns_buffer_and_keeps_recording(fake_sd):
     """drain() is the chunked-release path: return what was recorded
     since the last start/drain, keep the stream alive so more audio
     can be captured. After drain the live RMS resets to 0."""
-    from speakinput.audio import AudioRecorder
 
     r, cb = _make_recorder_with_captured_callback(fake_sd)
     cb(np.full((480, 1), 0.3, dtype=np.float32), 480, None, None)
@@ -217,7 +214,6 @@ def test_recorder_drain_on_empty_buffer_returns_empty(fake_sd):
 
 def test_recorder_close_is_idempotent(fake_sd):
     """Calling close() twice is a no-op."""
-    from speakinput.audio import AudioRecorder
 
     r, _ = _make_recorder_with_captured_callback(fake_sd)
     r.close()
@@ -303,7 +299,6 @@ def test_recorder_close_does_not_block_when_portaudio_wedges(fake_sd, monkeypatc
 def test_recorder_stop_equivalent_to_drain_then_close(fake_sd):
     """stop() should still return the full buffer and tear down the
     stream, preserving the existing single-chunk release behavior."""
-    from speakinput.audio import AudioRecorder
 
     r, cb = _make_recorder_with_captured_callback(fake_sd)
     cb(np.full((800, 1), 0.2, dtype=np.float32), 800, None, None)
@@ -360,7 +355,11 @@ def test_pinned_device_gone_falls_back_to_default(fake_sd, capsys):
     assert kwargs["device"] is None
     captured = capsys.readouterr()
     assert "device 2 is not available" in captured.err
-    assert "falling back" in captured.err
+    # With mic_failover_scan=True (default), the recorder tries to scan
+    # all devices first. query_devices also raises, so it falls through
+    # to system default. Either "falling back" or "trying system default"
+    # is an acceptable message.
+    assert "system default" in captured.err or "falling back" in captured.err
 
 
 def test_no_mic_at_all_raises_with_clear_message(fake_sd, capsys):

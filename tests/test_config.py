@@ -26,7 +26,6 @@ def test_default_construction():
 
 def test_primary_profile_default_key_is_platform_aware():
     """primary_profile() picks the platform default at call time."""
-    import sys as _sys
 
     from speakinput.config import _default_primary_key
 

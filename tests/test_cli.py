@@ -70,12 +70,16 @@ def test_edit_config_short_circuits_before_model_load(
     from speakinput import cli
 
     # Sentinel: if either of these gets called, the short-circuit
-    # failed. The CLI imports ensure_model at module load, so we patch
-    # it on the module attribute the function looks up.
+    # failed. The CLI doesn't import ensure_model directly (it's
+    # called via App.run), so we patch it on the models module in
+    # case the bootstrap path is reached. We also patch the
+    # single-instance lock.
+    from speakinput import models as _models
+
     def _explode(*a, **kw):
         raise AssertionError("ensure_model was called during -C")
 
-    monkeypatch.setattr(cli, "ensure_model", _explode, raising=True)
+    monkeypatch.setattr(_models, "ensure_model", _explode, raising=False)
     # Patching ensure_model above would also affect a real run; since
     # the short-circuit must happen before any of it, _explode will
     # never fire in the success case.

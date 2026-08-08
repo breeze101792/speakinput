@@ -490,6 +490,7 @@ install_arch() {
             pkg_installed_pacman cuda        || pkgs+=(cuda)
             pkg_installed_pacman nvidia-utils || pkgs+=(nvidia-utils)
             pkg_installed_pacman vulkan-icd-loader || pkgs+=(vulkan-icd-loader)
+            pkg_installed_pacman vulkan-headers || pkgs+=(vulkan-headers)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
                 confirm_run "sudo pacman -S --needed ${pkgs[*]}" \
                     sudo pacman -S --needed "${pkgs[@]}"
@@ -501,6 +502,7 @@ install_arch() {
             local pkgs=()
             pkg_installed_pacman vulkan-radeon      || pkgs+=(vulkan-radeon)
             pkg_installed_pacman vulkan-icd-loader  || pkgs+=(vulkan-icd-loader)
+            pkg_installed_pacman vulkan-headers     || pkgs+=(vulkan-headers)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
                 confirm_run "sudo pacman -S --needed ${pkgs[*]}" \
                     sudo pacman -S --needed "${pkgs[@]}"
@@ -512,6 +514,7 @@ install_arch() {
             local pkgs=()
             pkg_installed_pacman vulkan-intel      || pkgs+=(vulkan-intel)
             pkg_installed_pacman vulkan-icd-loader || pkgs+=(vulkan-icd-loader)
+            pkg_installed_pacman vulkan-headers    || pkgs+=(vulkan-headers)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
                 confirm_run "sudo pacman -S --needed ${pkgs[*]}" \
                     sudo pacman -S --needed "${pkgs[@]}"
@@ -523,6 +526,7 @@ install_arch() {
             local pkgs=()
             pkg_installed_pacman vulkan-mali       || pkgs+=(vulkan-mali)
             pkg_installed_pacman vulkan-icd-loader || pkgs+=(vulkan-icd-loader)
+            pkg_installed_pacman vulkan-headers    || pkgs+=(vulkan-headers)
             if [[ ${#pkgs[@]} -gt 0 ]]; then
                 confirm_run "sudo pacman -S --needed ${pkgs[*]}" \
                     sudo pacman -S --needed "${pkgs[@]}"
