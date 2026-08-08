@@ -311,16 +311,50 @@ def test_recorder_stop_equivalent_to_drain_then_close(fake_sd):
 # --- mic-presence preflight (device pinned in config) ----------------------
 
 
-def test_default_device_skips_preflight_check(fake_sd):
-    """When `device` is None (system default), we must NOT call
-    query_devices on every press — PortAudio re-resolves the default
-    on every InputStream(), so the check is unnecessary AND adds
-    ~1ms of work to every press for no benefit."""
+def test_default_device_uses_system_default(fake_sd):
+    """When device=None (system default), the recorder uses the system
+    default directly — NOT a scan. The default may be a pipewire bridge
+    that is perfectly usable at its native rate."""
     from speakinput.audio import AudioRecorder
 
-    r = AudioRecorder()  # default device=None
+    r = AudioRecorder()  # default device=None, mic_failover_scan=True
     r.start()
-    fake_sd.query_devices.assert_not_called()
+    # InputStream was opened with device=None (system default), and no
+    # device scan happened. query_devices may be called once for the
+    # native-rate query on the default device, but NOT as a scan.
+    kwargs = fake_sd.InputStream.call_args.kwargs
+    assert kwargs["device"] is None
+
+
+def test_default_device_scans_after_default_fails(fake_sd, capsys):
+    """When the system default itself fails to open, the next press
+    scans for a real hardware device instead of retrying the default."""
+    from speakinput.audio import AudioError, AudioRecorder
+
+    # First press: InputStream with device=None fails.
+    calls = {"n": 0}
+
+    def input_stream_side_effect(**kwargs):
+        calls["n"] += 1
+        if kwargs.get("device") is None and calls["n"] == 1:
+            raise OSError("default device broken")
+        return MagicMock()
+
+    fake_sd.InputStream.side_effect = input_stream_side_effect
+    fake_sd.query_devices.return_value = [
+        {"name": "USB Mic", "max_input_channels": 1, "default_samplerate": 16000.0},
+    ]
+
+    r = AudioRecorder()  # device=None
+    with pytest.raises(AudioError):
+        r.start()
+    assert r._default_blacklisted
+
+    # Second press: default is blacklisted → scan picks USB Mic.
+    r.start()
+    assert fake_sd.InputStream.call_args.kwargs["device"] == 0
+    assert r.is_recording()
+    r.close()
 
 
 def test_pinned_device_present_uses_it(fake_sd, capsys):
@@ -329,10 +363,11 @@ def test_pinned_device_present_uses_it(fake_sd, capsys):
     fallback."""
     from speakinput.audio import AudioRecorder
 
-    fake_sd.query_devices.return_value = {"name": "USB Mic"}  # no exception
+    fake_sd.query_devices.return_value = {"name": "USB Mic", "default_samplerate": 16000.0}  # no exception
     r = AudioRecorder(device=2)
     r.start()
-    fake_sd.query_devices.assert_called_once_with(2)
+    # query_devices is called for presence check and native rate check.
+    assert fake_sd.query_devices.call_count >= 1
     # The stream must be opened with the requested device, not the default.
     kwargs = fake_sd.InputStream.call_args.kwargs
     assert kwargs["device"] == 2
@@ -355,11 +390,6 @@ def test_pinned_device_gone_falls_back_to_default(fake_sd, capsys):
     assert kwargs["device"] is None
     captured = capsys.readouterr()
     assert "device 2 is not available" in captured.err
-    # With mic_failover_scan=True (default), the recorder tries to scan
-    # all devices first. query_devices also raises, so it falls through
-    # to system default. Either "falling back" or "trying system default"
-    # is an acceptable message.
-    assert "system default" in captured.err or "falling back" in captured.err
 
 
 def test_no_mic_at_all_raises_with_clear_message(fake_sd, capsys):

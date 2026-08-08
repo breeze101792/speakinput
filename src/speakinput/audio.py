@@ -104,6 +104,23 @@ class Recorder(Protocol):
     def current_rms(self) -> float: ...
 
 
+def _resample(audio: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
+    """Linear-interpolation resample from `from_rate` to `to_rate`.
+
+    Used when the capture device doesn't support the target 16kHz
+    natively — we open at its native rate (e.g. 44100) and resample
+    here before returning the buffer to the transcriber. Linear
+    interpolation is sufficient for speech (no need for a high-quality
+    FIR filter — whisper is robust to minor interpolation artifacts).
+    """
+    if from_rate == to_rate or audio.size == 0:
+        return audio
+    ratio = from_rate / to_rate
+    target_len = int(len(audio) / ratio)
+    indices = np.linspace(0, len(audio) - 1, target_len)
+    return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
+
 @dataclass
 class AudioRecorder:
     """Records mono float32 audio at `sample_rate` Hz from `device`.
@@ -124,6 +141,10 @@ class AudioRecorder:
     # from [recovery].mic_failover_scan. When False, only falls back to
     # system default (the old behavior).
     mic_failover_scan: bool = True
+    # True after the system default (device=None) failed to open once.
+    # Subsequent presses then scan for a real hardware device instead
+    # of trying the broken default again.
+    _default_blacklisted: bool = False
     # How many times to retry opening a stream with the fallback device
     # before raising. Set by the App from [recovery].mic_open_retries.
     mic_open_retries: int = 2
@@ -144,6 +165,18 @@ class AudioRecorder:
     # callback and the watchdog run on different threads.
     _last_rms: float = 0.0
     _rms_lock: threading.Lock = field(default_factory=threading.Lock)
+    # The actual sample rate the stream was opened at. May differ from
+    # `sample_rate` (the target rate whisper needs) when the hardware
+    # doesn't support 16kHz natively — we open at the device's native
+    # rate and resample in drain()/stop() before returning the buffer.
+    _capture_sample_rate: int = 16000
+    # Devices that failed to open in a previous press. Persisted across
+    # presses so we don't hammer the same broken ALSA device on every
+    # key press. Cleared when a device successfully opens (the blacklist
+    # is a per-session recovery state, not a permanent ban — a USB mic
+    # that's re-plugged should work on the next press after the old
+    # device index is gone from the system).
+    _blacklisted_devices: set[int] = field(default_factory=set)
 
     def _require_sounddevice(self) -> None:
         if sd is None:
@@ -192,29 +225,47 @@ class AudioRecorder:
         """Scan all input devices and return the best usable one.
 
         Used when the configured device disappeared and
-        `mic_failover_scan` is True. Picks the device with the most
-        input channels (usually a real microphone, not a virtual
-        loopback). Devices in `exclude` are skipped — this is how the
-        retry loop avoids hammering the same broken device (e.g. an
-        ALSA device that fails `PaAlsaStream_Configure` every time).
+        `mic_failover_scan` is True. Prefers real hardware devices
+        (ALSA/HDA) over virtual bridges (pipewire, default) because
+        virtual bridges can report many channels but still be broken.
+        Among real devices, picks the one with the most input channels.
 
-        Returns None if no usable input device is found (either no
-        devices at all, or all candidates are in the exclude set).
+        Devices in `exclude` are skipped — this is how the
+        blacklist prevents retrying broken devices across presses.
+
+        Returns None if no usable input device is found.
         """
         try:
             devices = sd.query_devices()
         except Exception:
             return None
         excluded = exclude or set()
+        # Score each device: (is_hardware, channels). Hardware devices
+        # (names containing "hw:" or "HDA" or a USB vendor name) rank
+        # higher than virtual ones ("pipewire", "default", "dmix").
+        # This avoids the case where pipewire reports 128 channels but
+        # is actually broken ("No such file or directory").
         best_idx: int | None = None
-        best_channels = 0
+        best_score: tuple[bool, int] = (False, 0)
         for i, d in enumerate(devices):
             if i in excluded:
                 continue
             ch = int(d.get("max_input_channels", 0))
-            if ch > best_channels:
+            if ch <= 0:
+                continue
+            name = str(d.get("name", ""))
+            # Heuristic: real hardware has "hw:" or "HDA" or "USB" in
+            # the ALSA device name. Virtual bridges are named
+            # "pipewire", "default", "dmix", "null", etc.
+            is_hardware = any(
+                tag in name for tag in ("hw:", "HDA", "USB", "Audio", "Codec")
+            ) and not any(
+                tag in name.lower() for tag in ("pipewire", "default", "dmix", "null")
+            )
+            score = (is_hardware, ch)
+            if score > best_score:
                 best_idx = i
-                best_channels = ch
+                best_score = score
         return best_idx
 
     def start(self) -> None:
@@ -225,139 +276,139 @@ class AudioRecorder:
             self._chunks = []
             with self._rms_lock:
                 self._last_rms = 0.0
-            # Fall back to system default if the pinned device disappeared
-            # since the last press (USB unplug, Bluetooth headset
-            # disconnected, etc.). The check is sub-ms; the stream-open
-            # that follows is the real cost (~30-100ms on macOS). When
-            # `device is None` the system default is used and re-resolved
-            # by PortAudio on every call, so the fallback is unnecessary.
+            # Pick the device to open. Start with the configured device.
+            # If it's gone (query_devices raises), fall back to a
+            # scanned device or system default. We pick ONE device and
+            # try it ONCE — calling InputStream() multiple times in a
+            # single press corrupts PortAudio state (the -9999 "not
+            # initialized" crash). The blacklist ensures we don't try
+            # the same broken device on the next press.
             device = self.device
-            if device is not None and not self._device_is_present(device):
-                fallback = None
-                if self.mic_failover_scan:
-                    scanned = self._find_fallback_device()
-                    if scanned is not None:
-                        print(
-                            f"[warn] configured audio device {device} is not available; "
-                            f"switching to device {scanned}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        fallback = scanned
-                    else:
-                        print(
-                            f"[warn] configured audio device {device} is not available; "
-                            f"no other input devices found; trying system default",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                else:
+            replaced_configured = False
+            # If the configured device is blacklisted (failed in a
+            # previous press) or gone (query_devices raises), fall
+            # back to a scanned device or system default.
+            if device is not None and (
+                device in self._blacklisted_devices
+                or not self._device_is_present(device)
+            ):
+                if device in self._blacklisted_devices:
                     print(
-                        f"[warn] configured audio device {device} is not available; "
-                        f"falling back to system default microphone",
+                        f"[warn] configured audio device {device} previously failed; "
+                        f"trying alternative",
                         file=sys.stderr,
                         flush=True,
                     )
-                device = fallback
-            # Try opening the stream. The retry strategy depends on
-            # WHY the open failed:
-            #
-            # - If the device is still present (query_devices succeeds),
-            #   the failure is likely transient (ALSA state glitch, a
-            #   momentary resource conflict). Retry the SAME device —
-            #   don't switch. Switching on a transient error causes
-            #   the user's configured mic to be silently abandoned
-            #   just because ALSA had a one-time hiccup.
-            #
-            # - If the device is gone (query_devices fails), it's a
-            #   real hardware change. Switch to the next available
-            #   device, excluding ones that already failed.
-            #
-            # - If all specific devices are exhausted, try system
-            #   default (device=None) as a last resort.
-            failed_devices: set[int] = set()
-            last_exc: Exception | None = None
-            for attempt in range(max(self.mic_open_retries, 0) + 1):
-                try:
-                    self._stream = sd.InputStream(
-                        samplerate=self.sample_rate,
-                        channels=self.channels,
-                        dtype="float32",
-                        device=device,
-                        callback=self._on_audio,
+                else:
+                    print(
+                        f"[warn] configured audio device {device} is not available",
+                        file=sys.stderr,
+                        flush=True,
                     )
-                    self._stream.start()
-                    self._recording = True
-                    return
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt >= max(self.mic_open_retries, 0):
-                        break
-                    # Close any half-open stream from the failed attempt.
-                    if self._stream is not None:
-                        leaked = self._stream
-                        self._stream = None
-                        try:
-                            leaked.close()
-                        except Exception:
-                            pass
-                    # Is the device still present? If yes, retry the
-                    # SAME device — this is a transient failure, not a
-                    # hardware change. Don't switch.
-                    if device is not None and self._device_is_present(device):
-                        continue
-                    # The device is gone (or was None and the default
-                    # failed). Switch to the next available device,
-                    # excluding everything that already failed.
-                    if device is not None:
-                        failed_devices.add(device)
-                    next_device: int | None = None
-                    if self.mic_failover_scan:
-                        scanned = self._find_fallback_device(exclude=failed_devices)
-                        if scanned is not None:
-                            next_device = scanned
-                    # If no specific fallback device was found, try
-                    # system default (device=None) as a last resort.
-                    # Only do this once — if the default also fails,
-                    # we're done.
-                    if next_device is None and None not in failed_devices:
-                        next_device = None
-                    elif next_device is None:
-                        # Even the system default already failed — give up.
-                        break
-                    if next_device != device:
-                        print(
-                            f"[warn] audio device {device} failed to open; "
-                            f"trying device {next_device if next_device is not None else 'default'}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    device = next_device
-            # All retries exhausted — close any half-open stream and
-            # surface the error.
-            if self._stream is not None:
-                leaked = self._stream
-                self._stream = None
+                device = None
+                self._default_blacklisted = False
+                replaced_configured = True
+            if device is None and self.mic_failover_scan:
+                # Fall back to scanning only when (a) a configured
+                # device was pinned but failed/went missing, or (b)
+                # the system default itself failed on a previous
+                # press. When the user left device=null (unconfigured)
+                # and the default hasn't failed before, use the system
+                # default as-is — it may be a pipewire bridge that is
+                # perfectly usable at its native rate.
+                if replaced_configured or self._default_blacklisted:
+                    scanned = self._find_fallback_device(
+                        exclude=self._blacklisted_devices
+                    )
+                    if scanned is not None:
+                        device = scanned
+            # Determine the sample rate to use. Try the target rate
+            # (16kHz) first, but if the device is known to not support
+            # it, use the device's native rate and resample later.
+            # We query the device's default sample rate upfront so we
+            # only call InputStream() ONCE — calling it multiple times
+            # in a single press corrupts PortAudio state (-9999).
+            open_rate = self.sample_rate
+            if device is not None:
                 try:
-                    leaked.close()
+                    dev_info = sd.query_devices(device)
+                    native_rate = int(dev_info["default_samplerate"])
+                    if native_rate != self.sample_rate:
+                        # The device's default rate differs from our
+                        # target. We'll try the native rate — most ALSA
+                        # devices only support their default rate, not
+                        # arbitrary rates. If 16kHz isn't in the
+                        # supported list, using it will fail and
+                        # corrupt PortAudio.
+                        open_rate = native_rate
                 except Exception:
                     pass
-            reason = _describe_audio_error(last_exc) if last_exc else "unknown"
-            print(
-                f"[error] could not open audio input stream: {reason}. "
-                f"Check that a microphone is connected and that speakinput "
-                f"has Microphone permission in System Settings → Privacy "
-                f"& Security → Microphone. If a USB/Bluetooth mic is "
-                f"configured, try setting `device = null` in config.toml "
-                f"to use the system default instead. (Original error: "
-                f"{type(last_exc).__name__}: {last_exc})",
-                file=sys.stderr,
-                flush=True,
-            )
-            self._recording = False
-            raise AudioError(
-                f"audio stream open failed: {reason}"
-            ) from last_exc
+            elif device is None:
+                # System default — query the default device's rate.
+                try:
+                    default_info = sd.query_devices(sd.default.device[0])
+                    native_rate = int(default_info["default_samplerate"])
+                    if native_rate != self.sample_rate:
+                        open_rate = native_rate
+                except Exception:
+                    pass
+            self._capture_sample_rate = open_rate
+            # Try to open the stream — exactly ONE InputStream() call.
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=open_rate,
+                    channels=self.channels,
+                    dtype="float32",
+                    device=device,
+                    callback=self._on_audio,
+                )
+                self._stream.start()
+                self._recording = True
+                if open_rate != self.sample_rate:
+                    print(
+                        f"[info] recording at {open_rate}Hz "
+                        f"(device doesn't support {self.sample_rate}Hz; "
+                        f"will resample)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                self._blacklisted_devices.clear()
+                self._default_blacklisted = False
+                return
+            except Exception as exc:
+                # Close any half-open stream.
+                if self._stream is not None:
+                    leaked = self._stream
+                    self._stream = None
+                    try:
+                        leaked.close()
+                    except Exception:
+                        pass
+                # Single failure — blacklist and report. No second
+                # InputStream() attempt (would corrupt PortAudio).
+                if device is not None:
+                    self._blacklisted_devices.add(device)
+                else:
+                    # The system default failed — remember it so the
+                    # next press scans for a real hardware device
+                    # instead of trying the broken default again.
+                    self._default_blacklisted = True
+                reason = _describe_audio_error(exc)
+                print(
+                    f"[error] could not open audio input stream: {reason}. "
+                    f"Check that a microphone is connected and that speakinput "
+                    f"has Microphone permission in System Settings → Privacy "
+                    f"& Security → Microphone. If a USB/Bluetooth mic is "
+                    f"configured, try setting `device = null` in config.toml "
+                    f"to use the system default instead. (Original error: "
+                    f"{type(exc).__name__}: {exc})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._recording = False
+                raise AudioError(
+                    f"audio stream open failed: {reason}"
+                ) from exc
 
     def _on_audio(self, indata, frames, time, status) -> None:  # noqa: ANN001 (sounddevice API)
         # PortAudio's contract is that the callback MUST NOT raise:
@@ -421,7 +472,13 @@ class AudioRecorder:
             self._last_rms = 0.0
         if not chunks:
             return np.zeros(0, dtype=np.float32)
-        return np.concatenate(chunks).astype(np.float32, copy=False)
+        audio = np.concatenate(chunks).astype(np.float32, copy=False)
+        # Resample if the capture rate differs from the target rate
+        # (whisper needs 16kHz). We open at the device's native rate
+        # when it doesn't support 16kHz natively, then resample here.
+        if self._capture_sample_rate != self.sample_rate and audio.size > 0:
+            audio = _resample(audio, self._capture_sample_rate, self.sample_rate)
+        return audio
 
     def close(self) -> None:
         """Stop and close the PortAudio stream. Idempotent.
