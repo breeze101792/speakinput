@@ -289,6 +289,146 @@ def test_mic_open_retries_tries_multiple_devices(fake_sd):
     assert r.is_recording()
 
 
+def test_mic_failover_excludes_broken_device_from_retry(fake_sd, capsys):
+    """When a fallback device fails to open AND is confirmed gone
+    (query_devices raises), the retry loop must NOT try the same
+    device again — it should exclude it and pick the next one.
+
+    This is the bug the user hit: _find_fallback_device kept returning
+    the same broken device, PortAudio hammered it 3 times, and
+    crashed with -9999 (not initialized).
+
+    Note: if the device is still present (query_devices succeeds),
+    a transient open failure retries the SAME device — no switch.
+    The switch only happens when the device is confirmed gone.
+    """
+    from speakinput.audio import AudioRecorder
+
+    # Two input devices: index 0 is gone (query_devices raises), index 1
+    # works. _find_fallback_device picks index 1 (only input device left
+    # after index 0 is excluded).
+    device_list = [
+        {"name": "Gone Mic", "max_input_channels": 2, "default_samplerate": 48000.0},
+        {"name": "Working USB", "max_input_channels": 1, "default_samplerate": 16000.0},
+    ]
+
+    def query_side_effect(*args):
+        if args:
+            idx = int(args[0])
+            if idx == 0:
+                # Device 0 is gone — query raises.
+                raise Exception("device 0 not found")
+            return device_list[idx]
+        return device_list
+
+    fake_sd.query_devices.side_effect = query_side_effect
+
+    # InputStream fails for device 0, succeeds for device 1.
+    def input_stream_side_effect(**kwargs):
+        dev = kwargs.get("device")
+        if dev == 0:
+            raise OSError("PaAlsaStream_Configure failed")
+        return MagicMock()
+
+    fake_sd.InputStream.side_effect = input_stream_side_effect
+
+    r = AudioRecorder(device=0, mic_failover_scan=True, mic_open_retries=2)
+    r.start()
+    # The recorder should have tried device 0 (failed, confirmed gone
+    # via query_devices), then device 1 (succeeded) — NOT retried
+    # device 0 three times.
+    devices_tried = [
+        call.kwargs["device"]
+        for call in fake_sd.InputStream.call_args_list
+    ]
+    # Device 0 should appear at most once.
+    assert devices_tried.count(0) == 1
+    # Device 1 should be tried and succeed.
+    assert 1 in devices_tried
+    assert r.is_recording()
+
+
+def test_mic_transient_failure_retries_same_device(fake_sd, capsys):
+    """When InputStream fails but the device is still present
+    (query_devices succeeds), the retry loop should retry the SAME
+    device — NOT switch to a different one. A transient ALSA error
+    is not evidence of a hardware change; switching on it would
+    silently abandon the user's configured mic."""
+    from speakinput.audio import AudioRecorder
+
+    # Device 0 is present (query_devices succeeds) but InputStream
+    # fails twice then succeeds on the third try.
+    fake_sd.query_devices.return_value = [
+        {"name": "Flaky ALSA", "max_input_channels": 1, "default_samplerate": 16000.0},
+        {"name": "Other Mic", "max_input_channels": 1, "default_samplerate": 16000.0},
+    ]
+    fake_sd.query_devices.side_effect = lambda *args: (
+        fake_sd.query_devices.return_value[int(args[0])]
+        if args else
+        fake_sd.query_devices.return_value
+    )
+    call_count = {"n": 0}
+
+    def input_stream_side_effect(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            raise OSError("transient ALSA glitch")
+        return MagicMock()
+
+    fake_sd.InputStream.side_effect = input_stream_side_effect
+
+    r = AudioRecorder(device=0, mic_failover_scan=True, mic_open_retries=3)
+    r.start()
+    # All three attempts should have been on device 0 — no switch.
+    devices_tried = [
+        call.kwargs["device"]
+        for call in fake_sd.InputStream.call_args_list
+    ]
+    assert all(d == 0 for d in devices_tried)
+    assert r.is_recording()
+    # No "switching" or "trying device" warning should have fired.
+    captured = capsys.readouterr()
+    assert "switching to device" not in captured.err
+    assert "trying device" not in captured.err
+
+
+def test_mic_failover_falls_to_system_default_after_all_devices_fail(fake_sd, capsys):
+    """When every specific input device is confirmed gone, the retry
+    loop should try the system default (device=None) as a last resort
+    before giving up."""
+    from speakinput.audio import AudioRecorder
+
+    # Device 0 is gone (query_devices(0) raises), and the fallback
+    # scan finds no other input device. The system default should be
+    # tried as a last resort.
+    device_list = [
+        {"name": "Gone Mic", "max_input_channels": 0, "default_samplerate": 16000.0},
+    ]
+
+    def query_side_effect(*args):
+        if args:
+            idx = int(args[0])
+            if idx == 0:
+                raise Exception("device 0 not found")
+            return device_list[idx]
+        return device_list
+
+    fake_sd.query_devices.side_effect = query_side_effect
+
+    # InputStream succeeds for device=None (system default).
+    fake_sd.InputStream.return_value = MagicMock()
+
+    r = AudioRecorder(device=0, mic_failover_scan=True, mic_open_retries=2)
+    r.start()
+    # Should have tried device=None (system default) and succeeded.
+    devices_tried = [
+        call.kwargs["device"]
+        for call in fake_sd.InputStream.call_args_list
+    ]
+    assert None in devices_tried
+    assert r.is_recording()
+
+
 # --- Engine registry -------------------------------------------------------
 
 
