@@ -30,7 +30,7 @@ Speak Input then checks whether the configured model file is present. If not, it
 
 ## Model management
 
-Model files are downloaded into pywhispercpp's cache directory, typically `~/Library/Application Support/pywhispercpp/models/`. By default Speak Input uses the `small` model (~466 MB, multilingual) so it works for English *and* Chinese out of the box. With two profiles, that single `small` file is loaded once and shared between the two `WhisperCppTranscriber` instances — so a typical two-language setup costs ~466 MB resident, not 932 MB. To see the curated model list, run `speakinput -L`.
+Model files are downloaded into pywhispercpp's cache directory (`~/Library/Application Support/pywhispercpp/models/` on macOS, `~/.cache/pywhispercpp/models/` on Linux). By default Speak Input uses the `small` model (~466 MB, multilingual) so it works for English *and* Chinese out of the box. With two profiles, that single `small` file is loaded once and shared between the two `WhisperCppTranscriber` instances — so a typical two-language setup costs ~466 MB resident, not 932 MB. To see the curated model list, run `speakinput -L`.
 
 ```bash
 speakinput -L                     # show the curated list
@@ -463,7 +463,7 @@ To change the model and language, edit the per-profile sections:
 
 ```toml
 [profile.primary]
-model = "small"        # tiny.en | base.en | small.en | tiny | base | small | medium
+model = "small"        # tiny.en | base.en | small.en | tiny | base | small | medium | large-v3
 language = "auto"      # auto | en | zh
 
 [profile.secondary]

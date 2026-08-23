@@ -120,7 +120,7 @@ section controls each independently.
 | **Hotkey listener dies**    | Liveness watcher restarts it   | `listener_restart_min_interval_s` |
 | **Event worker dies**       | Liveness watcher restarts it   | automatic                          |
 | **macOS CGEventTap disabled** | Self-heal monkey-patch re-enables tap | automatic              |
-| **System sleep**            | Clock-skew detection, restart all listeners | automatic          |
+| **System sleep**            | Clock-skew detection, close recorder (listener self-heal handles taps) | automatic |
 | **Stuck press (release lost)** | `_abort_press` discards buffer, releases lock | automatic      |
 | **Stuck press (processing hang)** | Busy-lock watchdog fires `_abort_press` after timeout | `busy_lock_timeout_s` |
 | **Media resume hangs**      | Bounded thread join (3s)       | automatic                          |
@@ -178,9 +178,10 @@ default).
 ### OS-aware model setup
 
 - **whispercpp**: downloads `.bin` model files from Hugging Face via
-  `pywhispercpp.utils.download_model()`. Cached in
-  `~/.cache/pywhispercpp/models/`. Only downloads if the file is
-  missing — subsequent runs reuse the cache.
+  `pywhispercpp.utils.download_model()`. Cached in pywhispercpp's
+  cache directory (`~/Library/Application Support/pywhispercpp/models/`
+  on macOS, `~/.cache/pywhispercpp/models/` on Linux). Only downloads
+  if the file is missing — subsequent runs reuse the cache.
 - **faster_whisper**: downloads from Hugging Face via CTranslate2's
   model loader. Cached in `~/.cache/huggingface/`. Same models as
   `openai/whisper` (converted to CTranslate2 format).
@@ -273,9 +274,14 @@ called:
 ### Layer 3: Sleep detection
 
 The watcher also detects system sleep via wall-clock vs monotonic-clock
-skew. When the skew exceeds 5s, `_on_system_sleep()` restarts **every**
-listener (macOS disables all CGEventTaps across sleep) and aborts any
-active press.
+skew. When the skew exceeds 5s, `_on_system_sleep()` closes the audio
+recorder (the CoreAudio HAL reinitializes and drops the stream) and
+aborts any active press. It does NOT restart listeners directly — the
+old listener's `CGEventTapEnable(tap, False)` cleanup in `_mac_tap_heal.py`'s
+finally block would race with a new listener's tap enable. Instead, the
+self-heal mechanism (Layer 1) re-enables the existing tap within ~1s.
+If self-healing fails, the heartbeat backstop (Layer 2) detects the
+dead listener and restarts it.
 
 ### Layer 4: Event worker liveness
 
