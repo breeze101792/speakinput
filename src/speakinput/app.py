@@ -99,6 +99,59 @@ def _dbg(enabled: bool, msg: str) -> None:
         print(f"[debug] {msg}", file=sys.stderr, flush=True)
 
 
+def _bounded_call(fn, *args, timeout_s: float, name: str, **kwargs) -> tuple[bool, Any]:
+    """Run `fn(*args, **kwargs)` on a helper thread with a bounded join.
+
+    Returns `(success, result)`. If `fn` returns within `timeout_s`,
+    `success` is True and `result` is the return value. If it doesn't,
+    `success` is False and `result` is None — the helper thread is a
+    daemon and is abandoned (it dies with the process, or finishes
+    later and its result is discarded).
+
+    Used to bound native calls that can hang indefinitely: whisper
+    inference (GPU hang, CUDA OOM recovery, Vulkan device-lost, Metal
+    command buffer stuck) and pynput inject (HID event system wedged
+    after sleep, focused app unresponsive). A hang in either holds
+    the event worker thread and the busy lock forever — every later
+    press is silently ignored as "already busy" and the only way out
+    is a manual restart. The bounded call turns that hang into a
+    recoverable failure: the caller logs, releases the lock, and the
+    next press works.
+
+    The thread is a daemon so it never blocks process exit. The
+    `name` parameter shows up in thread dumps (faulthandler on the
+    second Ctrl-C) so the user can see which call hung.
+    """
+    if timeout_s <= 0:
+        return True, fn(*args, **kwargs)
+    box: list[Any] = [None]
+    error: list[BaseException | None] = [None]
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            box[0] = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            error[0] = exc
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_runner, name=f"speakinput-{name}", daemon=True)
+    t.start()
+    if done.wait(timeout_s):
+        if error[0] is not None:
+            raise error[0]
+        return True, box[0]
+    print(
+        f"[warn] {name} did not finish in {timeout_s:.0f}s — abandoning "
+        f"it and continuing. This usually follows a GPU hang or a wedged "
+        f"HID/clipboard subsystem.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return False, None
+
+
 def _probe_evdev_or_diag() -> tuple[bool, str | None]:
     """Run the evdev availability probe and return both the result AND
     the error message if it failed.
@@ -178,6 +231,12 @@ class _LivenessWatcher:
         on_dead,
         on_sleep=None,
         sleep_threshold_s: float = 5.0,
+        worker_thread: threading.Thread | None = None,
+        on_worker_dead=None,
+        busy_lock: threading.Lock | None = None,
+        press_started_at=None,
+        busy_lock_timeout_s: float = 0.0,
+        on_busy_stuck=None,
     ) -> None:
         self._listeners = listeners
         self._interval_s = interval_s
@@ -210,6 +269,35 @@ class _LivenessWatcher:
         # re-sampled every poll tick.
         self._last_mono: float | None = None
         self._last_wall: float | None = None
+        # Event worker liveness monitoring. The worker thread runs
+        # press/release bodies; if it dies (an edge case the try/except
+        # in _event_worker_main doesn't catch, or a future bug), every
+        # press is silently enqueued and never processed. The watcher
+        # polls `worker_thread.is_alive()` and fires `on_worker_dead`
+        # once on the alive->dead transition so the App can restart it.
+        self._worker_thread = worker_thread
+        self._on_worker_dead = on_worker_dead
+        self._worker_was_alive = True
+        # Busy-lock watchdog. The universal backstop for ANY hang in
+        # the processing pipeline: a transcribe hang, an inject hang,
+        # a model reload hang, or any future code path that holds the
+        # busy lock too long. When the lock has been held continuously
+        # for longer than `busy_lock_timeout_s`, `on_busy_stuck` is
+        # invoked so the App can fire _abort_press and release the
+        # lock. Without this, a stuck press makes every later press
+        # silently ignored as "already busy" and the only way out is
+        # a manual restart. `press_started_at` is a callable returning
+        # the monotonic timestamp the current press started (or None
+        # when no press is active) so the watcher can read it fresh
+        # each tick without holding a reference to a stale closure.
+        self._busy_lock = busy_lock
+        self._press_started_at = press_started_at
+        self._busy_lock_timeout_s = busy_lock_timeout_s
+        self._on_busy_stuck = on_busy_stuck
+        # Fire on_busy_stuck at most once per stuck episode so we
+        # don't enqueue multiple aborts. Reset when the lock is
+        # released (the next poll sees it unheld).
+        self._busy_stuck_fired = False
 
     def start(self) -> None:
         if self._thread is not None:
@@ -244,6 +332,16 @@ class _LivenessWatcher:
         self._heartbeat_wedged.pop(id(old), None)
         self._heartbeat_wedged[id(new)] = False
 
+    def swap_worker(self, new_worker: threading.Thread) -> None:
+        """Replace the event worker thread after a restart.
+
+        Called by `App._restart_event_worker` after spinning up a fresh
+        worker. Resets the alive-transition tracking so the new worker's
+        future death fires `on_worker_dead` exactly once.
+        """
+        self._worker_thread = new_worker
+        self._worker_was_alive = True
+
     def _check_sleep(self) -> None:
         now_mono = time.monotonic()
         now_wall = time.time()
@@ -264,6 +362,8 @@ class _LivenessWatcher:
         while not self._stop_event.wait(self._interval_s):
             try:
                 self._check_sleep()
+                self._check_worker()
+                self._check_busy_lock()
                 now = time.monotonic()
                 for listener in self._listeners:
                     key = getattr(listener, "_key", None) or getattr(
@@ -322,6 +422,77 @@ class _LivenessWatcher:
                 # A watcher that dies silently is worse than any single
                 # bad poll — keep looping so the next tick gets a shot.
                 log.exception("liveness poll failed")
+
+    def _check_worker(self) -> None:
+        """Poll the event worker thread and fire `on_worker_dead` once.
+
+        The event worker runs press/release bodies on a single thread.
+        If it dies (an edge case the try/except in
+        `_event_worker_main` doesn't catch, or a future bug), every
+        press is silently enqueued and never processed — the user's
+        hotkey does nothing and there's no visible signal. The watcher
+        polls `worker_thread.is_alive()` and fires `on_worker_dead`
+        on the alive->dead transition so the App can restart it.
+        """
+        if self._worker_thread is None or self._on_worker_dead is None:
+            return
+        alive = self._worker_thread.is_alive()
+        if self._worker_was_alive and not alive:
+            self._worker_was_alive = False
+            try:
+                self._on_worker_dead()
+            except Exception:
+                log.exception("on_worker_dead callback failed")
+        # Update the tracked state so a future restart (swap_worker)
+        # re-arms the transition. Don't set alive=True here when the
+        # thread is alive — swap_worker does that explicitly.
+        if not alive:
+            return
+
+    def _check_busy_lock(self) -> None:
+        """Universal backstop: abort a press that's been stuck too long.
+
+        If the busy lock has been held continuously for longer than
+        `busy_lock_timeout_s`, fire `on_busy_stuck` so the App can
+        abort the press and release the lock. This catches ANY hang in
+        the processing pipeline — a transcribe hang, an inject hang, a
+        model reload hang, or any future code path that holds the lock
+        too long. Without it, a stuck press makes every later press
+        silently ignored as "already busy" and the only way out is a
+        manual restart.
+
+        Fires at most once per stuck episode. The flag resets when the
+        lock is released (the next poll sees it unheld).
+        """
+        if (
+            self._busy_lock is None
+            or self._on_busy_stuck is None
+            or self._busy_lock_timeout_s <= 0
+        ):
+            return
+        held = self._busy_lock.locked()
+        if not held:
+            self._busy_stuck_fired = False
+            return
+        # Read the press start time fresh each tick via the callable
+        # so we always see the current state (the App mutates
+        # `_press_started_at` directly on press/abort).
+        started = self._press_started_at() if self._press_started_at is not None else None
+        if started is None:
+            # Lock is held but no press is recorded — the press
+            # callback is mid-acquire (between `acquire()` and setting
+            # `_press_started_at`). This window is microseconds; skip
+            # this tick and check again next poll.
+            return
+        if self._busy_stuck_fired:
+            return
+        held_for = time.monotonic() - started
+        if held_for >= self._busy_lock_timeout_s:
+            self._busy_stuck_fired = True
+            try:
+                self._on_busy_stuck(held_for)
+            except Exception:
+                log.exception("on_busy_stuck callback failed")
 
 
 class _Heartbeat:
@@ -817,7 +988,10 @@ class App:
         self._active_profile = None
         self._manual_release_pending = False
         self._watchdog = None
-        self.feedback.set_state("idle")
+        try:
+            self.feedback.set_state("idle")
+        except Exception:
+            pass
 
     def _process_and_inject(self, audio: np.ndarray, profile: Profile | None) -> None:
         """Trim, silence-gate, transcribe, and inject a chunk of audio.
@@ -929,8 +1103,32 @@ class App:
                     # minutes. Acquired OUTSIDE the injector's own
                     # internal lock so we never deadlock with the
                     # injector's clip-restore scheduling path.
+                    #
+                    # The inject itself is bounded by
+                    # `recovery.inject_timeout_s`. The subprocess-based
+                    # backends (wtype, ydotool, pbcopy) are already
+                    # bounded by _SUBPROCESS_TIMEOUT_S inside the
+                    # injector; this bound covers the pynput path
+                    # (TypingInjector), which has no internal timeout
+                    # and can hang indefinitely when the HID event
+                    # system wedges (observed after sleep/wake, during
+                    # focus churn). A hang here holds the event worker
+                    # and the busy lock forever — the bounded call
+                    # turns it into a recoverable failure.
                     with self._inject_lock:
-                        self.injector.inject(text)
+                        ok, _ = _bounded_call(
+                            self.injector.inject,
+                            text,
+                            timeout_s=self.config.recovery.inject_timeout_s,
+                            name="inject",
+                        )
+                        if not ok:
+                            log.warning(
+                                "inject exceeded %.0fs timeout; "
+                                "text was not typed. The HID/clipboard "
+                                "subsystem may be wedged.",
+                                self.config.recovery.inject_timeout_s,
+                            )
                 except Exception:
                     log.exception("injection failed")
 
@@ -1006,28 +1204,50 @@ class App:
         profile: Profile,
         prompt: str,
     ) -> str:
-        """Transcribe audio with automatic crash recovery.
+        """Transcribe audio with automatic crash + hang recovery.
 
-        If transcribe() raises, reload the model and retry up to
-        `recovery.transcribe_retries` times with backoff. This handles
-        the case where the whisper model gets into a bad state (GPU
-        memory corruption, a corrupted model file, a native crash in
-        the inference engine) — reloading clears the state and the
-        retry has a good chance of succeeding.
+        Two recovery dimensions:
 
-        The user never sees a "transcription failed" error unless
-        ALL retries are exhausted. The audio chunk is preserved across
+        1. **Crash** — if transcribe() raises, reload the model and
+           retry up to `recovery.transcribe_retries` times with backoff.
+           Handles a whisper model in a bad state (GPU memory
+           corruption, corrupted model file, native crash). Reloading
+           clears the state and the retry usually succeeds.
+
+        2. **Hang** — if transcribe() takes longer than
+           `recovery.transcribe_timeout_s`, abandon it. The native
+           call is wedged (GPU hang, CUDA OOM recovery, Vulkan
+           device-lost, Metal command buffer stuck) and will never
+           return. Without the timeout, a hang here holds the event
+           worker and the busy lock forever — every later press is
+           silently ignored as "already busy" and the only way out is
+           a manual restart. The timeout turns the hang into a
+           recoverable failure: we treat it like a crash (reload +
+           retry) so the next attempt gets a fresh model instance.
+
+        The user never sees a "transcription failed" error unless ALL
+        retries are exhausted. The audio chunk is preserved across
         retries (it's just a numpy array, not tied to the model).
         """
         retries = self.config.recovery.transcribe_retries
         backoff = self.config.recovery.transcribe_backoff_s
+        timeout = self.config.recovery.transcribe_timeout_s
         last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                return transcriber.transcribe(
+                ok, text = _bounded_call(
+                    transcriber.transcribe,
                     audio,
                     self.config.audio.sample_rate,
                     initial_prompt=prompt or None,
+                    timeout_s=timeout,
+                    name="transcribe",
+                )
+                if ok:
+                    return text  # type: ignore[return-value]
+                # Timed out — treat like a crash: reload + retry.
+                raise TimeoutError(
+                    f"transcribe exceeded {timeout:.0f}s timeout"
                 )
             except Exception as exc:
                 last_exc = exc
@@ -1051,18 +1271,28 @@ class App:
         return ""
 
     def _reload_transcriber(self, profile: Profile) -> Transcriber | None:
-        """Reload the transcriber for `profile` after a crash.
+        """Reload the transcriber for `profile` after a crash or hang.
 
         Reconstructs the transcriber from scratch (re-downloads the
         model if it was deleted, re-initializes the engine). On
         success, updates the `self.transcribers` dict so subsequent
         presses use the fresh instance. On failure, returns None and
         the caller falls back to the old (possibly wedged) instance.
+
+        The reload itself is bounded by the transcribe timeout: a
+        GPU init hang (driver wedged, CUDA context lost) would
+        otherwise hold the event worker and the busy lock forever,
+        defeating the recovery the reload is supposed to provide.
+        The model download is NOT bounded (it can legitimately take
+        minutes on a slow connection) — but the download only happens
+        once, and a hang there is a network issue the user can see.
         """
         try:
             model_name, _ = resolve_for_language(profile.model, profile.language)
             model_path = ensure_model(model_name)
-            new_t = create_transcriber(
+            timeout = self.config.recovery.transcribe_timeout_s
+            ok, new_t = _bounded_call(
+                create_transcriber,
                 engine=self.config.transcribe.engine,
                 model=model_path,
                 language=profile.language,
@@ -1071,14 +1301,23 @@ class App:
                 use_gpu=self.config.transcribe.use_gpu,
                 gpu_device=self.config.transcribe.gpu_device,
                 n_threads=self.config.transcribe.n_threads,
+                timeout_s=timeout,
+                name="transcriber-reload",
             )
-            self.transcribers[profile.key] = new_t
+            if not ok:
+                log.warning(
+                    "transcriber reload for %r exceeded %.0fs timeout",
+                    profile.key,
+                    timeout,
+                )
+                return None
+            self.transcribers[profile.key] = new_t  # type: ignore[assignment]
             print(
                 f"[info] transcriber for {profile.key!r} reloaded successfully",
                 file=sys.stderr,
                 flush=True,
             )
-            return new_t
+            return new_t  # type: ignore[return-value]
         except Exception:
             log.exception("transcriber reload failed for %r", profile.key)
             return None
@@ -1151,6 +1390,98 @@ class App:
                     "hotkey event handler failed: %s",
                     getattr(fn, "__name__", repr(fn)),
                 )
+
+    def _restart_event_worker(self) -> bool:
+        """Recreate the event worker thread after it died.
+
+        The liveness watcher detects a dead worker (via
+        `_check_worker`) and calls `_on_worker_dead`, which enqueues
+        this restart. The old thread reference is replaced; the
+        queue is NOT drained (any enqueued press/release events are
+        lost, but the lock state is preserved — a dead worker mid-
+        press leaves the busy lock held, which the busy-lock
+        watchdog will abort). Returns True on success.
+        """
+        if self._shutdown.is_set():
+            return False
+        self._worker_thread = None
+        try:
+            self._worker_thread = threading.Thread(
+                target=self._event_worker_main,
+                name="speakinput-events",
+                daemon=True,
+            )
+            self._worker_thread.start()
+        except Exception:
+            log.exception("failed to restart event worker")
+            return False
+        if self._liveness_watcher is not None:
+            self._liveness_watcher.swap_worker(self._worker_thread)
+        print(
+            "[info] event worker died and was restarted",
+            file=sys.stderr,
+            flush=True,
+        )
+        return True
+
+    def _on_worker_dead(self) -> None:
+        """Liveness callback: the event worker thread died.
+
+        The worker's try/except in `_event_worker_main` catches
+        exceptions from individual handlers, so a dead worker means
+        something killed the thread itself (a native crash inside
+        whisper/pynput that escaped the Python-level catch, or an
+        uncaught BaseException like SystemExit). Restart it; if the
+        restart fails, warn the user — the hotkey is dead until they
+        restart speakinput.
+        """
+        if self._shutdown.is_set():
+            return
+        restarted = self._restart_event_worker()
+        if not restarted:
+            print(
+                "[warn] event worker is no longer alive and could not be "
+                "restarted — the hotkey will not respond. Restart "
+                "speakinput to recover.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _on_busy_stuck(self, held_for: float) -> None:
+        """Liveness callback: the busy lock has been held too long.
+
+        The universal backstop for ANY hang in the processing pipeline
+        — a transcribe hang (GPU wedge), an inject hang (HID wedge), a
+        model reload hang, or any future code path that holds the lock
+        too long. Fires `_abort_press` on the event worker (or inline
+        if the worker is dead) to release the lock, close the
+        recorder, and reset the press state. The buffered audio is
+        discarded — it may contain arbitrarily long ambient audio, and
+        transcribing it would stall the worker for minutes.
+
+        Enqueued on the event worker so it's serialized with any
+        in-flight handler (the abort's body-lock acquire waits for a
+        chunked body to finish its drain). If the worker is dead, run
+        the abort inline — the lock is already held by the dead
+        worker's orphaned handler, and _abort_press's body-lock
+        acquire will time out gracefully.
+        """
+        if self._shutdown.is_set():
+            return
+        print(
+            f"[warn] busy lock held for {held_for:.0f}s — aborting stuck "
+            f"press to recover. This usually means a transcribe or inject "
+            f"call hung (GPU/HID wedge).",
+            file=sys.stderr,
+            flush=True,
+        )
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._enqueue_event(self._abort_press, "busy lock watchdog timeout")
+        else:
+            # Worker is dead — run the abort inline. The body-lock
+            # acquire may fail (the dead worker's handler is still
+            # holding it), but _abort_press handles that gracefully.
+            self._abort_press("busy lock watchdog timeout (worker dead)")
 
     def _abort_press(self, reason: str = "") -> None:
         """Cancel an in-flight press whose release event will never arrive.
@@ -1545,11 +1876,23 @@ class App:
         # `_on_system_sleep`); only a failed restart warns the user to
         # restart the app. Daemon so it dies with the process; the
         # checks are cheap (one bool per listener, two clock reads).
+        #
+        # The watcher also monitors the event worker thread (restarts it
+        # if it dies) and the busy lock (aborts a press that's been
+        # stuck too long — the universal backstop for ANY hang in the
+        # processing pipeline). Both are off when the corresponding
+        # config field is 0.
         self._liveness_watcher = _LivenessWatcher(
             listeners=list(self.listeners.values()),
             interval_s=5.0,
             on_dead=self._on_listener_dead,
             on_sleep=self._on_system_sleep,
+            worker_thread=self._worker_thread,
+            on_worker_dead=self._on_worker_dead,
+            busy_lock=self._busy,
+            press_started_at=lambda: self._press_started_at,
+            busy_lock_timeout_s=self.config.recovery.busy_lock_timeout_s,
+            on_busy_stuck=self._on_busy_stuck,
         )
         self._liveness_watcher.start()
         # Heartbeat: print a one-line "still here" every 60s in debug

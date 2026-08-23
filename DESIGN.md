@@ -112,12 +112,17 @@ section controls each independently.
 | **Mic open fails**          | Retry with fallback device     | `mic_open_retries`                |
 | **PortAudio stream wedges** | Bounded close (1.5s timeout), abandon | `_CLOSE_JOIN_TIMEOUT_S`    |
 | **Transcriber crashes**     | Reload model, retry transcribe | `transcribe_retries`, `transcribe_backoff_s` |
+| **Transcriber hangs**       | Bounded transcribe (helper thread + join), abandon, reload+retry | `transcribe_timeout_s` |
+| **Transcriber reload hangs**| Bounded reload (same helper-thread mechanism) | `transcribe_timeout_s` |
 | **Engine package missing**  | Fall back to whispercpp        | `transcribe.engine`               |
 | **Injector fails at runtime** | FallbackInjector tries next backend | `injector_fallback`          |
+| **Injector hangs (pynput HID wedge)** | Bounded inject (helper thread + join), abandon, release lock | `inject_timeout_s` |
 | **Hotkey listener dies**    | Liveness watcher restarts it   | `listener_restart_min_interval_s` |
+| **Event worker dies**       | Liveness watcher restarts it   | automatic                          |
 | **macOS CGEventTap disabled** | Self-heal monkey-patch re-enables tap | automatic              |
 | **System sleep**            | Clock-skew detection, restart all listeners | automatic          |
 | **Stuck press (release lost)** | `_abort_press` discards buffer, releases lock | automatic      |
+| **Stuck press (processing hang)** | Busy-lock watchdog fires `_abort_press` after timeout | `busy_lock_timeout_s` |
 | **Media resume hangs**      | Bounded thread join (3s)       | automatic                          |
 | **Clipboard write fails**   | Skip Unicode inject, warn user | automatic                          |
 | **Subprocess hangs**        | 5s timeout on all shell-outs   | `_SUBPROCESS_TIMEOUT_S`           |
@@ -240,7 +245,7 @@ chain is a single element and `FallbackInjector` is transparent.
 
 ## Listener Self-Healing
 
-Three layers of defense keep the hotkey alive:
+Five layers of defense keep the hotkey alive:
 
 ### Layer 1: CGEventTap self-heal (macOS only)
 
@@ -254,9 +259,9 @@ Detection latency: ~1s (the run loop polls with a 1s timeout).
 
 A background thread (`_LivenessWatcher`) polls every 5s:
 - `listener.is_running()` — is the thread alive?
-- `listener.last_event_at()` — has any event arrived in the last 300s?
+- `listener.last_event_at()` — has any event arrived in the last 30s?
 
-If the thread is dead OR no events have arrived for 300s (the tap is
+If the thread is dead OR no events have arrived for 30s (the tap is
 wedged in a way the self-heal can't fix), `_on_listener_dead(key)` is
 called:
 1. Try to restart the listener (`_restart_listener`).
@@ -271,6 +276,36 @@ The watcher also detects system sleep via wall-clock vs monotonic-clock
 skew. When the skew exceeds 5s, `_on_system_sleep()` restarts **every**
 listener (macOS disables all CGEventTaps across sleep) and aborts any
 active press.
+
+### Layer 4: Event worker liveness
+
+The same watcher polls the event worker thread (the single thread that
+runs press/release bodies). If it dies — an edge case the try/except
+in `_event_worker_main` doesn't catch, or a native crash inside
+whisper/pynput that escaped the Python-level catch — `_on_worker_dead`
+restarts it. Without this, a dead worker with live listeners is the
+same "hotkey silently does nothing" failure the worker exists to
+prevent: presses are enqueued but never processed.
+
+### Layer 5: Busy-lock watchdog
+
+The universal backstop for ANY hang in the processing pipeline. If the
+busy lock has been held continuously for longer than
+`busy_lock_timeout_s` (default 120s), the watcher fires
+`_on_busy_stuck`, which enqueues `_abort_press` to release the lock,
+close the recorder, and reset the press state. This catches:
+
+- A transcribe hang (GPU wedge, CUDA OOM recovery, Vulkan device-lost)
+  that exceeds `transcribe_timeout_s` AND the retry budget — the
+  bounded transcribe turns the first hang into a crash, but if every
+  retry also hangs, the busy-lock watchdog is the final backstop.
+- An inject hang (pynput HID wedge) that exceeds
+  `inject_timeout_s` — same logic.
+- A model reload hang during recovery.
+- Any future code path that holds the lock too long.
+
+Without this, a stuck press makes every later press silently ignored
+as "already busy" and the only way out is a manual restart.
 
 ---
 
@@ -302,7 +337,7 @@ XWayland.
 
 | Platform | Backend |
 |----------|---------|
-| macOS    | osascript (Spotify, Music.app) |
+| macOS    | nowplaying-cli (all apps via system Now Playing), osascript fallback (Spotify/Music.app) |
 | Linux    | playerctl (MPRIS D-Bus) |
 | Windows  | PowerShell (SMTC) |
 
@@ -378,6 +413,10 @@ mic_failover_scan = true            # false = system-default fallback only
 mic_open_retries = 2               # 0 = fail on first attempt
 injector_fallback = true            # false = no backend fallback
 listener_restart_min_interval_s = 60  # 0 = always restart (may flap)
+transcribe_timeout_s = 30           # 0 = no timeout (hang holds lock forever)
+inject_timeout_s = 10               # 0 = no timeout (pynput hang holds lock)
+busy_lock_timeout_s = 120           # 0 = disable watchdog (stuck press
+                                    #         makes every later press ignored)
 ```
 
 ### [transcribe] section

@@ -171,3 +171,27 @@ listener_restart_min_interval_s = 60  # Backoff window for listener
                                 # unrecoverable and the user is warned
                                 # instead of flapping. 0 = always
                                 # restart (may flap forever).
+transcribe_timeout_s = 30       # If transcribe() takes longer than this
+                                # many seconds, abandon it (the native
+                                # call is wedged — GPU hang, CUDA OOM
+                                # recovery, Vulkan device-lost). The
+                                # transcriber is poisoned either way;
+                                # the next press reloads. 0 = no
+                                # timeout (a hang holds the event
+                                # worker and busy lock forever).
+inject_timeout_s = 10           # If injector.inject() takes longer
+                                # than this many seconds, abandon it
+                                # (pynput HID wedged after sleep,
+                                # focused app unresponsive). The
+                                # subprocess backends (wtype, ydotool,
+                                # pbcopy) are already bounded; this
+                                # covers the pynput path. 0 = no
+                                # timeout.
+busy_lock_timeout_s = 120       # If the busy lock has been held
+                                # continuously for longer than this
+                                # many seconds, fire _abort_press to
+                                # release it. Universal backstop for
+                                # ANY hang in the processing pipeline
+                                # — transcribe, inject, reload, or any
+                                # future code path that holds the lock
+                                # too long. 0 = disable the watchdog.

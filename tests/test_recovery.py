@@ -12,6 +12,8 @@ Markers: pytest.mark.recovery
 
 from __future__ import annotations
 
+import threading
+import time
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -46,6 +48,9 @@ def test_recovery_config_defaults():
     assert rc.mic_open_retries == 2
     assert rc.injector_fallback is True
     assert rc.listener_restart_min_interval_s == 60.0
+    assert rc.transcribe_timeout_s == 30.0
+    assert rc.inject_timeout_s == 10.0
+    assert rc.busy_lock_timeout_s == 120.0
 
 
 def test_config_has_recovery_section():
@@ -64,6 +69,9 @@ def test_recovery_config_from_toml():
             "mic_open_retries": 0,
             "injector_fallback": False,
             "listener_restart_min_interval_s": 30.0,
+            "transcribe_timeout_s": 60.0,
+            "inject_timeout_s": 20.0,
+            "busy_lock_timeout_s": 300.0,
         }
     })
     assert cfg.recovery.transcribe_retries == 5
@@ -72,6 +80,9 @@ def test_recovery_config_from_toml():
     assert cfg.recovery.mic_open_retries == 0
     assert cfg.recovery.injector_fallback is False
     assert cfg.recovery.listener_restart_min_interval_s == 30.0
+    assert cfg.recovery.transcribe_timeout_s == 60.0
+    assert cfg.recovery.inject_timeout_s == 20.0
+    assert cfg.recovery.busy_lock_timeout_s == 300.0
 
 
 def test_recovery_config_validation_rejects_negative_retries():
@@ -82,6 +93,21 @@ def test_recovery_config_validation_rejects_negative_retries():
 def test_recovery_config_validation_rejects_negative_backoff():
     with pytest.raises(ValueError, match="transcribe_backoff_s"):
         Config(recovery=RecoveryConfig(transcribe_backoff_s=-0.1)).validate()
+
+
+def test_recovery_config_validation_rejects_negative_transcribe_timeout():
+    with pytest.raises(ValueError, match="transcribe_timeout_s"):
+        Config(recovery=RecoveryConfig(transcribe_timeout_s=-1)).validate()
+
+
+def test_recovery_config_validation_rejects_negative_inject_timeout():
+    with pytest.raises(ValueError, match="inject_timeout_s"):
+        Config(recovery=RecoveryConfig(inject_timeout_s=-1)).validate()
+
+
+def test_recovery_config_validation_rejects_negative_busy_lock_timeout():
+    with pytest.raises(ValueError, match="busy_lock_timeout_s"):
+        Config(recovery=RecoveryConfig(busy_lock_timeout_s=-1)).validate()
 
 
 def test_recovery_config_validation_rejects_negative_mic_retries():
@@ -472,3 +498,536 @@ def test_select_injector_with_fallback_on_wayland_returns_chain(monkeypatch):
     inj = select_injector_with_fallback(InjectConfig(), enable_fallback=True)
     assert isinstance(inj, FallbackInjector)
     assert isinstance(inj._injectors[0], WtypeInjector)
+
+
+# --- Bounded transcribe: hang recovery -------------------------------------
+
+
+def test_bounded_call_returns_value_when_fast_enough():
+    """_bounded_call returns (True, result) when fn finishes within the
+    timeout."""
+    from speakinput.app import _bounded_call
+
+    ok, result = _bounded_call(lambda x: x * 2, 21, timeout_s=5.0, name="test")
+    assert ok is True
+    assert result == 42
+
+
+def test_bounded_call_returns_false_on_timeout(capsys):
+    """_bounded_call returns (False, None) when fn exceeds the timeout
+    and prints a warning."""
+    import threading
+
+    from speakinput.app import _bounded_call
+
+    never = threading.Event()
+
+    def _hang():
+        never.wait()  # blocks forever
+
+    ok, result = _bounded_call(_hang, timeout_s=0.1, name="test-hang")
+    assert ok is False
+    assert result is None
+    captured = capsys.readouterr()
+    assert "test-hang" in captured.err
+    assert "0s" in captured.err  # the timeout value
+    # Cleanup: let the daemon thread die with the test process.
+    never.set()
+
+
+def test_bounded_call_zero_timeout_bypasses_thread():
+    """When timeout_s=0, _bounded_call runs fn directly (no helper
+    thread). This is the 'disabled' config path."""
+    from speakinput.app import _bounded_call
+
+    ok, result = _bounded_call(lambda: "direct", timeout_s=0, name="test")
+    assert ok is True
+    assert result == "direct"
+
+
+def test_bounded_call_propagates_exception():
+    """When fn raises, _bounded_call re-raises the exception."""
+    from speakinput.app import _bounded_call
+
+    def _boom():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _bounded_call(_boom, timeout_s=5.0, name="test")
+
+
+def test_transcribe_hang_triggers_timeout_and_retry(monkeypatch, capsys):
+    """When transcribe() hangs longer than transcribe_timeout_s, the
+    App should abandon it, treat it like a crash (reload + retry), and
+    the retry should succeed."""
+    import threading
+
+    app, transcriber, _ = _build_app_for_recovery(transcribe_timeout_s=0.1)
+
+    # First call hangs forever, second succeeds (on the reloaded
+    # transcriber).
+    never = threading.Event()
+
+    def _hang(*args, **kwargs):
+        never.wait()
+
+    transcriber.transcribe.side_effect = _hang
+    new_transcriber = MagicMock()
+    new_transcriber.transcribe.return_value = "recovered after hang"
+    monkeypatch.setattr(app, "_reload_transcriber", lambda profile: new_transcriber)
+
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+
+    # The reload was called (the timeout was treated like a crash).
+    new_transcriber.transcribe.assert_called_once()
+    # The text was injected.
+    app.injector.inject.assert_called_once_with("recovered after hang")
+    # The lock was released so the next press is accepted.
+    assert not app._busy.locked()
+    captured = capsys.readouterr()
+    assert "transcribe" in captured.err.lower()
+    assert "0s" in captured.err  # timeout value in the warning
+    never.set()  # let the daemon thread die
+
+
+def test_transcribe_hang_exhausted_retries_releases_lock(monkeypatch):
+    """When all retries are exhausted on a hanging transcribe, the lock
+    must be released so the next press works."""
+    import threading
+
+    app, transcriber, _ = _build_app_for_recovery(
+        transcribe_retries=1, transcribe_timeout_s=0.1
+    )
+
+    never = threading.Event()
+
+    def _hang(*args, **kwargs):
+        never.wait()
+
+    transcriber.transcribe.side_effect = _hang
+    monkeypatch.setattr(
+        app,
+        "_reload_transcriber",
+        lambda profile: MagicMock(transcribe=MagicMock(side_effect=_hang)),
+    )
+
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+
+    # No text was injected.
+    app.injector.inject.assert_not_called()
+    # The lock was released.
+    assert not app._busy.locked()
+    never.set()
+
+
+def test_transcribe_timeout_zero_disables_bounded_call(monkeypatch):
+    """When transcribe_timeout_s=0, the bounded call is bypassed and
+    transcribe() runs directly (old behavior). A fast transcribe works
+    normally."""
+    app, transcriber, _ = _build_app_for_recovery(transcribe_timeout_s=0)
+    transcriber.transcribe.return_value = "hello"
+
+    monkeypatch.setattr(app, "_reload_transcriber", MagicMock())
+
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+
+    app._reload_transcriber.assert_not_called()  # type: ignore[attr-defined]
+    app.injector.inject.assert_called_once_with("hello")
+
+
+# --- Bounded inject: hang recovery -----------------------------------------
+
+
+def test_inject_hang_abandoned_and_lock_released(monkeypatch, capsys):
+    """When injector.inject() hangs longer than inject_timeout_s, the
+    App should abandon it, log a warning, and release the busy lock so
+    the next press works."""
+    import threading
+
+    app, _, _ = _build_app_for_recovery(inject_timeout_s=0.1)
+    # Make transcribe fast so we reach the inject path.
+    app.transcribers[app.config.primary.key].transcribe.return_value = "hello"
+
+    never = threading.Event()
+
+    def _hang_inject(text):
+        never.wait()
+
+    app.injector.inject.side_effect = _hang_inject
+
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+
+    # The lock was released despite the inject hang.
+    assert not app._busy.locked()
+    captured = capsys.readouterr()
+    assert "inject" in captured.err.lower()
+    assert "0s" in captured.err  # timeout value
+    never.set()
+
+
+def test_inject_timeout_zero_disables_bounded_call():
+    """When inject_timeout_s=0, the bounded call is bypassed and
+    inject() runs directly (old behavior)."""
+    app, _, _ = _build_app_for_recovery(inject_timeout_s=0)
+    app.transcribers[app.config.primary.key].transcribe.return_value = "hello"
+
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+
+    app.injector.inject.assert_called_once_with("hello")
+
+
+# --- Busy-lock watchdog -----------------------------------------------------
+
+
+def test_busy_lock_watchdog_fires_on_stuck_press(capsys):
+    """When the busy lock has been held longer than
+    busy_lock_timeout_s, the watcher should fire on_busy_stuck."""
+    from speakinput.app import _LivenessWatcher
+
+    on_busy_stuck = MagicMock()
+    lock = threading.Lock()
+    lock.acquire()
+    started = time.monotonic() - 200.0  # pretend the press started 200s ago
+
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        busy_lock=lock,
+        press_started_at=lambda: started,
+        busy_lock_timeout_s=100.0,
+        on_busy_stuck=on_busy_stuck,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+        lock.release()
+    on_busy_stuck.assert_called_once()
+    held_for = on_busy_stuck.call_args[0][0]
+    assert held_for >= 100.0
+
+
+def test_busy_lock_watchdog_does_not_fire_when_unheld():
+    """When the busy lock is not held, the watcher must not fire."""
+    from speakinput.app import _LivenessWatcher
+
+    on_busy_stuck = MagicMock()
+    lock = threading.Lock()  # unheld
+
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        busy_lock=lock,
+        press_started_at=lambda: time.monotonic(),
+        busy_lock_timeout_s=0.05,
+        on_busy_stuck=on_busy_stuck,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    on_busy_stuck.assert_not_called()
+
+
+def test_busy_lock_watchdog_does_not_fire_within_timeout():
+    """When the lock has been held for less than the timeout, the
+    watcher must not fire."""
+    from speakinput.app import _LivenessWatcher
+
+    on_busy_stuck = MagicMock()
+    lock = threading.Lock()
+    lock.acquire()
+    started = time.monotonic()  # just now
+
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        busy_lock=lock,
+        press_started_at=lambda: started,
+        busy_lock_timeout_s=100.0,  # 100s timeout, held for <1s
+        on_busy_stuck=on_busy_stuck,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+        lock.release()
+    on_busy_stuck.assert_not_called()
+
+
+def test_busy_lock_watchdog_fires_only_once_per_episode(capsys):
+    """The watchdog should fire on_busy_stuck at most once per stuck
+    episode, then reset when the lock is released."""
+    from speakinput.app import _LivenessWatcher
+
+    on_busy_stuck = MagicMock()
+    lock = threading.Lock()
+    lock.acquire()
+    started = time.monotonic() - 200.0
+
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        busy_lock=lock,
+        press_started_at=lambda: started,
+        busy_lock_timeout_s=100.0,
+        on_busy_stuck=on_busy_stuck,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+        lock.release()
+    # Only one call despite multiple poll cycles.
+    on_busy_stuck.assert_called_once()
+
+
+def test_busy_lock_watchdog_disabled_when_timeout_zero():
+    """When busy_lock_timeout_s=0, the watchdog is disabled."""
+    from speakinput.app import _LivenessWatcher
+
+    on_busy_stuck = MagicMock()
+    lock = threading.Lock()
+    lock.acquire()
+    started = time.monotonic() - 9999.0
+
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        busy_lock=lock,
+        press_started_at=lambda: started,
+        busy_lock_timeout_s=0,
+        on_busy_stuck=on_busy_stuck,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+        lock.release()
+    on_busy_stuck.assert_not_called()
+
+
+def test_on_busy_stuck_enqueues_abort_press(capsys):
+    """_on_busy_stuck should enqueue _abort_press on the event worker
+    so it's serialized with any in-flight handler."""
+    from speakinput.config import AudioConfig, Config
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    # Start the event worker so _on_busy_stuck enqueues instead of
+    # running the abort inline.
+    app._start_event_worker()
+    # Simulate a stuck press: acquire the busy lock and set
+    # _press_started_at to the past.
+    app._busy.acquire()
+    app._press_started_at = time.monotonic() - 200.0
+    app._active_profile = config.primary
+
+    app._on_busy_stuck(200.0)
+
+    # The abort was enqueued (not run inline).
+    fn, args = app._work_q.get_nowait()
+    assert fn == app._abort_press
+    assert "busy lock watchdog" in args[0]
+    captured = capsys.readouterr()
+    assert "busy lock held for 200s" in captured.err
+    # Cleanup: drain the queue and release the lock.
+    app._stop_event_worker()
+    app._busy.release()
+
+
+# --- Event worker liveness monitoring --------------------------------------
+
+
+def test_liveness_watcher_detects_dead_worker():
+    """When the event worker thread dies, the watcher should fire
+    on_worker_dead once."""
+    from speakinput.app import _LivenessWatcher
+
+    on_worker_dead = MagicMock()
+    worker = MagicMock()
+    worker.is_alive.return_value = False
+
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        worker_thread=worker,
+        on_worker_dead=on_worker_dead,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    on_worker_dead.assert_called_once()
+
+
+def test_liveness_watcher_does_not_fire_when_worker_alive():
+    """A healthy worker thread must not trigger on_worker_dead."""
+    from speakinput.app import _LivenessWatcher
+
+    on_worker_dead = MagicMock()
+    worker = MagicMock()
+    worker.is_alive.return_value = True
+
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        worker_thread=worker,
+        on_worker_dead=on_worker_dead,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    on_worker_dead.assert_not_called()
+
+
+def test_liveness_watcher_no_worker_monitoring_when_none():
+    """When worker_thread is None, the watcher must not try to monitor
+    it (no crash, no callback)."""
+    from speakinput.app import _LivenessWatcher
+
+    on_worker_dead = MagicMock()
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        worker_thread=None,
+        on_worker_dead=on_worker_dead,
+    )
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    on_worker_dead.assert_not_called()
+
+
+def test_swap_worker_resets_tracking():
+    """swap_worker replaces the worker thread and resets the alive-
+    transition tracking so the new worker's future death fires
+    on_worker_dead exactly once."""
+    from speakinput.app import _LivenessWatcher
+
+    on_worker_dead = MagicMock()
+    old_worker = MagicMock()
+    old_worker.is_alive.return_value = False  # dead
+    new_worker = MagicMock()
+    new_worker.is_alive.return_value = True  # alive
+
+    watcher = _LivenessWatcher(
+        listeners=[],
+        interval_s=0.01,
+        on_dead=MagicMock(),
+        worker_thread=old_worker,
+        on_worker_dead=on_worker_dead,
+    )
+    # The old worker is dead, but we swap before the watcher polls.
+    watcher.swap_worker(new_worker)
+    watcher.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        watcher.stop()
+    # The dead old worker must NOT fire on_worker_dead after the swap.
+    on_worker_dead.assert_not_called()
+
+
+def test_on_worker_dead_restarts_worker(capsys):
+    """_on_worker_dead should restart the event worker thread."""
+    from speakinput.config import AudioConfig, Config
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    # Start the real worker so the restart has something to replace.
+    app._start_event_worker()
+    old_thread = app._worker_thread
+    assert old_thread is not None
+
+    app._on_worker_dead()
+    # A new worker thread was created.
+    assert app._worker_thread is not None
+    assert app._worker_thread is not old_thread
+    assert app._worker_thread.is_alive()
+    captured = capsys.readouterr()
+    assert "event worker died and was restarted" in captured.err
+    # Cleanup: stop the worker.
+    app._stop_event_worker()
+
+
+def test_on_worker_dead_warns_when_restart_fails(monkeypatch, capsys):
+    """If the worker restart fails, the user must get a warning."""
+    from speakinput.config import AudioConfig, Config
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+
+    def _fail_restart():
+        return False
+
+    monkeypatch.setattr(app, "_restart_event_worker", _fail_restart)
+    app._on_worker_dead()
+    captured = capsys.readouterr()
+    assert "event worker" in captured.err
+    assert "Restart speakinput" in captured.err
+
+
+def test_restart_event_worker_warns_on_shutdown():
+    """During shutdown, _restart_event_worker should be a no-op."""
+    from speakinput.config import AudioConfig, Config
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0, auto_stop_seconds=0))
+    app = App(
+        config=config,
+        recorder=MagicMock(),
+        transcribers={config.primary.key: MagicMock()},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app._shutdown.set()
+    result = app._restart_event_worker()
+    assert result is False
+    assert app._worker_thread is None

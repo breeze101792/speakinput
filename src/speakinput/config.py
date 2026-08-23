@@ -209,8 +209,10 @@ class AudioConfig:
     prev_clip_window_seconds: float = 60.0
     # Pause any playing media (music, video) when the hotkey is pressed
     # and resume it when the key is released. On Linux requires
-    # `playerctl` (MPRIS); on macOS uses osascript for Spotify/Music;
-    # on Windows uses PowerShell SMTC. No-op when no backend is found.
+    # `playerctl` (MPRIS); on macOS prefers `nowplaying-cli` (all apps via
+    # the system Now Playing service) and falls back to osascript
+    # (Spotify/Music.app only); on Windows uses PowerShell SMTC. No-op
+    # when no backend is found.
     pause_media: bool = True
 
 
@@ -303,6 +305,45 @@ class RecoveryConfig:
     # the user is warned instead of flapping. 0 = always try to
     # restart (may flap forever on a permission revocation).
     listener_restart_min_interval_s: float = 60.0
+
+    # Transcribe timeout: if transcribe() takes longer than this many
+    # seconds, abandon it (the native call is wedged — GPU hang,
+    # CUDA OOM recovery, Vulkan device-lost, Metal command buffer
+    # stuck). The transcriber instance is poisoned either way; the
+    # next press reloads a fresh one. 0 = no timeout (old behavior:
+    # a hang here holds the event worker and the busy lock forever,
+    # every later press is ignored as "already busy"). Default 30s
+    # is well above the slowest healthy transcribe (a 30s clip on a
+    # CPU-only small model is ~10s) but short enough that a wedged
+    # GPU recovers within half a minute instead of requiring a
+    # manual restart.
+    transcribe_timeout_s: float = 30.0
+
+    # Inject timeout: if injector.inject() takes longer than this many
+    # seconds, abandon it (pynput's HID event system wedged after
+    # sleep, the focused app is unresponsive, the clipboard paste is
+    # stuck). The subprocess-based backends (wtype, ydotool, pbcopy)
+    # are already bounded by their own _SUBPROCESS_TIMEOUT_S; this
+    # covers the pynput path which has no internal timeout. 0 = no
+    # timeout (old behavior: a hang here holds the event worker and
+    # the busy lock forever). Default 10s is generous for a normal
+    # inject (sub-100ms) but short enough that a wedged HID path
+    # recovers quickly.
+    inject_timeout_s: float = 10.0
+
+    # Busy-lock watchdog: if the busy lock has been held continuously
+    # for longer than this many seconds, fire _abort_press to release
+    # it. This is the universal backstop for ANY hang in the
+    # processing pipeline — a transcribe hang, an inject hang, a
+    # model reload hang, or any future code path that holds the lock
+    # too long. Without it, a stuck press makes every later press
+    # silently ignored as "already busy" and the only way out is a
+    # manual restart. 0 = disable the watchdog (old behavior).
+    # Default 120s is well above the slowest healthy press+transcribe
+    # +inject cycle (a 30s clip + 10s transcribe + 1s inject = ~41s)
+    # but short enough that a truly wedged press recovers within two
+    # minutes instead of never.
+    busy_lock_timeout_s: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -474,6 +515,21 @@ class Config:
             raise ValueError(
                 f"recovery.listener_restart_min_interval_s must be >= 0, "
                 f"got {self.recovery.listener_restart_min_interval_s}"
+            )
+        if self.recovery.transcribe_timeout_s < 0:
+            raise ValueError(
+                f"recovery.transcribe_timeout_s must be >= 0 (0 disables), "
+                f"got {self.recovery.transcribe_timeout_s}"
+            )
+        if self.recovery.inject_timeout_s < 0:
+            raise ValueError(
+                f"recovery.inject_timeout_s must be >= 0 (0 disables), "
+                f"got {self.recovery.inject_timeout_s}"
+            )
+        if self.recovery.busy_lock_timeout_s < 0:
+            raise ValueError(
+                f"recovery.busy_lock_timeout_s must be >= 0 (0 disables), "
+                f"got {self.recovery.busy_lock_timeout_s}"
             )
 
     def with_overrides(self, **overrides: Any) -> "Config":
