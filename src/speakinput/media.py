@@ -1,7 +1,9 @@
 """Media playback control: pause/resume via platform-native tools.
 
 On Linux, uses ``playerctl`` (MPRIS D-Bus interface).
-On macOS, uses ``osascript`` for Spotify and Music.app.
+On macOS, uses ``nowplaying-cli`` (system Now Playing service — covers
+Safari, Firefox, Music.app, Spotify, Podcasts, VLC, etc.) when installed,
+falling back to ``osascript`` (Spotify/Music.app only) otherwise.
 On Windows, uses PowerShell for SMTC.
 """
 
@@ -59,6 +61,8 @@ def _detect_backend() -> str | None:
     if sys.platform == "linux" and shutil.which("playerctl"):
         return "playerctl"
     if sys.platform == "darwin":
+        if shutil.which("nowplaying-cli"):
+            return "nowplaying"
         return "osascript"
     if sys.platform == "win32":
         return "powershell"
@@ -86,6 +90,25 @@ def _check_playing(backend: str) -> bool:
             capture_output=True, text=True, timeout=5,
         )
         return r.returncode == 0 and "Playing" in r.stdout
+
+    if backend == "nowplaying":
+        # nowplaying-cli get playbackRate → "1" when playing, "0" when
+        # paused. With no active media session the binary still exits 0
+        # and prints "1", so the title is used as a sentinel: an empty
+        # title means nothing is actually loaded in Now Playing.
+        rate = subprocess.run(
+            ["nowplaying-cli", "get", "playbackRate"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if rate.returncode != 0:
+            return False
+        title = subprocess.run(
+            ["nowplaying-cli", "get", "title"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if title.returncode != 0 or not title.stdout.strip():
+            return False
+        return rate.stdout.strip() == "1"
 
     if backend == "osascript":
         for app_name in ("Spotify", "Music"):
@@ -122,6 +145,11 @@ def _pause_all(backend: str) -> None:
             ["playerctl", "-a", "pause"],
             capture_output=True, timeout=5,
         )
+    elif backend == "nowplaying":
+        subprocess.run(
+            ["nowplaying-cli", "pause"],
+            capture_output=True, timeout=5,
+        )
     elif backend == "osascript":
         for app_name in ("Spotify", "Music"):
             if not _app_is_running(app_name):
@@ -144,6 +172,11 @@ def _resume_all(backend: str) -> None:
     if backend == "playerctl":
         subprocess.run(
             ["playerctl", "-a", "play"],
+            capture_output=True, timeout=5,
+        )
+    elif backend == "nowplaying":
+        subprocess.run(
+            ["nowplaying-cli", "play"],
             capture_output=True, timeout=5,
         )
     elif backend == "osascript":

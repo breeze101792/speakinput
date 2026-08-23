@@ -45,6 +45,7 @@ def fake_subprocess(monkeypatch):
     [
         ("linux", "/usr/bin/playerctl", "playerctl"),
         ("linux", None, None),
+        ("darwin", "/opt/homebrew/bin/nowplaying-cli", "nowplaying"),
         ("darwin", None, "osascript"),
         ("win32", None, "powershell"),
         ("freebsd", None, None),
@@ -278,6 +279,165 @@ def test_resume_all_osascript_skips_apps_not_running(monkeypatch):
     )
     m._resume_all("osascript")
     assert cmds == ['tell application "Spotify" to play']
+
+
+# --- nowplaying-cli / macOS backend ----------------------------------------
+
+
+def _np_run_factory(results: dict[str, SimpleNamespace]):
+    """A subprocess.run fake keyed by the full argv joined with spaces."""
+    def _run(args, **kwargs):
+        joined = " ".join(args)
+        return results.get(joined, _completed(0, ""))
+    return _run
+
+
+def test_check_playing_nowplaying_true_when_rate_1_and_title_present(monkeypatch):
+    run = _np_run_factory({
+        "nowplaying-cli get playbackRate": _completed(0, "1\n"),
+        "nowplaying-cli get title": _completed(0, "Some Song\n"),
+    })
+    monkeypatch.setattr(m.subprocess, "run", run)
+    assert m._check_playing("nowplaying") is True
+
+
+def test_check_playing_nowplaying_false_when_rate_0(monkeypatch):
+    run = _np_run_factory({
+        "nowplaying-cli get playbackRate": _completed(0, "0\n"),
+        "nowplaying-cli get title": _completed(0, "Some Song\n"),
+    })
+    monkeypatch.setattr(m.subprocess, "run", run)
+    assert m._check_playing("nowplaying") is False
+
+
+def test_check_playing_nowplaying_false_when_title_empty(monkeypatch):
+    """nowplaying-cli prints playbackRate "1" even with no active session;
+    an empty title is the sentinel for "nothing is actually loaded"."""
+    run = _np_run_factory({
+        "nowplaying-cli get playbackRate": _completed(0, "1\n"),
+        "nowplaying-cli get title": _completed(0, "\n"),
+    })
+    monkeypatch.setattr(m.subprocess, "run", run)
+    assert m._check_playing("nowplaying") is False
+
+
+def test_check_playing_nowplaying_false_on_subprocess_error(monkeypatch):
+    run = _np_run_factory({
+        "nowplaying-cli get playbackRate": _completed(1, ""),
+        "nowplaying-cli get title": _completed(0, "Some Song\n"),
+    })
+    monkeypatch.setattr(m.subprocess, "run", run)
+    assert m._check_playing("nowplaying") is False
+
+
+def test_check_playing_nowplaying_false_when_title_subprocess_fails(monkeypatch):
+    """rate call succeeds but title call returns non-zero — the title
+    sentinel can't be verified, so treat as not playing."""
+    run = _np_run_factory({
+        "nowplaying-cli get playbackRate": _completed(0, "1\n"),
+        "nowplaying-cli get title": _completed(1, ""),
+    })
+    monkeypatch.setattr(m.subprocess, "run", run)
+    assert m._check_playing("nowplaying") is False
+
+
+def test_pause_all_nowplaying_runs_pause_command(monkeypatch, fake_subprocess):
+    m._pause_all("nowplaying")
+    assert fake_subprocess.recorded == [["nowplaying-cli", "pause"]]
+
+
+def test_resume_all_nowplaying_runs_play_command(monkeypatch, fake_subprocess):
+    m._resume_all("nowplaying")
+    assert fake_subprocess.recorded == [["nowplaying-cli", "play"]]
+
+
+def test_pause_resume_roundtrip_nowplaying(monkeypatch):
+    """End-to-end: pause() detects playing and marks paused; resume()
+    issues the play command and clears the flag."""
+    run = _np_run_factory({
+        "nowplaying-cli get playbackRate": _completed(0, "1\n"),
+        "nowplaying-cli get title": _completed(0, "Some Song\n"),
+    })
+    recorded: list[list[str]] = []
+
+    def _rec(args, **kwargs):
+        recorded.append(list(args))
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(m.subprocess, "run", _rec)
+    monkeypatch.setattr(m, "_detect_backend", lambda: "nowplaying")
+    controller = m.MediaController()
+    assert controller.pause() is True
+    assert controller._paused_by_us is True
+    recorded.clear()
+    controller.resume()
+    assert recorded == [["nowplaying-cli", "play"]]
+    assert controller._paused_by_us is False
+
+
+def test_pause_nowplaying_does_not_pause_when_nothing_playing(monkeypatch):
+    """When _check_playing returns False, pause() must NOT issue the
+    nowplaying-cli pause command — mirrors the playerctl contract."""
+    run = _np_run_factory({
+        "nowplaying-cli get playbackRate": _completed(0, "0\n"),
+        "nowplaying-cli get title": _completed(0, "Some Song\n"),
+    })
+    recorded: list[list[str]] = []
+
+    def _rec(args, **kwargs):
+        recorded.append(list(args))
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(m.subprocess, "run", _rec)
+    monkeypatch.setattr(m, "_detect_backend", lambda: "nowplaying")
+    controller = m.MediaController()
+    assert controller.pause() is False
+    assert controller._paused_by_us is False
+    assert not any(args == ["nowplaying-cli", "pause"] for args in recorded)
+
+
+def test_pause_nowplaying_swallows_subprocess_failure(monkeypatch):
+    """A broken nowplaying-cli (exception, not just non-zero) must not
+    crash the press path — pause() degrades to 'not paused'."""
+    def _boom(args, **kwargs):
+        raise RuntimeError("MediaRemote framework unavailable")
+
+    monkeypatch.setattr(m.subprocess, "run", _boom)
+    monkeypatch.setattr(m, "_detect_backend", lambda: "nowplaying")
+    controller = m.MediaController()
+    assert controller.pause() is False
+    assert controller._paused_by_us is False
+
+
+def test_resume_nowplaying_swallows_subprocess_failure_and_resets_flag(monkeypatch):
+    """Even if the resume command fails, the flag must clear so we don't
+    keep trying to resume a dead session forever."""
+    def _run(args, **kwargs):
+        joined = " ".join(args)
+        if joined == "nowplaying-cli get playbackRate":
+            return _completed(0, "1\n")
+        if joined == "nowplaying-cli get title":
+            return _completed(0, "Some Song\n")
+        if joined == "nowplaying-cli pause":
+            return _completed(0, "")
+        raise RuntimeError("nowplaying-cli vanished")
+
+    monkeypatch.setattr(m.subprocess, "run", _run)
+    monkeypatch.setattr(m, "_detect_backend", lambda: "nowplaying")
+    controller = m.MediaController()
+    assert controller.pause() is True
+    assert controller._paused_by_us is True
+    controller.resume()  # 'play' raises — swallowed, flag still cleared
+    assert controller._paused_by_us is False
+
+
+def test_resume_nowplaying_is_noop_when_we_never_paused(monkeypatch, fake_subprocess):
+    """Calling resume() without a prior pause must not issue the play
+    command — mirrors the playerctl contract."""
+    monkeypatch.setattr(m, "_detect_backend", lambda: "nowplaying")
+    controller = m.MediaController()
+    controller.resume()
+    assert fake_subprocess.recorded == []
 
 
 # --- powershell / Windows backend -----------------------------------------

@@ -617,6 +617,18 @@ install_macos() {
         return 1
     fi
     ok "macOS: no runtime package needed (drivers are part of the OS) for backend=$vendor"
+
+    # Optional: nowplaying-cli gives full media pause/resume across all
+    # apps (Safari, Firefox, Music, Spotify, Podcasts, VLC, ...). Without
+    # it, media control degrades to osascript which only handles Spotify
+    # and Music.app.
+    if ! command -v nowplaying-cli >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
+        if confirm "install nowplaying-cli via brew? (enables media pause for all apps, not just Spotify/Music)"; then
+            brew install nowplaying-cli
+        else
+            log "skipped nowplaying-cli — media pause will be limited to Spotify/Music.app (osascript fallback)"
+        fi
+    fi
 }
 
 # --- 3. rebuild pywhispercpp against the right backend ---------------------
