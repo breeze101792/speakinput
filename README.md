@@ -4,7 +4,7 @@ Push-to-talk voice transcription that types what you say into the focused field.
 
 ## Status
 
-v1 — dictation only. Voice commands and live partial transcription are intentionally deferred behind stable interfaces; see "Architecture" below.
+v1 — dictation only. Voice commands and live partial transcription are intentionally deferred behind stable interfaces; see [How it works](#how-it-works) below.
 
 ## Requirements
 
@@ -425,7 +425,8 @@ speakinput -d                     # debug mode: log every key event and transcri
 | Short | Long                  | What it does                                    |
 | ----- | --------------------- | ----------------------------------------------- |
 | `-c`  | `--config PATH`       | Path to config.toml                             |
-| `-m`  | `--model NAME`        | Override the **primary** profile's whisper model (`tiny`/`base`/`small`/`medium`/`.en` variants) |
+| `-C`  | `--edit-config`       | Open the config file in `$VISUAL`/`$EDITOR`/`vi` and exit (seeds from `config.example.toml` if missing) |
+| `-m`  | `--model NAME`        | Override the **primary** profile's whisper model (`tiny`/`base`/`small`/`medium`/`large-v3`/`.en` variants) |
 | `-g`  | `--language CODE`     | Override the **primary** profile's language (`auto` / `en` / `zh`) |
 | `-l`  | `--list-devices`      | List available input devices and exit           |
 | `-L`  | `--list-models`       | List curated whisper models and exit            |
@@ -437,6 +438,11 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-S`  | `--silence-threshold FLOAT` | Skip transcribe when audio RMS is below this floor (0 disables; default 0.005) |
 | `-A`  | `--auto-stop-seconds FLOAT` | Auto-stop after this many seconds of silence while the key is held (0 disables; default 0 — release the key yourself). Trailing silence is also trimmed from the buffer before transcribe. See [Auto-stop on silence](#auto-stop-on-silence) |
 | `-P`  | `--initial-prompt TEXT` | Override the **primary** profile's `initial_prompt` for this run (default: embedded-software-engineer bias; see [Initial prompt](#initial-prompt-vocabulary-biasing)) |
+| `--gpu`  | `--gpu`             | Force GPU acceleration on (warns if the pywhispercpp wheel is CPU-only) |
+| `--no-gpu` | `--no-gpu`         | Force CPU (useful for power-saving on laptops)  |
+| `--gpu-device N` | `--gpu-device N` | Use GPU index `N` when multiple GPUs are present (default: 0) |
+| `--threads N` | `--threads N`     | Number of CPU threads for the CPU path (0 = auto) |
+| `--pause-media` / `--no-pause-media` | Toggle pausing playing media on press, resume on release (default: on) |
 | `-v`  | `--verbose`           | Enable debug logging from python logging        |
 
 CLI flags apply to the **primary** profile only. The secondary profile is configured in `config.toml` — there's no `--secondary-*` flag by design, since the secondary's whole point is a stable per-machine config.
@@ -473,7 +479,8 @@ language = "zh"
 | tiny     | 75 MB | ~real-time | multilingual             |
 | base     | 142 MB| ~real-time | multilingual             |
 | small    | 466 MB| ~2x slower | multilingual (default)   |
-| medium   | 1.5 GB| ~5x slower | multilingual (best)      |
+| medium   | 1.5 GB| ~5x slower | multilingual             |
+| large-v3 | 3.1 GB| slower     | multilingual (best accuracy) |
 
 The first time you select a model, pywhispercpp downloads it to `~/.cache/pywhispercpp/`.
 

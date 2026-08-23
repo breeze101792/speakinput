@@ -376,6 +376,10 @@ Tests are split by concern and platform:
 | `test_silence.py`  | Silence trim, auto-stop watchdog       | Cross-platform |
 | `test_singleinstance.py` | Single-instance lockfile         | Cross-platform |
 | `test_cli.py`      | CLI flags, -C/--edit-config            | Cross-platform |
+| `test_media.py`    | MediaController, playerctl/nowplaying/osascript | Cross-platform (mocked subprocess) |
+| `test_feedback.py` | StderrFeedback, rumps feedback         | Cross-platform |
+| `test_mac_tap_heal.py` | CGEventTap self-heal monkey-patch | macOS-only (skipped elsewhere) |
+| `test_main.py`     | `python -m speakinput` entry, console entrypoint | Cross-platform |
 
 ### Platform-specific tests
 

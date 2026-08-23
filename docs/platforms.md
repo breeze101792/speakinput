@@ -9,11 +9,12 @@ Speakinput supports macOS (primary) and Linux (secondary). Platform-specific cod
 - Input Monitoring permission (System Settings → Privacy & Security → Input Monitoring)
 - Accessibility permission (System Settings → Privacy & Security → Accessibility)
 - PortAudio (installed via `sounddevice`)
+- Optional: `nowplaying-cli` (`brew install nowplaying-cli`) for media pause/resume across all apps (Safari, Firefox, Music, Spotify, etc.). Without it, only Spotify and Music.app are paused via osascript.
 
 ### Defaults
 - Hotkey: `alt_r` (Right Option)
 - Injection: pynput (Cmd+V for Unicode)
-- Media: osascript (Spotify, Music.app)
+- Media: nowplaying-cli (all apps via system Now Playing), osascript fallback (Spotify/Music.app only)
 - Menu bar: rumps (NSStatusBar)
 
 ### macOS-Specific Behavior
@@ -25,7 +26,7 @@ macOS silently disables CGEventTaps on sleep/wake, focus transitions, and permis
 `stream.stop()` / `stream.close()` can wedge indefinitely due to HAL mutex contention (especially after sleep/wake or USB/Bluetooth mic glitch). `AudioRecorder.close()` bounds this with a 1.5s helper thread timeout.
 
 **Sleep/Wake Recovery:**
-`_on_system_sleep()` restarts all listeners (CGEventTaps are disabled) and closes the audio recorder (stream goes silent). Detection uses wall/monotonic clock skew > 5s.
+`_on_system_sleep()` closes the audio recorder (the stream goes silent after wake) and aborts any orphaned press. It does NOT restart the listeners — the old listener's cleanup races with a new listener's tap enable, so the app relies on the `_mac_tap_heal.py` self-healing mechanism to re-enable the CGEventTap within ~1s. If self-healing fails, the heartbeat backstop (30s stale threshold) detects the dead listener and restarts it. Detection uses wall/monotonic clock skew > 5s.
 
 ### Permissions Notes
 - Both Input Monitoring AND Accessibility are needed for pynput global hotkeys
@@ -95,8 +96,8 @@ Uses `pyperclip` which falls back to `wl-paste`/`wl-copy` on Wayland or `xclip`/
 |---------|-------|-------|
 | Hotkey backend | pynput only | evdev (preferred) → pynput |
 | CGEventTap healing | Yes (`_mac_tap_heal.py`) | N/A |
-| Sleep recovery | Listener restart + recorder close | Same (clock skew detection) |
+| Sleep recovery | Recorder close + tap self-heal (no listener restart) | Same (clock skew detection) |
 | Unicode injection | pbcopy → Cmd+V | wl-copy → Ctrl+V |
-| Media control | osascript | playerctl |
+| Media control | nowplaying-cli → osascript fallback | playerctl |
 | Menu bar | rumps (NSStatusBar) | stderr |
 | Permissions | Input Monitoring + Accessibility | `input` group for evdev |

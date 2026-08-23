@@ -163,7 +163,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FLOAT",
         help="Auto-stop after this many seconds of consecutive silence while the "
-        "key is held (0 disables, default: 0.8). Trailing silence is also "
+        "key is held (0 disables, default: 0). Trailing silence is also "
         "trimmed from the buffer before transcribe.",
     )
     parser.add_argument(

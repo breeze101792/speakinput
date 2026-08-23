@@ -42,16 +42,17 @@ release work                           heartbeat stale events
 | Module | Role | Key Class |
 |--------|------|-----------|
 | `app.py` | Orchestrator — owns all components, press state machine | `App` |
+| `cli.py` | Argparse CLI, `-C`/`-D`/`-L` actions, config overrides | `main` |
 | `audio.py` | PortAudio capture — start/stop/drain/close | `AudioRecorder` |
 | `hotkey.py` | Global key detection — pynput or evdev backend | `HotkeyListener` / `EvdevHotkeyListener` |
 | `silence.py` | Trailing silence trim + auto-stop watchdog | `SilenceWatchdog` |
 | `config.py` | Frozen dataclass config, TOML loading | `Config` |
-| `transcriber.py` | whisper.cpp wrapper with GPU auto-detect | `WhisperCppTranscriber` |
-| `injector.py` | Text injection — pynput / wtype / ydotool | `TypingInjector` |
+| `transcriber.py` | STT engine registry — whispercpp / faster_whisper / apple | `WhisperCppTranscriber`, `create_transcriber` |
+| `injector.py` | Text injection — pynput / wtype / ydotool | `TypingInjector`, `FallbackInjector` |
 | `feedback.py` | Menu bar status indicator — rumps or stderr | `StderrFeedback` / `RumpsFeedback` |
 | `media.py` | Pause/resume media on press/release | `MediaController` |
 | `_mac_tap_heal.py` | Monkey-patch pynput to re-enable disabled CGEventTap | — |
-| `models.py` | Download/load whisper model files | — |
+| `models.py` | Download/load whisper model files, auto-upgrade `.en`→multilingual | — |
 | `singleinstance.py` | Process-level flock guard | — |
 
 ## Threading Model
@@ -148,6 +149,13 @@ Two profiles using the same model path share a single `WhisperCppTranscriber` in
 |-----------|-------|-------|
 | Hotkey | pynput (CGEventTap) | evdev (preferred) → pynput |
 | Injection | pynput (Cmd+V) | wtype → ydotool → pynput |
-| Media | osascript (Spotify) | playerctl (MPRIS) |
+| Media | nowplaying-cli → osascript fallback | playerctl (MPRIS) |
 | Menu bar | rumps (NSStatusBar) | stderr fallback |
 | Audio | PortAudio/CoreAudio | PortAudio/ALSA |
+
+## Further Reading
+
+- [Error Recovery](error-recovery.md) — the layered self-healing system
+- [Platform Guide](platforms.md) — macOS / Linux / Windows specifics
+- [../DESIGN.md](../DESIGN.md) — full design document (architecture, recovery, engine matrix, config reference)
+- [../README.md](../README.md) — user-facing install, usage, and troubleshooting

@@ -6,7 +6,7 @@ Speakinput has a layered recovery system that keeps the app running through macO
 
 ### 1. Listener Death (thread crash / event tap disabled)
 
-**Detection:** `_LivenessWatcher` polls `is_running()` every 5s. Also checks `last_event_at()` against a 300s stale threshold (heartbeat backstop).
+**Detection:** `_LivenessWatcher` polls `is_running()` every 5s. Also checks `last_event_at()` against a 30s stale threshold (heartbeat backstop).
 
 **Recovery:**
 - `_on_listener_dead(key)` calls `_restart_listener(key)` — creates a fresh listener in place
@@ -61,7 +61,7 @@ Listeners are NOT restarted here. The self-healing mechanism in `_mac_tap_heal.p
 - `_stream` is nulled so next `start()` opens fresh
 - Logged at WARNING
 
-### 7. Subprocess Hang (pbcopy, wtype, osascript, playerctl)
+### 7. Subprocess Hang (pbcopy, wtype, osascript, nowplaying-cli, playerctl)
 
 All subprocess calls in `injector.py` and `media.py` are bounded by `_SUBPROCESS_TIMEOUT_S = 5.0`. Media resume during shutdown runs on a daemon thread with 3s bounded join.
 
