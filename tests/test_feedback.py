@@ -69,9 +69,17 @@ def test_stderr_start_stop_are_noops():
 
 def test_stderr_accepts_all_valid_states():
     fb_inst = fb.StderrFeedback()
-    for state in fb._STATES:  # idle, listening, processing, error
+    for state in fb._STATES:  # idle, listening, processing, error, mic_warning
         fb_inst.set_state(state)
         assert fb_inst._state == state
+
+
+def test_stderr_accepts_mic_warning_state():
+    """The dead-mic warning is surfaced through the standard state
+    channel, so it must be a valid state for both implementations."""
+    fb_inst = fb.StderrFeedback()
+    fb_inst.set_state("mic_warning")
+    assert fb_inst._state == "mic_warning"
 
 
 # --- make_feedback ---------------------------------------------------------

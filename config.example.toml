@@ -81,6 +81,13 @@ sample_rate = 16000         # whisper expects 16 kHz; do not change
 silence_threshold = 0.005   # RMS floor used by the silence gate and the
                             # auto-stop watchdog. Audio below this is
                             # treated as silence. 0 disables both.
+# dead_mic_consecutive = 3  # Warn after this many consecutive *held*
+                            # recordings come back silent. A single quiet
+                            # press is normal; several in a row means the
+                            # mic device streams but no signal reaches it
+                            # (muted, switched off, or a wedged audio
+                            # driver). Any loud recording resets the count.
+                            # 0 disables the dead-mic warning.
 auto_stop_seconds = 0       # auto-stop after this many seconds of
                             # continuous silence while the key is held.
                             # Trailing silence is also trimmed from the

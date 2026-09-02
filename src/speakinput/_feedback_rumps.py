@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - exercised only when missing
     rumps = None  # type: ignore[assignment]
 
 
-_STATE_TITLE = {"idle": "○", "listening": "●", "processing": "◐", "error": "✕"}
+_STATE_TITLE = {"idle": "○", "listening": "●", "processing": "◐", "error": "✕", "mic_warning": "⚠"}
 
 
 class RumpsFeedback:  # pragma: no cover - requires a macOS GUI

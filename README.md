@@ -174,6 +174,10 @@ silence_threshold = 0.005   # RMS floor: below this counts as "silence"
 auto_stop_seconds = 0       # auto-stop after this many seconds of
                             # silence. 0 disables; you release the key
                             # yourself. Set to e.g. 0.8 to enable.
+dead_mic_consecutive = 3    # warn after this many consecutive *held*
+                            # recordings come back silent (see
+                            # Troubleshooting → "Microphone produces no
+                            # sound"). 0 disables the warning.
 ```
 
 Both flags have CLI overrides: `-S/--silence-threshold` and `-A/--auto-stop-seconds`. Lower `auto_stop_seconds` for snappier response; raise it if the watchdog is chopping mid-sentence pauses. The default is `0` — opt in by editing `config.toml` or passing `-A 0.8`.
@@ -413,7 +417,7 @@ speakinput -m base.en            # override the model for this run
 speakinput -g zh                 # force Chinese transcription
 speakinput -g en                 # force English (skips language ID)
 speakinput -l                     # show available input devices
-speakinput -D                     # record 2s, print audio stats, don't inject
+speakinput -D                     # record 2s, print audio stats, flag a silent/dead mic
 speakinput -n                     # print transcribed text to stderr instead of typing
 speakinput -T                     # don't append a space after each transcript
 speakinput -c ./my.toml           # use a custom config file
@@ -430,7 +434,7 @@ speakinput -d                     # debug mode: log every key event and transcri
 | `-g`  | `--language CODE`     | Override the **primary** profile's language (`auto` / `en` / `zh`) |
 | `-l`  | `--list-devices`      | List available input devices and exit           |
 | `-L`  | `--list-models`       | List curated whisper models and exit            |
-| `-D`  | `--diagnose`          | Record 2s and print audio stats                 |
+| `-D`  | `--diagnose`          | Record 2s, print audio stats, and flag a silent/dead mic |
 | `-n`  | `--no-inject`         | Print transcript to stderr instead of typing it |
 | `-d`  | `--debug`             | Log every key event and transcript to stderr    |
 | `-t`  | `--trailing-space`    | Append a space after each transcript (default)  |
@@ -514,6 +518,13 @@ sample_rate = 16000        # whisper expects 16 kHz; do not change
 silence_threshold = 0.005  # RMS floor used by the silence gate and the
                            # auto-stop watchdog. Audio below this counts
                            # as silence. 0 disables both.
+dead_mic_consecutive = 3   # warn after this many consecutive *held*
+                           # recordings come back silent. A single quiet
+                           # press is normal; several in a row means the
+                           # mic device streams but no signal reaches it
+                           # (muted, switched off, or a wedged driver).
+                           # Any loud recording resets the count.
+                           # 0 disables the dead-mic warning.
 auto_stop_seconds = 0      # auto-stop after this many seconds of
                            # continuous silence while the key is held.
                            # Trailing silence is also trimmed from the
@@ -564,6 +575,14 @@ Three interfaces — `Recorder`, `Transcriber`, `Injector` — are stable seams.
 - A streaming partial-results UI as you hold the key.
 
 ## Troubleshooting
+
+**Microphone produces no sound even though it's detected.** After a few consecutive held recordings come back silent, speakinput prints `[warn] microphone detected but no audio` and flips the menu-bar icon to the ⚠ warning state — the classic dead-mic symptom where the device streams but no signal reaches it. `speakinput -D` also flags this explicitly. First check for a physical mute switch on the mic and confirm no software mute (`pactl set-source-mute @DEFAULT_SOURCE@ 0`). On Linux, restart just the audio driver layer (no reboot):
+
+```bash
+systemctl --user restart pipewire pipewire-pulse wireplumber
+```
+
+Then verify signal with a short capture: `timeout 4 parec --device=@DEFAULT_SOURCE@ /tmp/m.txt && python3 -c "import array;a=array.array('h');a.frombytes(open('/tmp/m.txt','rb').read());print('peak',max(abs(x) for x in a))"`. A healthy mic shows a peak well above 0 while speaking.
 
 **Key detection works but transcript never appears in the focused app.** This is the Accessibility permission — see the [macOS permissions](#macos-permissions) section. Run with `--debug` to confirm: the `[debug] key press end` and `[debug] transcript: '...'` lines will appear, but the receiving app stays empty. Add the venv python to **Privacy & Security → Accessibility**, log out/in, and try again.
 

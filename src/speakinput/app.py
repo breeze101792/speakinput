@@ -778,6 +778,16 @@ class App:
         self._press_start_clip_text: str = ""
         self._last_chunk_text: str = ""
         self._prompt_lock = threading.Lock()
+        # Dead-mic detector. Counts consecutive *held* recordings whose
+        # RMS is below `audio.silence_threshold` (i.e. the silence gate
+        # fired). When the count reaches `audio.dead_mic_consecutive`,
+        # the user gets a prominent "microphone detected but no audio"
+        # signal — the classic dead-mic symptom where the device streams
+        # but the analog stage is silent/muted. Any loud recording
+        # resets the count. `_dead_mic_warned` makes sure we warn once
+        # per consecutive-run, not on every silent press.
+        self._consecutive_silent = 0
+        self._dead_mic_warned = False
 
     @property
     def active_profile(self) -> Profile | None:
@@ -988,10 +998,20 @@ class App:
         self._active_profile = None
         self._manual_release_pending = False
         self._watchdog = None
-        try:
-            self.feedback.set_state("idle")
-        except Exception:
-            pass
+        # Keep the dead-mic warning visible after the release so the
+        # user notices it. A loud recording later clears it (the
+        # `_dead_mic_warned` flag is reset in `_process_and_inject`
+        # when audio passes the gate).
+        if self._dead_mic_warned:
+            try:
+                self.feedback.set_state("mic_warning")
+            except Exception:
+                pass
+        else:
+            try:
+                self.feedback.set_state("idle")
+            except Exception:
+                pass
 
     def _process_and_inject(self, audio: np.ndarray, profile: Profile | None) -> None:
         """Trim, silence-gate, transcribe, and inject a chunk of audio.
@@ -1040,7 +1060,13 @@ class App:
                 self.debug,
                 f"silence gate: rms={rms:.4f} < {threshold:.4f}, skipping transcribe",
             )
+            self._note_silent_recording()
             return
+        # The audio passed the gate — the mic is delivering a signal.
+        # Reset the dead-mic counter so the warning only fires on a
+        # genuine sustained dead-mic run, not one bad press.
+        self._consecutive_silent = 0
+        self._dead_mic_warned = False
         try:
             transcriber = self.transcribers[profile.key]
         except KeyError:
@@ -1131,6 +1157,40 @@ class App:
                             )
                 except Exception:
                     log.exception("injection failed")
+
+    def _note_silent_recording(self) -> None:
+        """Account for a near-silent recording and warn if the mic looks dead.
+
+        Called every time the silence gate fires (a held recording came
+        back below `silence_threshold`). Increments the consecutive-silent
+        counter; when it reaches `audio.dead_mic_consecutive`, emit a loud
+        "microphone detected but no audio" warning once and switch the
+        menu-bar/feedback state to 'mic_warning'. The warning is a manual
+        signal, not a crash — the user can keep talking to see if it
+        clears (a loud recording resets the counter) or act on the
+        README's restart/driver guidance.
+        """
+        consecutive = self.config.audio.dead_mic_consecutive
+        if consecutive <= 0:
+            return
+        self._consecutive_silent += 1
+        if self._consecutive_silent < consecutive or self._dead_mic_warned:
+            return
+        self._dead_mic_warned = True
+        print(
+            f"[warn] microphone detected but no audio: "
+            f"{consecutive} consecutive silent recordings. The mic device "
+            f"streams but no signal is reaching it — it may be muted, "
+            f"switched off, or the audio driver is wedged. See README → "
+            f"Troubleshooting → 'Microphone produces no sound even though "
+            f"it's detected'.",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            self.feedback.set_state("mic_warning")
+        except Exception:
+            pass
 
     # Whisper's initial_prompt has a 224-token cap (the n_text_ctx of
     # tiny/base/small). Long prompts either get truncated or confuse the

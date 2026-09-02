@@ -483,6 +483,35 @@ def test_main_diagnose_short_circuits_before_app(monkeypatch):
     assert rc == 7
 
 
+def test_diagnose_warns_when_rms_below_silence_threshold(capsys, monkeypatch):
+    """-D must explicitly flag a silent capture as a dead mic, not just
+    print the raw RMS and let the user puzzle it out."""
+    import numpy as np
+    from unittest.mock import MagicMock
+
+    from speakinput import cli
+    from speakinput.config import AudioConfig, Config
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005))
+    fake_transcriber = MagicMock()
+
+    monkeypatch.setattr(
+        "speakinput.app._build_transcribers", lambda *a, **k: {config.primary.key: fake_transcriber}
+    )
+    recorder = MagicMock()
+    recorder.stop.return_value = np.zeros(16000, dtype=np.float32)  # 1s silence
+    monkeypatch.setattr(
+        "speakinput.audio.AudioRecorder", lambda *a, **k: recorder
+    )
+
+    rc = cli._diagnose(config)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "rms=" in captured.out
+    assert "silence_threshold" in captured.err
+    assert "muted or switched off" in captured.err
+
+
 def test_main_rejects_invalid_model_choice():
     """argparse choices must reject bogus model names with exit code 2."""
     from speakinput.cli import _build_parser

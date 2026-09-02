@@ -181,6 +181,20 @@ class AudioConfig:
     #      themselves. Trailing silence is also trimmed from the
     #      buffer before transcribe.
     silence_threshold: float = 0.005
+    # A recording whose RMS is below `silence_threshold` counts as
+    # "silent" for the dead-mic detector (see `dead_mic_consecutive`).
+    # This is the same floor the silence gate and auto-stop watchdog
+    # use, so "no signal" is judged consistently everywhere.
+    #
+    # How many consecutive *held* recordings must come back below
+    # `silence_threshold` before speakinput shows a "microphone
+    # detected but no audio" warning. The key is being held for a real
+    # press while you speak, but nothing is captured — the classic
+    # dead-mic symptom (device streams but the analog stage is silent).
+    # A single near-silent recording is normal (accidental tap, a
+    # pause); N in a row means the mic is broken/muted/mis-routed.
+    # Any loud recording resets the counter. 0 disables the detector.
+    dead_mic_consecutive: int = 3
     # Seconds of consecutive sub-threshold audio that triggers an
     # auto-stop while the key is held. 0 disables the watchdog entirely
     # (the old "release the key yourself" behavior). Default 0 — by
@@ -465,6 +479,10 @@ class Config:
             raise ValueError("audio.sample_rate must be positive")
         if self.audio.silence_threshold < 0:
             raise ValueError("audio.silence_threshold must be >= 0 (0 disables)")
+        if self.audio.dead_mic_consecutive < 0:
+            raise ValueError(
+                "audio.dead_mic_consecutive must be >= 0 (0 disables the dead-mic detector)"
+            )
         if self.audio.auto_stop_seconds < 0:
             raise ValueError("audio.auto_stop_seconds must be >= 0 (0 disables)")
         if self.audio.prev_clip_window_seconds < 0:

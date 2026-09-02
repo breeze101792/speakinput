@@ -180,6 +180,134 @@ def test_release_silence_skips_transcribe(capsys):
     assert "skipping transcribe" in captured.err
 
 
+def test_dead_mic_warns_after_consecutive_silent_recordings(capsys):
+    """After `dead_mic_consecutive` near-silent held recordings in a row,
+    the app must emit a loud 'microphone detected but no audio' warning
+    and flip the feedback state to mic_warning."""
+    from speakinput.app import App
+
+    config = Config(
+        audio=AudioConfig(
+            silence_threshold=0.005,
+            auto_stop_seconds=0,
+            dead_mic_consecutive=3,
+        )
+    )
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
+    transcriber = MagicMock()
+    injector = MagicMock()
+    feedback = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=injector,
+        feedback=feedback,
+        debug=True,
+    )
+    # Two silent presses is not enough — no warning yet.
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+    captured = capsys.readouterr()
+    assert "microphone detected but no audio" not in captured.err
+    assert feedback.set_state.call_args_list.count(
+        ("mic_warning",)
+    ) == 0
+
+    # The third silent press crosses the threshold -> warn once.
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+    captured = capsys.readouterr()
+    assert "microphone detected but no audio" in captured.err
+    assert ("mic_warning",) in [
+        c[0] for c in feedback.set_state.call_args_list
+    ]
+
+
+def test_dead_mic_warns_only_once_per_run(capsys):
+    """The warning must not repeat on every silent press after the first
+    time it fires — once per consecutive silent run."""
+    from speakinput.app import App
+
+    config = Config(
+        audio=AudioConfig(
+            silence_threshold=0.005,
+            auto_stop_seconds=0,
+            dead_mic_consecutive=2,
+        )
+    )
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+    feedback = MagicMock()
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=feedback,
+        debug=True,
+    )
+    for _ in range(4):
+        app.on_hotkey_press(config.primary)
+        app.on_hotkey_release(config.primary)
+    captured = capsys.readouterr()
+    assert captured.err.count("microphone detected but no audio") == 1
+
+
+def test_dead_mic_resets_on_loud_recording(capsys):
+    """A recording that passes the silence gate resets the dead-mic
+    counter, so a subsequent silent run must re-arm the warning."""
+    from speakinput.app import App
+
+    config = Config(
+        audio=AudioConfig(
+            silence_threshold=0.005,
+            auto_stop_seconds=0,
+            dead_mic_consecutive=2,
+        )
+    )
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    transcriber = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+    feedback = MagicMock()
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=feedback,
+        debug=True,
+    )
+    # One silent press, then a loud one (passes the gate, resets).
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+    recorder.drain.return_value = np.full(16000, 0.5, dtype=np.float32)
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+
+    # Loud recording reset the counter. Now one more silent press alone
+    # (only count == 1) must NOT warn.
+    recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+    captured = capsys.readouterr()
+    assert "microphone detected but no audio" not in captured.err
+
+
 def test_release_silence_threshold_zero_disables_gate(capsys):
     from speakinput.app import App
 

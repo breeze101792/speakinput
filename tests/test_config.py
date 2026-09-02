@@ -204,6 +204,29 @@ def test_with_overrides_auto_stop_seconds():
     assert cfg.audio.auto_stop_seconds == 0  # original untouched
 
 
+# --- dead_mic_consecutive --------------------------------------------------
+
+
+def test_default_dead_mic_consecutive():
+    assert Config().audio.dead_mic_consecutive == 3
+
+
+def test_validation_rejects_negative_dead_mic_consecutive():
+    with pytest.raises(ValueError, match="dead_mic_consecutive"):
+        Config(audio=AudioConfig(dead_mic_consecutive=-1)).validate()
+
+
+def test_validation_allows_zero_dead_mic_consecutive():
+    """0 is the documented way to disable the dead-mic warning — must
+    validate, not error."""
+    Config(audio=AudioConfig(dead_mic_consecutive=0)).validate()
+
+
+def test_from_dict_dead_mic_consecutive():
+    cfg = Config.from_dict({"audio": {"dead_mic_consecutive": 5}})
+    assert cfg.audio.dead_mic_consecutive == 5
+
+
 # --- prev_clip_window_seconds --------------------------------------------
 
 

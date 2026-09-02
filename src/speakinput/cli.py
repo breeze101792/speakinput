@@ -354,6 +354,16 @@ def _diagnose(config: Config) -> int:
     print(
         f"captured {audio.size} samples ({audio.size / config.audio.sample_rate:.2f}s) rms={rms:.4f}"
     )
+    threshold = config.audio.silence_threshold
+    if threshold > 0 and rms < threshold:
+        print(
+            f"warning: rms is below the silence_threshold ({threshold:.4f}). "
+            "The mic device streams but little/no audio is reaching it — "
+            "it may be muted or switched off, or the audio driver is "
+            "wedged. See README → Troubleshooting → 'Microphone produces "
+            "no sound even though it's detected'.",
+            file=sys.stderr,
+        )
     return 0
 
 
