@@ -18,13 +18,19 @@ Three backends are available, picked per-platform by `select_injector`:
   and reachable via a Unix socket (`$YDOTOOL_SOCKET` or
   `/run/user/<uid>/.ydotool_socket`).
 
-All three expose the same public surface — `inject(text)` — and
-share the same ASCII / Unicode split. ASCII text is typed
-character-by-character through the backend (fast, no side effects).
-Unicode (CJK, accents, emoji) goes through the clipboard: write to
-clipboard, send the paste shortcut, restore the prior clipboard
-contents after a short delay. The restore is what keeps this from
-being a destructive operation on the user's clipboard.
+All three expose the same public surface — `inject(text)`. `wtype`
+types Unicode directly: it uploads an XKB keymap with one keycode per
+distinct character, so CJK, accents and emoji arrive as ordinary key
+events. That is the only path that works in a terminal emulator, which
+pastes on `Ctrl+Shift+V` and therefore ignores the `Ctrl+V` that the
+clipboard path sends (`Ctrl+V` is readline's `quoted-insert`).
+
+`TypingInjector` (pynput) and `YdotoolInjector` still take the
+clipboard route for non-ASCII text: pynput only types what the active
+keymap can produce, and ydotool's `type` is an ASCII-only keycode
+table. That path writes to the clipboard, sends the paste shortcut,
+and restores the prior clipboard contents after a short delay — the
+restore keeps the operation from destroying the user's clipboard.
 """
 
 from __future__ import annotations
@@ -61,6 +67,14 @@ _PRINTABLE_ASCII = set(string.printable) - set("\t\n\r\x0b\x0c")
 # hotkey silently stops working.
 _SUBPROCESS_TIMEOUT_S = 5.0
 
+# wtype uploads the virtual keyboard's keymap after connecting and presses
+# keys immediately. Compositor → client keymap propagation is not
+# synchronous, so the first key press of a run is delivered against the
+# previous keymap and is lost. Measured on wtype 0.4 + sway + alacritty:
+# "hello world" arrives as "ello world" without a pause; 5 ms was enough
+# in testing, 30 ms leaves margin and is imperceptible to the user.
+_WTYPE_KEYMAP_SETTLE_MS = 30
+
 
 class Injector(Protocol):
     def inject(self, text: str) -> None: ...
@@ -70,7 +84,8 @@ def is_ascii_safe(text: str) -> bool:
     """True when `text` can be sent character-by-character without losing meaning.
 
     Allows printable ASCII plus common whitespace. Anything outside (CJK,
-    accented chars, emoji, box-drawing) goes through the clipboard path.
+    accented chars, emoji, box-drawing) is Unicode: wtype types it directly,
+    the pynput and ydotool backends go through the clipboard path.
     """
     return all(ch in _PRINTABLE_ASCII or ch in (" ", "\t") for ch in text)
 
@@ -277,15 +292,15 @@ class TypingInjector:
 class WtypeInjector:
     """Types text into the focused field via `wtype` (wlroots virtual-keyboard).
 
-    ASCII path: `wtype -- <text>` (one call, fast).
-    Unicode path: `wl-copy` + `wtype -M ctrl -k v` (clipboard paste).
-    The prior clipboard is snapshotted and restored after
-    `restore_clipboard_ms` to avoid clobbering whatever the user
-    had there.
+    wtype builds its own XKB keymap and assigns one keycode per distinct
+    character, so `wtype -- <text>` types Unicode (CJK, accents, emoji)
+    directly. No clipboard is involved on this backend; the paste chord
+    never has to be guessed, which is why terminals accept the text.
+    A short `-s` pause follows the keymap upload so the first key press
+    is not delivered against the stale keymap (see
+    `_WTYPE_KEYMAP_SETTLE_MS`).
 
-    The `wtype` binary must be on PATH. The `wl-copy` binary is
-    only needed for the Unicode path; if it's missing, the ASCII
-    path still works.
+    The `wtype` binary must be on PATH.
     """
 
     def __init__(
@@ -315,15 +330,35 @@ class WtypeInjector:
             return
         with self._lock:
             payload = text + " " if self._trailing_space else text
-            if is_ascii_safe(payload):
-                # `wtype -- <text>` types the text without interpreting
-                # the leading `--` as a flag. Newlines are typed as
-                # `Return` automatically by wtype.
-                _run_subprocess(["wtype", "--", payload])
-                return
-            self._inject_unicode(payload)
+            # `wtype -- <text>` types the text without interpreting the
+            # leading `--` as a flag. Newlines are typed as `Return`
+            # automatically by wtype. Unicode needs no special case:
+            # wtype maps each distinct character to its own keycode.
+            # `-s` pauses after the keymap upload so the focused client
+            # has applied it before the first key arrives.
+            args = ["wtype", "-s", str(_WTYPE_KEYMAP_SETTLE_MS), "--", payload]
+            try:
+                _run_subprocess(args)
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+                # ASCII failing means the backend itself is gone (binary
+                # removed, compositor wedged) — let the fallback chain
+                # take over. A Unicode-only refusal (non-UTF-8 locale,
+                # unsupported codepoint) is not a dead backend, so try
+                # the clipboard once and keep wtype alive for the rest
+                # of the session.
+                if is_ascii_safe(payload):
+                    raise
+                print(
+                    "[warn] wtype could not type the text directly; "
+                    "falling back to clipboard paste (a terminal will "
+                    "ignore Ctrl+V)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._inject_unicode(payload)
 
     def _inject_unicode(self, text: str) -> None:
+        """Clipboard rescue path, used only when `wtype` refuses the text."""
         self._prior_clipboard = _clipboard_read()
         try:
             _pbcopy(text)

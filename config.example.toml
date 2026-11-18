@@ -115,7 +115,8 @@ prev_clip_window_seconds = 60   # When the next press starts within this
 
 [inject]
 restore_clipboard_ms = 50   # how long to wait before restoring the prior
-                            # clipboard contents (Unicode paste path only)
+                            # clipboard contents (only the clipboard paths:
+                            # pynput and ydotool; wtype types Unicode directly)
 trailing_space = true       # append a single space after each transcript
                             # (set false for code editors)
 # backend = "auto"          # Output injection backend. One of:

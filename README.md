@@ -390,13 +390,13 @@ Verify with `ls -l /dev/input/event*` — your user should be able to `cat` one 
 
 On Wayland, the output side is also auto-detected. Speak Input picks the first available of:
 
-1. **`wtype`** — uses the wlroots `virtual-keyboard-unstable-v1` protocol directly. Daemon-free, works on any wlroots-based compositor (Sway, swayfx, Hyprland, river). Not supported on GNOME or KDE. Install: `pacman -S wtype` (Arch), `apt install wtype` (Debian/Ubuntu).
-2. **`ydotool`** — uinput-based, needs the `ydotoold` daemon. Install: `pacman -S ydotool` (Arch), `apt install ydotool` (Debian), then `systemctl --user enable --now ydotool` to start the daemon. Works on more compositors (including eventually GNOME via libei).
+1. **`wtype`** — uses the wlroots `virtual-keyboard-unstable-v1` protocol directly. Daemon-free, works on any wlroots-based compositor (Sway, swayfx, Hyprland, river). Not supported on GNOME or KDE. Install: `pacman -S wtype` (Arch), `apt install wtype` (Debian/Ubuntu). wtype uploads its own keymap, so it types non-ASCII text (Chinese, accents, emoji) directly — no clipboard, and it works in terminals.
+2. **`ydotool`** — uinput-based, needs the `ydotoold` daemon. Install: `pacman -S ydotool` (Arch), `apt install ydotool` (Debian), then `systemctl --user enable --now ydotool` to start the daemon. Works on more compositors than wtype, but `ydotool type` only handles ASCII, so non-ASCII text goes through the clipboard and is pasted with `Ctrl+V`. ydotool has no libei support; GNOME's own input-injection path (libei over the RemoteDesktop portal) carries keycodes only, so on GNOME Wayland neither tool can type Chinese — use wtype on a wlroots compositor or an IBus engine there.
 3. **`pynput`** — last-resort fallback. Only works through XWayland, so it does nothing useful on a pure-Wayland session; if you see this in the startup banner, install wtype or ydotool.
 
 The startup banner shows the chosen backend. Override with `[inject].backend = "wtype" | "ydotool" | "pynput"` in `config.toml`.
 
-For the Unicode (CJK, accented) path, speakinput also needs a working clipboard tool. On Wayland that's `wl-copy` / `wl-paste` from the `wl-clipboard` package (`pacman -S wl-clipboard`, `apt install wl-clipboard`). The user's prior clipboard contents are restored after each injection.
+The clipboard path (pynput and ydotool, non-ASCII text only) needs a working clipboard tool. On Wayland that's `wl-copy` / `wl-paste` from the `wl-clipboard` package (`pacman -S wl-clipboard`, `apt install wl-clipboard`). The user's prior clipboard contents are restored after each injection. wtype needs none of this.
 
 ### Double-fires with other key-grabbers
 
@@ -540,7 +540,7 @@ prev_clip_window_seconds = 60  # Reuse the most recent transcription as
 
 [inject]
 restore_clipboard_ms = 50  # how long to wait before restoring the prior clipboard contents
-                           # (only relevant when injecting Unicode text)
+                           # (only used by the clipboard paths: pynput, ydotool)
 trailing_space = true      # append a single space after each transcript
                            # (set false for code editors where you don't want auto-spacing)
 ```
@@ -563,7 +563,8 @@ hotkey release →  AudioRecorder stops
               →  trim trailing silence from the buffer (30ms hops)
               →  silence gate: if whole buffer's RMS < threshold, skip
               →  profile.transcriber.transcribe(buffer)
-              →  TypingInjector types the result (or pastes via clipboard for non-ASCII)
+              →  the injector types the result (wtype types Unicode directly;
+                 the pynput / ydotool backends paste non-ASCII via clipboard)
 ```
 
 The App keeps a `key → profile` map. When a key fires, the matching profile's transcriber runs (with that profile's language + initial_prompt). When two profiles share a model file, they share a `WhisperCppTranscriber` instance — one model load, ~466 MB resident, two keys.
@@ -597,6 +598,8 @@ Then verify signal with a short capture: `timeout 4 parec --device=@DEFAULT_SOUR
 **The startup banner says `cpu (wheel is CPU-only)` even after I ran the install command.** Check the build log for `error: failed to find cuBLAS` (CUDA) or `error: Vulkan headers not found` (Vulkan). The most common cause on Arch is missing the `cuda` / `vulkan-headers` package; the second most common is pip reusing a cached sdist (`--no-cache` fixes that).
 
 **On Linux Wayland, the transcript shows up in debug output but nothing is typed into the focused app.** pynput is X11-only — the output side needs a Wayland-native typing tool. Install `wtype` (preferred, daemon-free) or `ydotool` + start `ydotoold`. See the [Text injection](#text-injection-the-typing-part) section above.
+
+**Chinese (or accented/emoji) text appears in a browser but not in the terminal.** The terminal pastes on `Ctrl+Shift+V`; `Ctrl+V` is readline's `quoted-insert`, so the clipboard path types nothing there. wtype is the only backend that types Unicode directly instead of pasting, so check the startup banner and make sure it says `wtype`. On the ydotool or pynput backends no setting makes Chinese work in a terminal.
 
 **The right-Option hotkey (macOS default) triggers menu mnemonics.** v1 uses `suppress=False` so the key reaches other apps — useful for Alt-Tab, but it can arm menu shortcuts in some apps. v2 will add a `suppress=True` mode for that case. On Linux/Windows the default is Right Ctrl, which has fewer menu-mnemonic conflicts.
 

@@ -19,3 +19,10 @@ chain, listener self-healing, and the complete configuration reference), see
 - [platforms.md](platforms.md) — macOS, Linux, and Windows support: backend
   selection for hotkey detection and text injection, permissions, clipboard
   handling, and the cross-platform differences table.
+- [research/text-injection-unicode.md](research/text-injection-unicode.md) —
+  what each injection backend can type (wtype, ydotool, pynput on macOS, X11,
+  Windows) and what Wayland terminals do with a Unicode keysym.
+- [research/gnome-wayland-injection.md](research/gnome-wayland-injection.md) —
+  how GNOME/Mutter exposes input injection (EIS over the RemoteDesktop
+  portal, the on-screen-keyboard path, IBus) and why Unicode still cannot be
+  injected there.

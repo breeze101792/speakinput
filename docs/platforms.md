@@ -76,9 +76,11 @@ elif Linux X11:
     TypingInjector (pynput)
 ```
 
-**wtype** uses the wlroots virtual-keyboard protocol. ASCII: direct typing. Unicode: `wl-copy` + `Ctrl+V`.
+**wtype** uses the wlroots virtual-keyboard protocol. It uploads its own XKB keymap with one keycode per distinct character, so ASCII and Unicode (CJK, accents, emoji) are both typed directly. No clipboard, and the text therefore lands in terminal emulators, which paste on `Ctrl+Shift+V` and ignore `Ctrl+V`. wtype needs a short pause after the keymap upload before the first key press (the compositor and client apply the new keymap asynchronously; without it the first character is dropped) — that is `_WTYPE_KEYMAP_SETTLE_MS` in `injector.py`.
 
-**ydotool** uses uinput. Needs `ydotoold` daemon. Same clipboard approach for Unicode.
+**ydotool** uses uinput. Needs `ydotoold` daemon. Its `type` command is an ASCII-only keycode table, so non-ASCII text goes through the clipboard and `Ctrl+V`. That works in GUIs but not in terminals.
+
+**GNOME / KDE** implement neither the virtual-keyboard protocol nor a way to inject Unicode: Mutter's EIS seat (since 45) exposes keyboard/pointer devices with keycodes only, and `zwp_input_method_v1` is not implemented. On those desktops the only routes that carry CJK are an IBus engine or a compositor extension. See `docs/research/gnome-wayland-injection.md`.
 
 ### Clipboard on Linux
 Uses `pyperclip` which falls back to `wl-paste`/`wl-copy` on Wayland or `xclip`/`xsel` on X11.
@@ -97,7 +99,7 @@ Uses `pyperclip` which falls back to `wl-paste`/`wl-copy` on Wayland or `xclip`/
 | Hotkey backend | pynput only | evdev (preferred) → pynput |
 | CGEventTap healing | Yes (`_mac_tap_heal.py`) | N/A |
 | Sleep recovery | Recorder close + tap self-heal (no listener restart) | Same (clock skew detection) |
-| Unicode injection | pbcopy → Cmd+V | wl-copy → Ctrl+V |
+| Unicode injection | pbcopy → Cmd+V | wtype types it directly; ydotool/pynput use wl-copy → Ctrl+V |
 | Media control | nowplaying-cli → osascript fallback | playerctl |
 | Menu bar | rumps (NSStatusBar) | stderr |
 | Permissions | Input Monitoring + Accessibility | `input` group for evdev |

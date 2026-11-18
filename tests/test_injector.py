@@ -187,9 +187,9 @@ def test_inject_concurrent_unicode_calls_are_serialized(fake_modules, monkeypatc
 #
 # These tests patch the binary-discovery path (shutil.which / os.environ /
 # os.path.exists) and subprocess.run so the tests run without a real wtype,
-# ydotool, wl-copy, or running compositor. The ASCII / Unicode split logic
-# is shared with TypingInjector; here we only verify the backend-specific
-# subprocess commands and the auto-select dispatch.
+# ydotool, wl-copy, or running compositor. The clipboard fallback for
+# non-ASCII text is shared with TypingInjector; here we only verify the
+# backend-specific subprocess commands and the auto-select dispatch.
 
 
 @pytest.fixture
@@ -240,28 +240,59 @@ def test_wtype_injector_ascii_appends_trailing_space_by_default(
     assert args[-1] == "hi "
 
 
-def test_wtype_injector_unicode_uses_clipboard_paste(
+def test_wtype_injector_unicode_is_typed_directly(_wtype_available, _patch_subprocess):
+    """CJK is handed to wtype as text: no clipboard write, no paste chord.
+
+    This is what makes dictation work in a terminal emulator, which pastes
+    on Ctrl+Shift+V and ignores the Ctrl+V the clipboard path sends.
+    """
+    from speakinput.injector import WtypeInjector
+
+    inj = WtypeInjector(trailing_space=False)
+    inj.inject("你好")
+    _patch_subprocess.assert_called_once()
+    args = _patch_subprocess.call_args.args[0]
+    # `-s` pauses after the keymap upload; without it the first key press
+    # is delivered against the stale keymap and the character is lost.
+    assert args[:2] == ["wtype", "-s"]
+    assert args[3:] == ["--", "你好"]
+
+
+def test_wtype_injector_unicode_falls_back_to_clipboard_on_wtype_error(
     _wtype_available, _patch_subprocess, fake_modules, monkeypatch
 ):
-    """Non-ASCII text writes to the clipboard, sends Ctrl+V via wtype, then
-    schedules a restore of the prior clipboard contents."""
+    """A wtype refusal on Unicode text must not disable the backend for the
+    session: clipboard paste is tried instead."""
     from speakinput.injector import WtypeInjector
 
     monkeypatch.setattr("speakinput.injector.sys.platform", "linux")
     _, pyperclip_mod = fake_modules
-    inj = WtypeInjector(trailing_space=False)
+
+    def fake_run(args, **kwargs):
+        if "--" in args:
+            raise subprocess.CalledProcessError(1, args)
+        return MagicMock()
+
+    _patch_subprocess.side_effect = fake_run
+    inj = WtypeInjector(restore_clipboard_ms=0, trailing_space=False)
     inj.inject("你好")
-    # Clipboard got the text.
     pyperclip_mod.copy.assert_any_call("你好")
-    # wtype was called with a Ctrl+V sequence.
-    paste_call = [
-        c for c in _patch_subprocess.call_args_list
-        if c.args and c.args[0] and c.args[0][0] == "wtype"
-        and "-k" in c.args[0]
+    paste_calls = [
+        c.args[0] for c in _patch_subprocess.call_args_list
+        if c.args[0] == ["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"]
     ]
-    assert paste_call, "expected a wtype paste invocation"
-    args = paste_call[0].args[0]
-    assert args == ["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"]
+    assert paste_calls, "expected a clipboard paste after the wtype failure"
+
+
+def test_wtype_injector_ascii_error_propagates(_wtype_available, _patch_subprocess):
+    """An ASCII failure means the backend itself is gone, so the exception
+    must reach the fallback chain instead of a silent clipboard paste."""
+    from speakinput.injector import WtypeInjector
+
+    _patch_subprocess.side_effect = subprocess.CalledProcessError(1, ["wtype"])
+    inj = WtypeInjector(trailing_space=False)
+    with pytest.raises(subprocess.CalledProcessError):
+        inj.inject("hello")
 
 
 def test_wtype_injector_raises_when_wtype_missing(monkeypatch):
