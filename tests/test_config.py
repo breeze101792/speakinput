@@ -254,6 +254,51 @@ def test_with_overrides_prev_clip_window_seconds():
     assert cfg.audio.prev_clip_window_seconds == 60.0  # untouched
 
 
+# --- speech gate (VAD) ----------------------------------------------------
+
+
+def test_default_speech_gate_values():
+    assert Config().audio.vad_noise_margin == 2.0
+    assert Config().audio.vad_min_speech_ms == 80.0
+
+
+def test_validation_rejects_noise_margin_below_one():
+    with pytest.raises(ValueError, match="vad_noise_margin"):
+        Config(audio=AudioConfig(vad_noise_margin=0.5)).validate()
+
+
+def test_validation_rejects_negative_min_speech_ms():
+    with pytest.raises(ValueError, match="vad_min_speech_ms"):
+        Config(audio=AudioConfig(vad_min_speech_ms=-1)).validate()
+
+
+def test_validation_allows_zero_min_speech_ms():
+    Config(audio=AudioConfig(vad_min_speech_ms=0)).validate()
+
+
+def test_validation_rejects_non_finite_min_speech_ms():
+    with pytest.raises(ValueError, match="vad_min_speech_ms"):
+        Config(audio=AudioConfig(vad_min_speech_ms=float("nan"))).validate()
+
+
+def test_validation_rejects_non_finite_noise_margin():
+    with pytest.raises(ValueError, match="vad_noise_margin"):
+        Config(audio=AudioConfig(vad_noise_margin=float("inf"))).validate()
+
+
+def test_config_loads_speech_gate_from_toml(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[audio]\n"
+        "silence_threshold = 0.005\n"
+        "vad_noise_margin = 3.0\n"
+        "vad_min_speech_ms = 150\n"
+    )
+    cfg = Config.from_toml(path)
+    assert cfg.audio.vad_noise_margin == 3.0
+    assert cfg.audio.vad_min_speech_ms == 150
+
+
 def test_cli_auto_stop_seconds_short_flag():
     from speakinput.cli import _build_parser
 

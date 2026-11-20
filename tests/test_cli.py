@@ -8,6 +8,7 @@ lock."""
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -510,6 +511,87 @@ def test_diagnose_warns_when_rms_below_silence_threshold(capsys, monkeypatch):
     assert "rms=" in captured.out
     assert "silence_threshold" in captured.err
     assert "muted or switched off" in captured.err
+
+
+def test_diagnose_reports_speech_gate_verdict(capsys, monkeypatch):
+    """-D must say whether the captured buffer would pass the speech
+    gate, so "nothing gets typed" can be traced to the gate."""
+    from unittest.mock import MagicMock
+
+    from speakinput import cli
+    from speakinput.config import AudioConfig, Config
+    from audio_signals import room_tone
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005))
+    monkeypatch.setattr(
+        "speakinput.app._build_transcribers",
+        lambda *a, **k: {config.primary.key: MagicMock()},
+    )
+    recorder = MagicMock()
+    # Room tone above the floor: passes stage 1, fails stage 2.
+    recorder.stop.return_value = room_tone(2000, level=0.02)
+    monkeypatch.setattr("speakinput.audio.AudioRecorder", lambda *a, **k: recorder)
+
+    rc = cli._diagnose(config)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "speech gate: noise_floor=" in captured.err
+    assert "audio would be dropped" in captured.err
+
+
+def test_diagnose_reports_speech_gate_pass(capsys, monkeypatch):
+    """The verdict must also report a pass — otherwise the user cannot
+    tell the gate apart from a broken mic or model."""
+    from unittest.mock import MagicMock
+
+    from speakinput import cli
+    from speakinput.config import AudioConfig, Config
+    from audio_signals import speech_like
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005))
+    monkeypatch.setattr(
+        "speakinput.app._build_transcribers",
+        lambda *a, **k: {config.primary.key: MagicMock()},
+    )
+    recorder = MagicMock()
+    recorder.stop.return_value = speech_like(1500, level=0.2)
+    monkeypatch.setattr("speakinput.audio.AudioRecorder", lambda *a, **k: recorder)
+
+    rc = cli._diagnose(config)
+    assert rc == 0
+    assert "audio would reach whisper" in capsys.readouterr().err
+
+
+def test_diagnose_trims_trailing_silence_before_scoring(capsys, monkeypatch):
+    """The app trims before both gates; the diagnostic must score the
+    same buffer or its verdict contradicts what a press would do."""
+    import numpy as np
+    from unittest.mock import MagicMock
+
+    from speakinput import cli
+    from speakinput.config import AudioConfig, Config
+    from audio_signals import room_tone, speech_like
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005))
+    monkeypatch.setattr(
+        "speakinput.app._build_transcribers",
+        lambda *a, **k: {config.primary.key: MagicMock()},
+    )
+    # 1s of speech followed by 1s of digital silence: untrimmed, the
+    # mean RMS is diluted by the silent half.
+    recorder = MagicMock()
+    recorder.stop.return_value = np.concatenate(
+        [speech_like(1000, level=0.2), room_tone(samples=16000, level=0.0)]
+    )
+    monkeypatch.setattr("speakinput.audio.AudioRecorder", lambda *a, **k: recorder)
+
+    rc = cli._diagnose(config)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The reported duration is the trimmed one (< 1.5s), not the raw 2s.
+    match = re.search(r"\(([0-9.]+)s\)", out)
+    assert match is not None
+    assert float(match.group(1)) < 1.5
 
 
 def test_main_rejects_invalid_model_choice():

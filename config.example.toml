@@ -78,9 +78,24 @@ beam_size = 1               # 1 = greedy (fastest); 2..10 = beam search
 
 [audio]
 sample_rate = 16000         # whisper expects 16 kHz; do not change
-silence_threshold = 0.005   # RMS floor used by the silence gate and the
-                            # auto-stop watchdog. Audio below this is
-                            # treated as silence. 0 disables both.
+silence_threshold = 0.005   # Absolute RMS floor. A recording quieter
+                            # than this is dropped (and counts toward
+                            # the dead-mic warning); the auto-stop
+                            # watchdog uses it as its silence level.
+                            # 0 disables the gate, the speech gate
+                            # below, and the watchdog.
+vad_noise_margin = 2.0      # Speech gate: after a buffer clears
+                            # silence_threshold, it is split into 20ms
+                            # frames and a frame counts as speech only
+                            # when it is this many times the buffer's
+                            # own noise floor. 2.0 is 6dB. Raise it
+                            # (e.g. 3.0) in a noisy room; lower toward
+                            # 1.5 if quiet words are being dropped.
+                            # Only used when silence_threshold > 0.
+vad_min_speech_ms = 80      # Accumulated speech needed before
+                            # transcribing. A keyboard click is 20-40ms
+                            # and is rejected here. Only used when
+                            # silence_threshold > 0.
 # dead_mic_consecutive = 3  # Warn after this many consecutive *held*
                             # recordings come back silent. A single quiet
                             # press is normal; several in a row means the

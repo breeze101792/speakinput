@@ -159,6 +159,33 @@ n_threads = 0       # CPU threads for the CPU path (0 = auto)
 - **CoreML / Apple Neural Engine** is the macOS equivalent of GPU and would be 5-10x faster than the current CPU path on M-series Macs. The probe code already lists `metal` / `coreml` strings as a recognized backend; just needs a `WHISPER_COREML=1` install step documented.
 - **An `install-gpu.sh` helper** that auto-detects the GPU vendor via `lspci` and runs the right command. Easy follow-up. *(Shipped as `./setup.sh` — this follow-up is done.)*
 
+## Speech gate
+
+Unless `silence_threshold = 0`, every recording passes two gates before whisper sees it:
+
+1. **Absolute floor.** If the buffer's RMS is below `silence_threshold`, nothing reached the mic at all — the press is dropped and counted toward the dead-mic warning (see [Troubleshooting](#troubleshooting)).
+2. **Speech activity.** A buffer can clear the absolute floor and still contain no speech: a fan, an air conditioner, a keyboard click, a tap on the desk. A whole-buffer mean RMS cannot tell those apart from a voice — one click is enough to lift the mean — so the buffer is split into 20ms frames, the noise floor is estimated from the buffer itself (10th percentile of the frame RMS values, ignoring frames that are exactly zero so a muted device cannot zero it out), and every frame at least `vad_noise_margin` times that floor counts as speech. The press is dropped unless the speech totals `vad_min_speech_ms` *and* contains one unbroken run of 60ms, which is what rejects clicks: a click energises one or two frames, and two clicks in one press would otherwise add up to the length of a word.
+
+This is a short-time energy VAD, not a neural one: it needs no extra model and costs microseconds. It relies on speech varying in level (10-20dB between syllables) while noise does not, which is what lets it reject room tone *louder* than `silence_threshold`. The trade-off is that a signal varying by less than about 6dB never counts as speech, however loud: a hum, a test tone, or a voice flattened by heavy AGC. Normal speech, including a raised voice, is far more modulated than that.
+
+```toml
+[audio]
+silence_threshold = 0.005  # absolute floor; 0 disables both gates
+vad_noise_margin = 2.0     # a frame must be this many times the
+                           # estimated noise floor to count as speech.
+                           # 2.0 is 6dB. Raise in a noisy room,
+                           # lower toward 1.5 for quiet speech.
+vad_min_speech_ms = 80     # accumulated speech needed before
+                           # transcribing. A click is 20-40ms.
+```
+
+Run with `-d/--debug` to print the measured noise floor and speech duration for each press that reaches the gate; that is how you pick a value for your room. `-D/--diagnose` records two seconds once and prints the same numbers plus a verdict.
+
+```
+[debug] speech gate: noise_floor=0.0213, speech=140ms, min=80ms
+[debug] speech gate: 20ms of speech above the noise floor (< 80ms min), skipping transcribe
+```
+
 ## Auto-stop on silence
 
 By default Speak Input stops the recording **when you release the key** — no auto-stop watchdog. If you set `auto_stop_seconds` to a positive value (e.g. `0.8`), the program stops the recording automatically after that many seconds of consecutive silence while you're holding the key, so you don't have to time the release. Two things are wired together:
@@ -166,11 +193,16 @@ By default Speak Input stops the recording **when you release the key** — no a
 - **Trailing-silence trim** runs on every release, whether manual or auto. The audio buffer is walked backwards in 30ms hops and any trailing silent portion is dropped, so whisper doesn't see a long silent tail (a real source of hallucinated filler text).
 - **Auto-stop watchdog** is a small background thread that polls the recorder's live RMS at ~20Hz. When the configured number of seconds of sub-threshold audio passes, it synthesizes a release for the active profile.
 
-The two related config knobs are both under `[audio]`:
+`auto_stop_seconds` and `silence_threshold` are both under `[audio]`:
 
 ```toml
 [audio]
-silence_threshold = 0.005   # RMS floor: below this counts as "silence"
+silence_threshold = 0.005   # absolute floor: below this counts as
+                            # "silence". 0 disables both gates.
+vad_noise_margin = 2.0      # speech gate: frames must be this many
+                            # times the buffer's noise floor to count
+                            # as speech. Raise in a noisy room.
+vad_min_speech_ms = 80      # accumulated speech needed to transcribe
 auto_stop_seconds = 0       # auto-stop after this many seconds of
                             # silence. 0 disables; you release the key
                             # yourself. Set to e.g. 0.8 to enable.
@@ -180,9 +212,9 @@ dead_mic_consecutive = 3    # warn after this many consecutive *held*
                             # sound"). 0 disables the warning.
 ```
 
-Both flags have CLI overrides: `-S/--silence-threshold` and `-A/--auto-stop-seconds`. Lower `auto_stop_seconds` for snappier response; raise it if the watchdog is chopping mid-sentence pauses. The default is `0` — opt in by editing `config.toml` or passing `-A 0.8`.
+Both have CLI overrides: `-S/--silence-threshold` and `-A/--auto-stop-seconds`. The speech-gate knobs are config-file only. Lower `auto_stop_seconds` for snappier response; raise it if the watchdog is chopping mid-sentence pauses. The default is `0` — opt in by editing `config.toml` or passing `-A 0.8`.
 
-When auto-stop fires, the release path runs the same as a manual release: same buffer-trim step, same silence-gate check, same transcriber. The only difference is who flipped the bit.
+When auto-stop fires, the release path runs the same as a manual release: same buffer-trim step, same two gates, same transcriber. The only difference is who flipped the bit.
 
 ### Multi-sentence sessions: chunked re-arm
 
@@ -515,9 +547,18 @@ beam_size = 1
 [audio]
 device = null              # null = system default mic; or an integer index from --list-devices
 sample_rate = 16000        # whisper expects 16 kHz; do not change
-silence_threshold = 0.005  # RMS floor used by the silence gate and the
-                           # auto-stop watchdog. Audio below this counts
-                           # as silence. 0 disables both.
+silence_threshold = 0.005  # Absolute RMS floor. Audio below this
+                           # counts as silence and feeds the dead-mic
+                           # warning; the auto-stop watchdog uses it as
+                           # its silence level too. 0 disables the
+                           # gate, the speech gate, and the watchdog.
+vad_noise_margin = 2.0     # Speech gate: a 20ms frame counts as speech
+                           # only when it is this many times the
+                           # buffer's own noise floor (2.0 = 6dB).
+                           # Raise in a noisy room; lower toward 1.5
+                           # for quiet speech.
+vad_min_speech_ms = 80     # Accumulated speech needed before
+                           # transcribing. A click is 20-40ms.
 dead_mic_consecutive = 3   # warn after this many consecutive *held*
                            # recordings come back silent. A single quiet
                            # press is normal; several in a row means the
@@ -561,7 +602,8 @@ hotkey press   →  look up profile by key  →  AudioRecorder starts capturing
                 →  if hotkey is released manually first → cancel watchdog
 hotkey release →  AudioRecorder stops
               →  trim trailing silence from the buffer (30ms hops)
-              →  silence gate: if whole buffer's RMS < threshold, skip
+              →  gate: RMS below the floor -> skip (dead-mic check);
+                 no speech above the buffer's noise floor -> skip
               →  profile.transcriber.transcribe(buffer)
               →  the injector types the result (wtype types Unicode directly;
                  the pynput / ydotool backends paste non-ASCII via clipboard)
@@ -609,7 +651,7 @@ Then verify signal with a short capture: `timeout 4 parec --device=@DEFAULT_SOUR
 
 **The same phrase appears multiple times in the focused field.** Two processes are listening to the hotkey. The app refuses to start a second instance — the new process exits with code 3 and a clear error message pointing at the lockfile. Check `ps aux | grep speakinput` and kill any leftover processes. A common cause is starting the app, getting distracted, then starting it again from another terminal — every instance registers a hotkey listener and your single key release fans out to all of them.
 
-**A random short phrase appears when I didn't say anything / accidentally tapped the hotkey.** Whisper hallucinates on near-empty audio — the silence gate should catch this. If you still see phantom text, your environment may be noisy enough that the RMS exceeds the default `0.005` floor. Lower it: `speakinput -S 0.01` or set `[audio].silence_threshold = 0.01` in config.toml. Set to `0` to disable the gate entirely (whisper will see every recording, including silence).
+**A random short phrase appears when I didn't say anything / accidentally tapped the hotkey.** Whisper hallucinates on near-empty audio. Two gates are meant to stop it: the absolute floor, then the speech gate (see [Speech gate](#speech-gate)). Run with `-D` and read the `speech gate:` line — it prints the measured noise floor and how much speech it found. If the floor is close to your voice level, raise `[audio].vad_noise_margin` (e.g. `3.0`); if a real word is being dropped, lower it toward `1.5` or lower `vad_min_speech_ms`. Setting `[audio].silence_threshold = 0` disables both gates, and whisper will see every recording, including silence.
 
 **Output contains "DMA", "FreeRTOS", "OpenOCD" etc. that I didn't say.** The shipped `initial_prompt` biases whisper toward embedded-software vocabulary — see [Initial prompt](#initial-prompt-vocabulary-biasing). It's a one-shot token prior: whisper overweights those words because they appear in the seed. If your dictation isn't embedded (or you want mixed/general speech), either set `[profile.primary].initial_prompt = ""` (and the same for `secondary` if you have one) in `config.toml` to disable the bias, or pass a domain-appropriate comma-separated list of the words you actually use. The phantom outputs are strongest right after the prompt tokens, weakest mid-sentence.
 

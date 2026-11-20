@@ -1,12 +1,20 @@
-"""Silence detection helpers.
+"""Silence and speech detection helpers.
 
-Two pieces:
+Three pieces:
 
 - `trim_trailing_silence`: walk a recorded buffer backwards in
   ~30ms hops and drop any trailing portion whose per-hop RMS is below
   `threshold`. The leading portion is preserved. Useful as a
   pre-transcribe cleanup step so whisper doesn't see a long silent
   tail (a real hallucination source).
+
+- `analyse_speech`: short-time energy VAD. Splits the buffer into
+  20ms frames, estimates the noise floor as a low percentile of the
+  frame RMS values, and counts the frames that stand clear of it.
+  A whole-buffer mean RMS cannot do this job: one fan, one keyboard
+  click, or one desk bump lifts the mean above any fixed floor, so
+  whisper gets fed noise and invents text. A press with no speech in
+  it is rejected here instead.
 
 - `SilenceWatchdog`: a small daemon thread that polls
   `AudioRecorder.current_rms()` while a hotkey is held, and calls a
@@ -20,6 +28,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -31,6 +40,139 @@ from speakinput.audio import Recorder
 # the end of a word, long enough to swallow a typical consonant
 # release or breath. At 16kHz that's 480 samples.
 _TRIM_HOP_SAMPLES = 480
+
+# Speech gate defaults. 20ms frames are short enough to resolve a
+# syllable onset and long enough for the RMS to be meaningful at
+# 16kHz (320 samples per frame).
+_SPEECH_FRAME_MS = 20
+# A frame counts as speech when its RMS is at least this multiple of
+# the estimated noise floor. 2.0 is 6dB — speech peaks sit 10-20dB
+# above room tone, so this clears the floor without missing quiet
+# syllables. Stationary noise (a fan, a hum) has no frame 6dB above
+# its own 10th percentile, which is what makes the gate reject it.
+_DEFAULT_NOISE_MARGIN = 2.0
+# A press must contain at least this much speech to reach whisper.
+# Below ~100ms there is not enough context to decode and whisper tends
+# to produce filler, so the default sits just under that.
+_DEFAULT_MIN_SPEECH_MS = 80.0
+# And at least one run of consecutive speech frames this long. An
+# impulse (a click, a tap) energises one or two frames; requiring a
+# sustained run is what separates a transient from a voiced syllable.
+# Bounded above by `min_speech_ms` so lowering that knob still works.
+_DEFAULT_MIN_SPEECH_RUN_MS = 60.0
+# Percentile of the frame-RMS distribution used as the noise floor.
+# The 10th percentile ignores the quiet gaps between words and the
+# loud syllables alike, so it tracks room tone in a buffer that
+# contains speech. Frames that are digitally zero are excluded first:
+# some devices and OS noise gates zero-fill muted output, and a floor
+# of 0 would collapse the relative test back to the absolute one.
+_NOISE_FLOOR_PERCENTILE = 10
+
+
+@dataclass(frozen=True)
+class SpeechStats:
+    """Result of `analyse_speech`, kept small so it is cheap to log."""
+
+    # Estimated room tone, as a frame RMS in the same units as the audio.
+    noise_floor: float
+    # Total duration of frames that stood clear of the noise floor.
+    speech_ms: float
+    # True when the speech totals the minimum duration AND contains
+    # one unbroken run long enough to be a syllable rather than a click.
+    has_speech: bool
+
+
+def _frame_rms(audio: np.ndarray, frame_samples: int) -> np.ndarray:
+    """RMS per non-overlapping frame. Trailing partial frame is dropped."""
+    n_frames = audio.size // frame_samples
+    frames = audio[: n_frames * frame_samples].reshape(n_frames, frame_samples)
+    return np.sqrt(np.mean(frames * frames, axis=1))
+
+
+def _longest_true_run(mask: np.ndarray) -> int:
+    """Length of the longest unbroken run of True in a 1-D bool array."""
+    if mask.size == 0 or not mask.any():
+        return 0
+    # Pad both ends with False so every run is closed by a False->True
+    # and a True->False edge, and read the run lengths off the edges.
+    padded = np.concatenate(([False], mask, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return int(np.max(edges[1::2] - edges[0::2]))
+
+
+def analyse_speech(
+    audio: np.ndarray,
+    sample_rate: int,
+    threshold: float,
+    *,
+    frame_ms: float = _SPEECH_FRAME_MS,
+    noise_margin: float = _DEFAULT_NOISE_MARGIN,
+    min_speech_ms: float = _DEFAULT_MIN_SPEECH_MS,
+) -> SpeechStats:
+    """Decide whether a recorded buffer contains speech.
+
+    The buffer is split into `frame_ms` frames and each frame's RMS is
+    compared against a noise floor estimated from the buffer itself
+    (the 10th percentile of frame RMS, ignoring digitally zero
+    frames). Frames above `max(threshold, noise_floor * noise_margin)`
+    count as speech.
+
+    Speech must then satisfy two conditions: at least `min_speech_ms`
+    of accumulated speech frames, and at least one unbroken run of
+    60ms. The run requirement is what rejects transients — a click
+    energises one or two frames, and two clicks in one press would
+    otherwise add up to the duration of a word.
+
+    Why not a whole-buffer mean RMS: a mean is dominated by the
+    loudest part of the buffer, so a single click is enough to lift a
+    silent press over the floor. A per-frame comparison with a floor
+    derived from the same buffer is immune to that.
+
+    The rule is one of level against the buffer's own noise floor, so
+    a perfectly steady signal (a hum, a test tone, an AGC-flattened
+    voice) never counts as speech: no frame can stand 6dB above its
+    own 10th percentile.
+
+    `threshold` is the absolute floor from `[audio].silence_threshold`.
+    A value <= 0 disables the gate: the buffer always counts as
+    speech. Buffers shorter than one frame never count as speech.
+    """
+    if audio.size == 0 or sample_rate <= 0:
+        return SpeechStats(noise_floor=0.0, speech_ms=0.0, has_speech=False)
+    duration_ms = audio.size * 1000.0 / sample_rate
+    if threshold <= 0:
+        return SpeechStats(noise_floor=0.0, speech_ms=duration_ms, has_speech=True)
+    frame_samples = int(sample_rate * frame_ms / 1000.0)
+    if frame_samples <= 0 or audio.size < frame_samples:
+        return SpeechStats(noise_floor=0.0, speech_ms=0.0, has_speech=False)
+    rms = _frame_rms(audio.astype(np.float32, copy=False), frame_samples)
+    if rms.size == 0:
+        return SpeechStats(noise_floor=0.0, speech_ms=0.0, has_speech=False)
+    # Digitally zero frames are not a measurement of room tone: a muted
+    # device or an OS noise gate zero-fills them, and letting a floor of
+    # 0 through would reduce the relative test to the absolute one.
+    audible = rms[rms > 0.0]
+    if audible.size == 0:
+        return SpeechStats(noise_floor=0.0, speech_ms=0.0, has_speech=False)
+    noise_floor = float(np.percentile(audible, _NOISE_FLOOR_PERCENTILE))
+    bar = max(threshold, noise_floor * noise_margin)
+    speech = rms >= bar
+    speech_frames = int(np.count_nonzero(speech))
+    speech_ms = speech_frames * frame_ms
+    # The run requirement never exceeds the total requirement, so
+    # lowering `min_speech_ms` (e.g. for very short words) still lets a
+    # proportionally shorter utterance through.
+    required_run_ms = min(_DEFAULT_MIN_SPEECH_RUN_MS, min_speech_ms)
+    longest_run_ms = _longest_true_run(speech) * frame_ms
+    return SpeechStats(
+        noise_floor=noise_floor,
+        speech_ms=speech_ms,
+        has_speech=(
+            speech_frames > 0
+            and speech_ms >= min_speech_ms
+            and longest_run_ms >= required_run_ms
+        ),
+    )
 
 
 def _chunk_rms(chunk: np.ndarray) -> float:

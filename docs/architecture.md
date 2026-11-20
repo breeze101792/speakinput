@@ -31,6 +31,7 @@ release work                           heartbeat stale events
           │     └── Audio teardown thread (bounded 1.5s)
           ├── _process_and_inject()
           │     ├── trim_trailing_silence()
+          │     ├── analyse_speech()  [frame VAD]
           │     ├── transcriber.transcribe()  [CPU/GPU bound]
           │     └── injector.inject()
           │           └── Clipboard restore timer (daemon)
@@ -45,7 +46,7 @@ release work                           heartbeat stale events
 | `cli.py` | Argparse CLI, `-C`/`-D`/`-L` actions, config overrides | `main` |
 | `audio.py` | PortAudio capture — start/stop/drain/close | `AudioRecorder` |
 | `hotkey.py` | Global key detection — pynput or evdev backend | `HotkeyListener` / `EvdevHotkeyListener` |
-| `silence.py` | Trailing silence trim + auto-stop watchdog | `SilenceWatchdog` |
+| `silence.py` | Trailing silence trim, speech gate (VAD), auto-stop watchdog | `analyse_speech`, `SilenceWatchdog` |
 | `config.py` | Frozen dataclass config, TOML loading | `Config` |
 | `transcriber.py` | STT engine registry — whispercpp / faster_whisper / apple | `WhisperCppTranscriber`, `create_transcriber` |
 | `injector.py` | Text injection — pynput / wtype / ydotool | `TypingInjector`, `FallbackInjector` |

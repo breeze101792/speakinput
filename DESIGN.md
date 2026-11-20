@@ -85,7 +85,9 @@ A single push-to-talk cycle:
    → on_hotkey_release / _on_watchdog_chunk:
       a. recorder.drain()  [returns accumulated audio]
       b. trim_trailing_silence()
-      c. Silence gate: if RMS < threshold, skip
+      c. Gates: absolute RMS floor (below it -> silent, dead-mic
+         counter); then analyse_speech() frame-based VAD (room tone,
+         clicks -> skip)
       d. _transcribe_with_recovery():
          - transcriber.transcribe(audio)
          - If raises: reload model, retry up to N times

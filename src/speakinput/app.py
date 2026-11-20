@@ -32,7 +32,7 @@ from speakinput.models import (
     ensure_model,
     resolve_for_language,
 )
-from speakinput.silence import SilenceWatchdog, trim_trailing_silence
+from speakinput.silence import SilenceWatchdog, analyse_speech, trim_trailing_silence
 from speakinput.transcriber import Transcriber, WhisperCppTranscriber, _gpu_summary, create_transcriber
 
 log = logging.getLogger("speakinput")
@@ -999,9 +999,9 @@ class App:
         self._manual_release_pending = False
         self._watchdog = None
         # Keep the dead-mic warning visible after the release so the
-        # user notices it. A loud recording later clears it (the
-        # `_dead_mic_warned` flag is reset in `_process_and_inject`
-        # when audio passes the gate).
+        # user notices it. A recording that passes the speech gate
+        # later clears it (the `_dead_mic_warned` flag is reset in
+        # `_process_and_inject` once audio is accepted for transcribe).
         if self._dead_mic_warned:
             try:
                 self.feedback.set_state("mic_warning")
@@ -1014,7 +1014,7 @@ class App:
                 pass
 
     def _process_and_inject(self, audio: np.ndarray, profile: Profile | None) -> None:
-        """Trim, silence-gate, transcribe, and inject a chunk of audio.
+        """Trim, gate, transcribe, and inject a chunk of audio.
 
         Pulled out of the release path so the chunked watchdog body
         and the final release body share it. Silent short-circuits
@@ -1051,10 +1051,11 @@ class App:
             self.debug,
             f"audio: {audio.size} samples, {duration:.2f}s, rms={rms:.4f}",
         )
-        # Silence gate: short-circuit near-empty recordings so whisper
-        # doesn't hallucinate on them. The default 0.005 is well above
-        # the noise floor of a quiet room but well below any actual
-        # speech. Set to 0 in config.toml to disable.
+        # Two-stage gate, both keyed on `silence_threshold`.
+        #
+        # Stage 1, absolute floor: a buffer quieter than the floor means
+        # no signal reached the mic at all. This is also the dead-mic
+        # signal, so it feeds the consecutive-silent counter.
         if threshold > 0 and rms < threshold:
             _dbg(
                 self.debug,
@@ -1062,6 +1063,36 @@ class App:
             )
             self._note_silent_recording()
             return
+        # Stage 2, speech activity: the buffer has energy, but is it
+        # speech? Room tone, a fan, or a single keyboard click clears the
+        # absolute floor and then whisper invents text from it. A
+        # per-frame comparison against the buffer's own noise floor
+        # rejects those. This is NOT a dead-mic symptom — the mic is
+        # delivering audio, it just isn't the user talking — so it does
+        # not touch the consecutive-silent counter.
+        if threshold > 0:
+            stats = analyse_speech(
+                audio,
+                self.config.audio.sample_rate,
+                threshold,
+                noise_margin=self.config.audio.vad_noise_margin,
+                min_speech_ms=self.config.audio.vad_min_speech_ms,
+            )
+            _dbg(
+                self.debug,
+                f"speech gate: noise_floor={stats.noise_floor:.4f}, "
+                f"speech={stats.speech_ms:.0f}ms, "
+                f"min={self.config.audio.vad_min_speech_ms:.0f}ms",
+            )
+            if not stats.has_speech:
+                _dbg(
+                    self.debug,
+                    f"speech gate: {stats.speech_ms:.0f}ms of speech above "
+                    f"the noise floor "
+                    f"(< {self.config.audio.vad_min_speech_ms:.0f}ms min), "
+                    f"skipping transcribe",
+                )
+                return
         # The audio passed the gate — the mic is delivering a signal.
         # Reset the dead-mic counter so the warning only fires on a
         # genuine sustained dead-mic run, not one bad press.
@@ -1982,6 +2013,13 @@ class App:
         auto_stop_str = "off" if auto_stop == 0 else f"{auto_stop:g}s"
         prev_window = cfg.audio.prev_clip_window_seconds
         prev_window_str = "off" if prev_window == 0 else f"{prev_window:g}s"
+        if threshold == 0:
+            speech_str = "off"
+        else:
+            speech_str = (
+                f"{cfg.audio.vad_min_speech_ms:g}ms "
+                f"@{cfg.audio.vad_noise_margin:g}x noise"
+            )
         if self.config_source is not None:
             source_str = str(self.config_source)
         else:
@@ -2009,7 +2047,8 @@ class App:
             *profile_lines,
             f"models   : loaded {distinct} into memory{dedupe_str}",
             f"sample   : {cfg.audio.sample_rate} Hz, device={device}",
-            f"silence  : rms<{threshold_str} -> skip; auto-stop after {auto_stop_str}",
+            f"silence  : rms<{threshold_str} -> skip; speech {speech_str}; "
+            f"auto-stop after {auto_stop_str}",
             f"continuity: across-press hint within {prev_window_str} (within-press always on)",
             f"inject   : {inject_mode}, trailing_space={cfg.inject.trailing_space}",
             f"transcribe: {_gpu_summary(cfg.transcribe.use_gpu, cfg.transcribe.gpu_device)}",

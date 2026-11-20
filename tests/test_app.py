@@ -8,6 +8,7 @@ import pytest
 import time
 
 from speakinput.config import AudioConfig, Config, Profile
+from audio_signals import room_tone, speech_like
 
 
 @pytest.fixture(autouse=True)
@@ -180,6 +181,109 @@ def test_release_silence_skips_transcribe(capsys):
     assert "skipping transcribe" in captured.err
 
 
+def test_release_noise_only_skips_transcribe(capsys):
+    """Room tone above the absolute floor has energy but no speech.
+
+    The whole-buffer RMS gate passes it, whisper then invents text from
+    it. The frame-based speech gate must reject it — and it must NOT
+    count as a dead-mic press, because the mic is delivering audio.
+    """
+    from speakinput.app import App
+
+    config = Config(
+        audio=AudioConfig(
+            silence_threshold=0.005,
+            auto_stop_seconds=0,
+            dead_mic_consecutive=1,  # would warn on the first silent press
+        )
+    )
+    noise = room_tone(1000, level=0.02, seed=7)
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = noise
+    transcriber = MagicMock()
+    injector = MagicMock()
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=injector,
+        feedback=MagicMock(),
+        debug=True,
+    )
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+
+    transcriber.transcribe.assert_not_called()
+    injector.inject.assert_not_called()
+    captured = capsys.readouterr()
+    assert "speech gate" in captured.err
+    assert "ms of speech above the noise floor" in captured.err
+    assert "microphone detected but no audio" not in captured.err
+
+
+def test_release_speech_passes_speech_gate(capsys):
+    """A modulated buffer with plenty of speech above the floor reaches
+    the transcriber even when the gate is armed."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = speech_like(500, level=0.2)
+    transcriber = MagicMock()
+    transcriber.transcribe.return_value = "hello"
+    transcribers = {config.primary.key: transcriber}
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers=transcribers,
+        injector=MagicMock(),
+        feedback=MagicMock(),
+        debug=True,
+    )
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+
+    transcriber.transcribe.assert_called_once()
+    captured = capsys.readouterr()
+    assert "speech gate: noise_floor=" in captured.err
+
+
+def test_release_loud_room_tone_skips_transcribe(capsys):
+    """A hot mic lifts room tone well above the absolute floor. It is
+    still stationary noise, so it must still be gated out."""
+    from speakinput.app import App
+
+    config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = room_tone(2000, level=0.2)
+    transcriber = MagicMock()
+    injector = MagicMock()
+
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=injector,
+        feedback=MagicMock(),
+        debug=True,
+    )
+    app.on_hotkey_press(config.primary)
+    app.on_hotkey_release(config.primary)
+
+    transcriber.transcribe.assert_not_called()
+    injector.inject.assert_not_called()
+    assert "ms of speech above the noise floor" in capsys.readouterr().err
+
+
 def test_dead_mic_warns_after_consecutive_silent_recordings(capsys):
     """After `dead_mic_consecutive` near-silent held recordings in a row,
     the app must emit a loud 'microphone detected but no audio' warning
@@ -295,7 +399,7 @@ def test_dead_mic_resets_on_loud_recording(capsys):
     recorder.drain.return_value = np.zeros(16000, dtype=np.float32)
     app.on_hotkey_press(config.primary)
     app.on_hotkey_release(config.primary)
-    recorder.drain.return_value = np.full(16000, 0.5, dtype=np.float32)
+    recorder.drain.return_value = speech_like(1000, level=0.5)
     app.on_hotkey_press(config.primary)
     app.on_hotkey_release(config.primary)
 
@@ -335,13 +439,15 @@ def test_release_silence_threshold_zero_disables_gate(capsys):
 
 
 def test_release_loud_audio_passes_gate(capsys):
+    """A buffer with plenty of speech energy above the noise floor
+    reaches the transcriber."""
     from speakinput.app import App
 
     config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.drain.return_value = np.full(16000, 0.5, dtype=np.float32)
+    recorder.drain.return_value = speech_like(400, level=0.5)
     transcriber = MagicMock()
     transcriber.transcribe.return_value = "hello"
     transcribers = {config.primary.key: transcriber}
@@ -1120,7 +1226,26 @@ def test_run_prints_startup_banner(monkeypatch, capsys):
     assert "[startup] models   : loaded 1 into memory (shared: 1 transcriber, 2 profiles)" in captured.err
     assert "[startup] sample   :" in captured.err
     assert "[startup] silence  :" in captured.err
+    assert "speech 80ms @2x noise" in captured.err
     assert "[startup] inject   :" in captured.err
+
+
+def test_run_banner_marks_speech_gate_off_when_threshold_zero(monkeypatch, capsys):
+    """With silence_threshold = 0 both gates are off; the banner must say
+    so rather than print gate numbers that are not applied."""
+    from speakinput.app import App
+    from speakinput.config import AudioConfig
+
+    monkeypatch.setattr("speakinput.app.ensure_model", MagicMock(return_value="/x.bin"))
+    monkeypatch.setattr("speakinput.app.WhisperCppTranscriber", MagicMock())
+
+    config = Config(audio=AudioConfig(silence_threshold=0))
+    app = App(config=config, recorder=MagicMock(), injector=MagicMock(), feedback=MagicMock())
+    app._shutdown.set()
+    app.run()
+
+    captured = capsys.readouterr()
+    assert "speech off" in captured.err
 
 
 def test_run_banner_shows_config_source_when_file_loaded(monkeypatch, capsys, tmp_path):
@@ -1299,7 +1424,7 @@ def test_auto_stop_watchdog_fires_after_silence_window(capsys):
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0  # pure silence from the start
-    recorder.drain.return_value = np.full(16000, 0.5, dtype=np.float32)  # 1s of "loud" so gate passes
+    recorder.drain.return_value = speech_like(1000, level=0.5)  # 1s of speech so the gate passes
     transcriber = MagicMock()
     transcriber.transcribe.return_value = "watchdog fired"
     transcribers = {config.primary.key: transcriber}
@@ -1363,10 +1488,8 @@ def test_release_trims_trailing_silence(capsys):
 
     config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
     sr = config.audio.sample_rate
-    # 100ms of loud (RMS 0.5) followed by 200ms of silence.
-    audio = np.concatenate(
-        [np.full(sr // 10, 0.5, dtype=np.float32), np.zeros(sr // 5, dtype=np.float32)]
-    )
+    # 300ms of speech followed by 200ms of silence.
+    audio = np.concatenate([speech_like(300, level=0.5), np.zeros(sr // 5, dtype=np.float32)])
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
@@ -1388,6 +1511,8 @@ def test_release_trims_trailing_silence(capsys):
     # Trim log line printed.
     captured = capsys.readouterr()
     assert "trimmed trailing silence" in captured.err
+    # And the trimmed buffer still reached whisper.
+    transcriber.transcribe.assert_called_once()
     # The transcriber received a buffer that is SHORTER than the original.
     call_audio = transcriber.transcribe.call_args.args[0]
     assert call_audio.size < audio.size
@@ -1398,8 +1523,7 @@ def test_release_does_not_trim_when_buffer_is_pure_speech(capsys):
     from speakinput.app import App
 
     config = Config(audio=AudioConfig(silence_threshold=0.005, auto_stop_seconds=0))
-    sr = config.audio.sample_rate
-    audio = np.full(sr // 5, 0.5, dtype=np.float32)  # 200ms loud
+    audio = speech_like(400, level=0.5)  # 400ms of speech, no silent tail
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
@@ -1420,6 +1544,7 @@ def test_release_does_not_trim_when_buffer_is_pure_speech(capsys):
 
     captured = capsys.readouterr()
     assert "trimmed trailing silence" not in captured.err
+    transcriber.transcribe.assert_called_once()
 
 
 # --- banner shows auto-stop --------------------------------------------
@@ -1523,7 +1648,7 @@ def test_watchdog_chunk_drains_and_injects_then_rearms():
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    chunk_audio = np.full(16000, 0.3, dtype=np.float32)  # 1s of "speech"
+    chunk_audio = speech_like(1000, level=0.3)  # 1s of speech
     recorder.drain.return_value = chunk_audio
     transcriber = MagicMock()
     transcriber.transcribe.return_value = "first sentence"
@@ -1632,7 +1757,7 @@ def test_manual_release_during_chunked_session_finalizes():
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.drain.return_value = np.full(16000, 0.3, dtype=np.float32)
+    recorder.drain.return_value = speech_like(1000, level=0.3)
     transcriber = MagicMock()
     transcriber.transcribe.return_value = "goodbye"
     injector = MagicMock()
@@ -1676,7 +1801,7 @@ def test_watchdog_chunk_bails_out_when_manual_release_already_pending():
     recorder = MagicMock()
     recorder.is_recording.return_value = True
     recorder.current_rms.return_value = 0.0
-    recorder.drain.return_value = np.full(8000, 0.3, dtype=np.float32)
+    recorder.drain.return_value = speech_like(500, level=0.3)
     transcriber = MagicMock()
     injector = MagicMock()
     feedback = MagicMock()
@@ -1718,7 +1843,7 @@ def test_watchdog_chunk_does_not_rearm_if_recorder_closed():
     # False — a closed recorder is closed.
     recorder.is_recording.return_value = False
     recorder.current_rms.return_value = 0.0
-    recorder.drain.return_value = np.full(8000, 0.3, dtype=np.float32)
+    recorder.drain.return_value = speech_like(500, level=0.3)
     transcriber = MagicMock()
     injector = MagicMock()
     feedback = MagicMock()

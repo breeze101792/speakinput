@@ -22,6 +22,7 @@ from speakinput.models import (
     ModelNotFoundError,
 )
 from speakinput.singleinstance import acquire as acquire_instance_lock
+from speakinput.silence import analyse_speech, trim_trailing_silence
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -350,11 +351,15 @@ def _diagnose(config: Config) -> int:
     if audio.size == 0:
         print("no audio captured (device=)", file=sys.stderr)
         return 1
-    rms = float(np.sqrt(np.mean(audio * audio)))
+    threshold = config.audio.silence_threshold
+    # Trim exactly like the app does, so the numbers printed here are
+    # the numbers the press path would compute.
+    if threshold > 0 and audio.size:
+        audio = trim_trailing_silence(audio, config.audio.sample_rate, threshold)
+    rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
     print(
         f"captured {audio.size} samples ({audio.size / config.audio.sample_rate:.2f}s) rms={rms:.4f}"
     )
-    threshold = config.audio.silence_threshold
     if threshold > 0 and rms < threshold:
         print(
             f"warning: rms is below the silence_threshold ({threshold:.4f}). "
@@ -362,6 +367,29 @@ def _diagnose(config: Config) -> int:
             "it may be muted or switched off, or the audio driver is "
             "wedged. See README → Troubleshooting → 'Microphone produces "
             "no sound even though it's detected'.",
+            file=sys.stderr,
+        )
+    elif threshold > 0:
+        # The buffer cleared the absolute floor — say whether the speech
+        # gate would have let it through, so "nothing gets typed" can be
+        # traced to the gate rather than to the mic or the model.
+        stats = analyse_speech(
+            audio,
+            config.audio.sample_rate,
+            threshold,
+            noise_margin=config.audio.vad_noise_margin,
+            min_speech_ms=config.audio.vad_min_speech_ms,
+        )
+        verdict = (
+            "audio would reach whisper"
+            if stats.has_speech
+            else "audio would be dropped"
+        )
+        print(
+            f"speech gate: noise_floor={stats.noise_floor:.4f}, "
+            f"speech={stats.speech_ms:.0f}ms "
+            f"(min {config.audio.vad_min_speech_ms:.0f}ms) — {verdict}. "
+            f"Speak a few words during the recording to compare.",
             file=sys.stderr,
         )
     return 0

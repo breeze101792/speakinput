@@ -6,7 +6,8 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from speakinput.silence import SilenceWatchdog, trim_trailing_silence
+from speakinput.silence import SilenceWatchdog, analyse_speech, trim_trailing_silence
+from audio_signals import room_tone, speech_like
 
 
 # --- trim_trailing_silence ------------------------------------------------
@@ -79,6 +80,117 @@ def test_trim_trailing_silence_partial_hop_at_end():
     )
     out = trim_trailing_silence(audio, sample_rate=sr, threshold=0.005)
     assert out.size == 480
+
+
+# --- analyse_speech -------------------------------------------------------
+
+
+def test_analyse_speech_rejects_digital_silence():
+    stats = analyse_speech(np.zeros(16000, dtype=np.float32), 16000, 0.005)
+    assert stats.has_speech is False
+    assert stats.speech_ms == 0.0
+
+
+def test_analyse_speech_rejects_stationary_noise_above_the_floor():
+    """Room tone louder than `silence_threshold` clears the absolute
+    gate; the frame-based gate must still reject it. This is the case
+    the whole-buffer RMS gate could not catch."""
+    audio = room_tone(1000, level=0.02)  # 4x the default floor
+    stats = analyse_speech(audio, 16000, 0.005)
+    assert stats.noise_floor == pytest.approx(0.02, rel=0.3)
+    assert stats.has_speech is False
+
+
+def test_analyse_speech_rejects_loud_stationary_noise():
+    """A hot mic or an AGC can lift room tone far above the floor. It is
+    still flat, so it is still noise."""
+    audio = room_tone(2000, level=0.2)
+    stats = analyse_speech(audio, 16000, 0.005)
+    assert stats.has_speech is False
+
+
+def test_analyse_speech_ignores_digitally_zero_frames():
+    """Some devices zero-fill muted output. Those frames must not drag
+    the noise floor to zero and disable the relative test."""
+    audio = np.concatenate([np.zeros(8000, dtype=np.float32), room_tone(800, level=0.04)])
+    stats = analyse_speech(audio, 16000, 0.005)
+    assert stats.noise_floor > 0.01
+    assert stats.has_speech is False
+
+
+def test_analyse_speech_rejects_a_single_click():
+    """One keyboard click is a couple of 20ms frames — nowhere near the
+    minimum speech duration, no matter how loud it is."""
+    audio = np.concatenate(
+        [room_tone(500, level=0.001), np.full(800, 0.5, dtype=np.float32)]
+    )
+    stats = analyse_speech(audio, 16000, 0.005)
+    assert stats.has_speech is False
+    assert stats.speech_ms < 80
+
+
+def test_analyse_speech_accepts_speech_after_leading_silence():
+    audio = np.concatenate([room_tone(300, level=0.001), speech_like(500)])
+    stats = analyse_speech(audio, 16000, 0.005)
+    assert stats.has_speech is True
+
+
+def test_analyse_speech_accepts_speech_in_a_noisy_room():
+    """Speech must still pass when the room tone is well above the
+    absolute floor — the noise-relative bar is what matters."""
+    audio = room_tone(1000, level=0.01) + speech_like(1000)
+    stats = analyse_speech(audio, 16000, 0.005)
+    assert stats.has_speech is True
+
+
+def test_analyse_speech_accepts_a_loud_press():
+    audio = speech_like(500, level=0.5)
+    stats = analyse_speech(audio, 16000, 0.005)
+    assert stats.has_speech is True
+
+
+def test_analyse_speech_threshold_zero_disables_the_gate():
+    stats = analyse_speech(np.zeros(16000, dtype=np.float32), 16000, 0)
+    assert stats.has_speech is True
+
+
+def test_analyse_speech_rejects_two_short_taps():
+    """Two clicks add up to the duration of a short word. The sustained
+    run requirement is what rejects them — neither run is long enough."""
+    tap = np.full(320, 0.5, dtype=np.float32)  # 20ms, frame-misaligned
+    audio = np.concatenate(
+        [
+            room_tone(samples=160, level=0.001),
+            tap,
+            room_tone(samples=1000, level=0.001),
+            tap,
+            room_tone(samples=1000, level=0.001),
+        ]
+    )
+    stats = analyse_speech(audio, 16000, 0.005)
+    assert stats.speech_ms >= 80  # total clears the duration bar
+    assert stats.has_speech is False  # but no run of 60ms
+
+
+def test_analyse_speech_rejects_buffer_shorter_than_one_frame():
+    stats = analyse_speech(np.zeros(100, dtype=np.float32), 16000, 0.005)
+    assert stats.has_speech is False
+    assert stats.speech_ms == 0.0
+
+
+def test_analyse_speech_min_speech_ms_is_honoured():
+    audio = speech_like(300)
+    assert analyse_speech(audio, 16000, 0.005, min_speech_ms=40).has_speech is True
+    assert analyse_speech(audio, 16000, 0.005, min_speech_ms=1000).has_speech is False
+
+
+def test_analyse_speech_noise_margin_is_honoured():
+    """A margin of 1.0 treats every frame at or above the estimated
+    noise floor as speech, so stationary noise passes. This documents
+    what lowering the knob below its default does."""
+    audio = room_tone(1000, level=0.02)
+    assert analyse_speech(audio, 16000, 0.005, noise_margin=1.0).has_speech is True
+    assert analyse_speech(audio, 16000, 0.005, noise_margin=2.0).has_speech is False
 
 
 # --- SilenceWatchdog ------------------------------------------------------

@@ -15,6 +15,7 @@ is optional; when omitted only the primary key is wired.
 
 from __future__ import annotations
 
+import math
 import sys
 import tomllib
 from dataclasses import dataclass, field, replace
@@ -181,6 +182,23 @@ class AudioConfig:
     #      themselves. Trailing silence is also trimmed from the
     #      buffer before transcribe.
     silence_threshold: float = 0.005
+    # Speech gate. After a buffer clears `silence_threshold`, it is
+    # framed into 20ms frames and each frame's RMS is compared against
+    # a noise floor estimated from the buffer itself. This is what
+    # rejects a press that captured only room tone, a fan, or a
+    # keyboard click — a whole-buffer RMS lets those through, and
+    # whisper then invents text.
+    #
+    # How far above the estimated noise floor a frame must be to count
+    # as speech. 2.0 is 6dB; speech peaks sit 10-20dB above room tone.
+    # Raise it in a noisy room (fewer false accepts, more lost quiet
+    # syllables); lower it toward 1.5 for a very quiet, hot mic.
+    vad_noise_margin: float = 2.0
+    # Minimum accumulated speech needed before transcribing. A click
+    # or a tap is one or two 20ms frames; below ~100ms whisper has no
+    # context to decode anyway. 0 accepts any single frame above the
+    # floor.
+    vad_min_speech_ms: float = 80.0
     # A recording whose RMS is below `silence_threshold` counts as
     # "silent" for the dead-mic detector (see `dead_mic_consecutive`).
     # This is the same floor the silence gate and auto-stop watchdog
@@ -479,6 +497,17 @@ class Config:
             raise ValueError("audio.sample_rate must be positive")
         if self.audio.silence_threshold < 0:
             raise ValueError("audio.silence_threshold must be >= 0 (0 disables)")
+        if self.audio.vad_noise_margin < 1 or not math.isfinite(
+            self.audio.vad_noise_margin
+        ):
+            raise ValueError(
+                "audio.vad_noise_margin must be a finite number >= 1 "
+                "(1 means 'any frame above the noise floor is speech')"
+            )
+        if self.audio.vad_min_speech_ms < 0 or not math.isfinite(
+            self.audio.vad_min_speech_ms
+        ):
+            raise ValueError("audio.vad_min_speech_ms must be finite and >= 0")
         if self.audio.dead_mic_consecutive < 0:
             raise ValueError(
                 "audio.dead_mic_consecutive must be >= 0 (0 disables the dead-mic detector)"
