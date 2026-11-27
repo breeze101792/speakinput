@@ -2021,6 +2021,52 @@ def test_continuity_across_press_skipped_when_window_expired():
     assert "alpha bravo" not in prompt
 
 
+def test_continuity_stale_hint_not_refreshed_by_mid_press_chunk():
+    """A press that starts outside the window must not pick the stale
+    across-press hint back up just because its own first chunk
+    refreshed `_last_clip_at`."""
+    from speakinput.app import App
+
+    config = Config(
+        audio=AudioConfig(
+            silence_threshold=0,
+            auto_stop_seconds=0.05,
+            prev_clip_window_seconds=10,
+        )
+    )
+    recorder = MagicMock()
+    recorder.is_recording.return_value = True
+    recorder.current_rms.return_value = 0.0
+    recorder.drain.return_value = np.full(16000, 0.3, dtype=np.float32)
+    transcriber = MagicMock()
+    transcriber.transcribe.side_effect = [
+        "alpha bravo",
+        "mid sentence",
+        "charlie delta",
+    ]
+    app = App(
+        config=config,
+        recorder=recorder,
+        transcribers={config.primary.key: transcriber},
+        injector=MagicMock(),
+        feedback=MagicMock(),
+    )
+    app.on_hotkey_press(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    # The second press starts long after the first clip finished.
+    app._last_clip_at -= 100.0
+    app.on_hotkey_press(app.config.primary)
+    app._on_watchdog_chunk(app.config.primary)
+    app.on_hotkey_release(app.config.primary)
+    assert transcriber.transcribe.call_count == 3
+    final_prompt = transcriber.transcribe.call_args_list[2].kwargs.get("initial_prompt") or ""
+    # Stale across-press text must stay out even though the mid-press
+    # chunk updated `_last_clip_at`.
+    assert "alpha bravo" not in final_prompt
+    # The within-press chunk still flows.
+    assert "mid sentence" in final_prompt
+
+
 def test_continuity_across_press_skipped_when_window_zero():
     """`prev_clip_window_seconds=0` disables the across-press hint
     entirely (within-press still works)."""

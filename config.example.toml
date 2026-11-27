@@ -111,7 +111,7 @@ auto_stop_seconds = 0       # auto-stop after this many seconds of
                             # (default). Set to a typical end-of-
                             # sentence pause (e.g. 0.8) to enable the
                             # chunked auto-stop.
-prev_clip_window_seconds = 60   # When the next press starts within this
+prev_clip_window_seconds = 30   # When the next press starts within this
                                 # many seconds of the previous
                                 # transcription, that text is appended
                                 # to `initial_prompt` as a continuity

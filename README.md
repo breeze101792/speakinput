@@ -225,7 +225,7 @@ When `auto_stop_seconds > 0`, auto-stop doesn't end the session. If you keep hol
 Whisper's `initial_prompt` is re-evaluated at the start of every transcription. By default Speak Input feeds it a layered prompt built from three sources, in order:
 
 1. **Configured lexical bias** — the `initial_prompt` you set per profile in `config.toml` (or with `-P` on the command line). The default is the embedded-software-engineer vocabulary bank. Static; never changes.
-2. **Across-press hint** — the most recent successful transcription, if the gap between presses is under `prev_clip_window_seconds` (default **60s**). When you start a new press within a minute of finishing the last one, the previous text is appended to the prompt. Whisper treats it as a topic hint, so technical terms and style from the previous sentence are more likely to carry over.
+2. **Across-press hint** — the most recent successful transcription, if the gap between presses is under `prev_clip_window_seconds` (default **30s**). When you start a new press within half a minute of finishing the last one, the previous text is appended to the prompt. Whisper treats it as a topic hint, so technical terms and style from the previous sentence are more likely to carry over.
 3. **Within-press chunk** — the previous auto-stopped chunk's text from the **same** key-hold. Always used, regardless of the across-press window, because mid-press chunks are by definition part of the same thought.
 
 The three sources are concatenated and the result is capped at 400 characters (well under whisper's 224-token prompt limit) — long previous clips are truncated from the end first, and the within-press chunk is dropped first if everything still overflows.
@@ -571,7 +571,7 @@ auto_stop_seconds = 0      # auto-stop after this many seconds of
                            # Trailing silence is also trimmed from the
                            # buffer before transcribe. 0 disables (you
                            # release the key yourself).
-prev_clip_window_seconds = 60  # Reuse the most recent transcription as
+prev_clip_window_seconds = 30  # Reuse the most recent transcription as
                                # an `initial_prompt` hint for the next
                                # press, when the gap between presses is
                                # under this window. The within-press

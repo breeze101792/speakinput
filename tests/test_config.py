@@ -231,9 +231,9 @@ def test_from_dict_dead_mic_consecutive():
 
 
 def test_default_prev_clip_window_seconds():
-    """Default 60s — the previous press's transcript is used as a
-    continuity hint for the next press if the gap is under a minute."""
-    assert Config().audio.prev_clip_window_seconds == 60.0
+    """Default 30s — the previous press's transcript is used as a
+    continuity hint for the next press if the gap is under 30 seconds."""
+    assert Config().audio.prev_clip_window_seconds == 30.0
 
 
 def test_validation_rejects_negative_prev_clip_window_seconds():
@@ -251,7 +251,7 @@ def test_with_overrides_prev_clip_window_seconds():
     cfg = Config()
     new = cfg.with_overrides(prev_clip_window_seconds=120)
     assert new.audio.prev_clip_window_seconds == 120
-    assert cfg.audio.prev_clip_window_seconds == 60.0  # untouched
+    assert cfg.audio.prev_clip_window_seconds == 30.0  # untouched
 
 
 # --- speech gate (VAD) ----------------------------------------------------

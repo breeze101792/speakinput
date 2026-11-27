@@ -753,15 +753,18 @@ class App:
         # the NEXT press when the gap is under
         # `audio.prev_clip_window_seconds`.
         #
-        # `_press_start_clip_text`: a snapshot of `_last_clip_text`
-        # taken at the start of each press. This is what the current
-        # press's transcribes see as their "across-press" hint — it's
-        # frozen at press-start so updating `_last_clip_text` mid-press
-        # (e.g. after the first chunk) doesn't change the across-press
-        # hint for the second chunk of the SAME press. The semantic is:
-        # the across-press hint is "the last thing I said BEFORE I
-        # pressed the key this time", not "the last thing I said
-        # 200ms ago in this very press".
+        # `_press_start_clip_text` / `_press_start_clip_age`: a snapshot
+        # of `_last_clip_text` and its age, taken at the start of each
+        # press. This is what the current press's transcribes see as
+        # their "across-press" hint — it's frozen at press-start so
+        # updating `_last_clip_text` mid-press (e.g. after the first
+        # chunk) doesn't change the across-press hint for the second
+        # chunk of the SAME press. The semantic is: the across-press
+        # hint is "the last thing I said BEFORE I pressed the key this
+        # time", not "the last thing I said 200ms ago in this very
+        # press". The age is frozen too, so a long multi-chunk hold
+        # can't keep a stale hint alive by refreshing `_last_clip_at`
+        # from its own chunks.
         #
         # `_last_chunk_text`: the text of the previous auto-stopped
         # chunk WITHIN the current press. Reset on press, updated on
@@ -776,6 +779,7 @@ class App:
         self._last_clip_text: str = ""
         self._last_clip_at: float = 0.0
         self._press_start_clip_text: str = ""
+        self._press_start_clip_age: float = float("inf")
         self._last_chunk_text: str = ""
         self._prompt_lock = threading.Lock()
         # Dead-mic detector. Counts consecutive *held* recordings whose
@@ -812,6 +816,11 @@ class App:
         with self._prompt_lock:
             self._last_chunk_text = ""
             self._press_start_clip_text = self._last_clip_text
+            self._press_start_clip_age = (
+                time.monotonic() - self._last_clip_at
+                if self._last_clip_at
+                else float("inf")
+            )
         _dbg(self.debug, f"key press start ({profile.key})")
         try:
             self.recorder.start()
@@ -1256,14 +1265,11 @@ class App:
         static = (profile.initial_prompt or "").strip()
         with self._prompt_lock:
             prev_clip = self._press_start_clip_text
-            prev_clip_age = (
-                time.monotonic() - self._last_clip_at if self._last_clip_at else float("inf")
-            )
+            prev_clip_age = self._press_start_clip_age
             prev_chunk = self._last_chunk_text
         # Drop the across-press hint if it's missing or too old. The
-        # `prev_clip_age` here is the age of the press-start snapshot,
-        # which is the same as the age of `_last_clip_text` at the
-        # moment the press started (the snapshot is taken then).
+        # age was frozen at press start, so a chunk recorded during a
+        # long hold cannot refresh it.
         if (
             not prev_clip
             or prev_clip_age > self.config.audio.prev_clip_window_seconds

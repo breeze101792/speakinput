@@ -238,7 +238,7 @@ class AudioConfig:
     # vocabulary bias wins, then the across-press topic, then the
     # within-press sentence-level context. 0 disables the across-press
     # hint entirely (within-press still flows).
-    prev_clip_window_seconds: float = 60.0
+    prev_clip_window_seconds: float = 30.0
     # Pause any playing media (music, video) when the hotkey is pressed
     # and resume it when the key is released. On Linux requires
     # `playerctl` (MPRIS); on macOS prefers `nowplaying-cli` (all apps via
